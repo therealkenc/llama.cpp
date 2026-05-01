@@ -276,19 +276,65 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                         {"tool_call_id", item.at("call_id")},
                     });
                 } else {
-                    json chatcmpl_outputs = item.at("output");
-                    for (json & chatcmpl_output : chatcmpl_outputs) {
-                        if (!chatcmpl_output.contains("type") || chatcmpl_output.at("type") != "input_text") {
-                            SRV_DBG("responses compat: item_type='%s', action='treat_tool_output_as_text'\n",
-                                    json_value(chatcmpl_output, "type", std::string("missing")).c_str());
+                    // Walk output parts. Text parts stay in the tool message;
+                    // input_image parts are split into a synthetic follow-up
+                    // user message. Qwen-style chat templates render media
+                    // markers reliably in user role but not in tool role
+                    // (the encoder still fires, but the model effectively
+                    // ignores tool-role images). Mirrors the chat-completions
+                    // "image stash" pattern at the responses-API boundary.
+                    std::vector<json> tool_text_content;
+                    std::vector<json> followup_image_content;
+                    const std::string tool_role = "tool";
+                    for (const json & output_part : item.at("output")) {
+                        const std::string type = json_value(output_part, "type", std::string());
+                        if (type == "input_text" || type == "output_text" || type == "text") {
+                            if (!exists_and_is_string(output_part, "text")) {
+                                responses_append_recovery_text(tool_text_content, tool_role, type, type + " item missing text");
+                                continue;
+                            }
+                            tool_text_content.push_back({
+                                {"text", output_part.at("text")},
+                                {"type", "text"},
+                            });
+                        } else if (type == "input_image") {
+                            if (!output_part.contains("image_url")) {
+                                responses_append_recovery_text(tool_text_content, tool_role, type, "input_image item missing image_url");
+                                continue;
+                            }
+                            followup_image_content.push_back({
+                                {"image_url", json {
+                                    {"url", output_part.at("image_url")}
+                                }},
+                                {"type", "image_url"},
+                            });
+                        } else {
+                            const std::string item_type = type.empty() ? std::string("unknown") : type;
+                            responses_append_recovery_text(
+                                    tool_text_content,
+                                    tool_role,
+                                    item_type,
+                                    "unsupported tool_output content type " + item_type);
                         }
-                        chatcmpl_output["type"] = "text";
+                    }
+                    if (!followup_image_content.empty()) {
+                        const size_t n = followup_image_content.size();
+                        tool_text_content.push_back({
+                            {"type", "text"},
+                            {"text", "[" + std::to_string(n) + " image(s) attached to the next user message]"},
+                        });
                     }
                     chatcmpl_messages.push_back(json {
-                        {"content",      chatcmpl_outputs},
+                        {"content",      tool_text_content},
                         {"role",         "tool"},
                         {"tool_call_id", item.at("call_id")},
                     });
+                    if (!followup_image_content.empty()) {
+                        chatcmpl_messages.push_back(json {
+                            {"role",    "user"},
+                            {"content", followup_image_content},
+                        });
+                    }
                 }
             } else if (exists_and_is_array(item, "summary") &&
                 exists_and_is_string(item, "type") &&

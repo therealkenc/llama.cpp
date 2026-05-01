@@ -1,0 +1,16 @@
+$HOME/Devel/geode-fin/vendor/llama.cpp/build/bin/llama-server \
+    -m $HOME/Devel/llama.cpp/scripts-ken/gguf/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf  \
+    --mmproj $HOME/Devel/llama.cpp/scripts-ken/gguf/Qwen3.6-35B-A3B-mmproj-BF16.gguf \
+    --port 8081 \
+    --host 0.0.0.0 \
+    --jinja \
+    --ctx-size 196608 \
+    --reasoning off \
+    --temperature 1.0 \
+    --top-p 0.95 \
+    --top-k 20 \
+    --presence-penalty 1.5 \
+    --log-timestamps  \
+    --log-colors on \
+    -np 2 \
+    -ngl 99
