@@ -31,7 +31,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
         throw std::invalid_argument("llama.cpp does not support 'previous_response_id'.");
     }
 
-    const json input_value = response_body.at("input");
+    const json & input_value = response_body.at("input");
     json chatcmpl_body = response_body;
     chatcmpl_body.erase("input");
     std::vector<json> chatcmpl_messages;
@@ -276,33 +276,31 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                         {"tool_call_id", item.at("call_id")},
                     });
                 } else {
-                    // Walk output parts. Text parts stay in the tool message;
-                    // input_image parts are split into a synthetic follow-up
-                    // user message. Qwen-style chat templates render media
-                    // markers reliably in user role but not in tool role
-                    // (the encoder still fires, but the model effectively
-                    // ignores tool-role images). Mirrors the chat-completions
-                    // "image stash" pattern at the responses-API boundary.
-                    std::vector<json> tool_text_content;
-                    std::vector<json> followup_image_content;
+                    // Walk output parts. Translate Responses-API content types
+                    // into chat-completions content types in place; the
+                    // downstream `oaicompat_chat_params_parse` then fetches
+                    // any `image_url` parts via `handle_media()` and replaces
+                    // them with the model's media marker, which the chat
+                    // template renders normally regardless of role.
+                    std::vector<json> tool_content;
                     const std::string tool_role = "tool";
                     for (const json & output_part : item.at("output")) {
                         const std::string type = json_value(output_part, "type", std::string());
                         if (type == "input_text" || type == "output_text" || type == "text") {
                             if (!exists_and_is_string(output_part, "text")) {
-                                responses_append_recovery_text(tool_text_content, tool_role, type, type + " item missing text");
+                                responses_append_recovery_text(tool_content, tool_role, type, type + " item missing text");
                                 continue;
                             }
-                            tool_text_content.push_back({
+                            tool_content.push_back({
                                 {"text", output_part.at("text")},
                                 {"type", "text"},
                             });
                         } else if (type == "input_image") {
                             if (!output_part.contains("image_url")) {
-                                responses_append_recovery_text(tool_text_content, tool_role, type, "input_image item missing image_url");
+                                responses_append_recovery_text(tool_content, tool_role, type, "input_image item missing image_url");
                                 continue;
                             }
-                            followup_image_content.push_back({
+                            tool_content.push_back({
                                 {"image_url", json {
                                     {"url", output_part.at("image_url")}
                                 }},
@@ -311,30 +309,17 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                         } else {
                             const std::string item_type = type.empty() ? std::string("unknown") : type;
                             responses_append_recovery_text(
-                                    tool_text_content,
+                                    tool_content,
                                     tool_role,
                                     item_type,
                                     "unsupported tool_output content type " + item_type);
                         }
                     }
-                    if (!followup_image_content.empty()) {
-                        const size_t n = followup_image_content.size();
-                        tool_text_content.push_back({
-                            {"type", "text"},
-                            {"text", "[" + std::to_string(n) + " image(s) attached to the next user message]"},
-                        });
-                    }
                     chatcmpl_messages.push_back(json {
-                        {"content",      tool_text_content},
+                        {"content",      tool_content},
                         {"role",         "tool"},
                         {"tool_call_id", item.at("call_id")},
                     });
-                    if (!followup_image_content.empty()) {
-                        chatcmpl_messages.push_back(json {
-                            {"role",    "user"},
-                            {"content", followup_image_content},
-                        });
-                    }
                 }
             } else if (exists_and_is_array(item, "summary") &&
                 exists_and_is_string(item, "type") &&
