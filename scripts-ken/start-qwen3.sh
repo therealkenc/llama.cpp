@@ -1,6 +1,6 @@
 $HOME/Devel/geode-fin/vendor/llama.cpp/build/bin/llama-server \
-    -m $HOME/Devel/llama.cpp/scripts-ken/gguf/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf  \
-    --mmproj $HOME/Devel/llama.cpp/scripts-ken/gguf/Qwen3.6-35B-A3B-mmproj-BF16.gguf \
+    -m gguf/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf  \
+    --mmproj gguf/Qwen3.6-35B-A3B-mmproj-BF16.gguf \
     --port 8081 \
     --host 0.0.0.0 \
     --jinja \
