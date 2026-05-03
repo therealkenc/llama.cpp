@@ -3893,14 +3893,27 @@ void server_routes::init_routes() {
             }
         }
         SRV_DBG("converted request: %s\n", debug_body.dump().c_str());
+        // Pre-build the parser variant before the first parse:
+        // oaicompat_chat_params_parse mutates `body` content parts in
+        // place — every `image_url` / `input_audio` part is rewritten
+        // to `media_marker` after the bytes are extracted. A second
+        // parse over the mutated body then throws
+        // "unsupported content[].type='media_marker'". Snapshot the
+        // body up front so the parser pass starts from the original
+        // request shape.
+        const bool needs_parser_pass =
+            body.contains("tools") && body.at("tools").is_array() && !body.at("tools").empty();
+        json parser_body;
+        if (needs_parser_pass) {
+            parser_body = responses_relax_tool_required_for_parser(body);
+        }
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
             files,
             /* no_prefill_assistant */ true);
-        if (body.contains("tools") && body.at("tools").is_array() && !body.at("tools").empty()) {
+        if (needs_parser_pass) {
             std::vector<raw_buffer> parser_files;
-            json parser_body = responses_relax_tool_required_for_parser(body);
             json parser_parsed = oaicompat_chat_params_parse(
                 parser_body,
                 meta->chat_params,
