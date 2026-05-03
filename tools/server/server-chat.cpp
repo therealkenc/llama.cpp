@@ -119,7 +119,7 @@ static json parse_arguments_best_effort(const json & value) {
         return value;
     }
     if (value.is_string()) {
-        const std::string raw = value.get<std::string>();
+        std::string raw = value.get<std::string>();
         try {
             return json::parse(raw);
         } catch (const std::exception &) {
@@ -206,12 +206,17 @@ static json encode_tool_output_content(const json & output) {
         return output.get<std::string>();
     }
     if (output.is_array()) {
+        const auto stringify = [](const json & item) -> std::string {
+            if (item.is_string()) { return item.get<std::string>(); }
+            if (item.is_null())   { return std::string(); }
+            return item.dump();
+        };
         json content = json::array();
         for (const auto & item : output) {
             if (item.is_object()) {
                 content.push_back(encode_tool_output_content_item(item));
             } else {
-                content.push_back(responses_make_text_content(item.is_string() ? item.get<std::string>() : item.is_null() ? "" : item.dump()));
+                content.push_back(responses_make_text_content(stringify(item)));
             }
         }
         return content;
@@ -354,14 +359,14 @@ static void append_tool_output_message(std::vector<json> & messages, const json 
     });
 }
 
-static bool strip_shell_output_metadata_text(const std::string & text, std::string & stripped) {
+static bool strip_shell_output_metadata_text(const std::string & raw, std::string & stripped) {
     for (const std::string marker : {
             "\nOutput:\n", "\r\nOutput:\r\n", "\nOutput:\r\n", "\r\nOutput:\n",
             "Output:\n", "Output:\r\n",
         }) {
-        const size_t pos = text.find(marker);
+        const size_t pos = raw.find(marker);
         if (pos != std::string::npos) {
-            stripped = text.substr(pos + marker.size());
+            stripped = raw.substr(pos + marker.size());
             return true;
         }
     }
@@ -428,7 +433,12 @@ static std::string input_file_text(const json & input_item) {
     const std::string file_id  = json_value(input_item, "file_id", std::string());
     const std::string file_url = json_value(input_item, "file_url", std::string());
     const std::string file_data = json_value(input_item, "file_data", std::string());
-    const std::string label = filename.empty() ? (file_id.empty() ? "file" : file_id) : filename;
+    const auto first_non_empty = [](std::string a, std::string b, std::string fallback) {
+        if (!a.empty()) { return a; }
+        if (!b.empty()) { return b; }
+        return fallback;
+    };
+    const std::string label = first_non_empty(filename, file_id, "file");
 
     if (!file_url.empty()) {
         return "[file: " + label + "] " + file_url;
@@ -481,15 +491,11 @@ static bool has_function_tool_named(const json & tools, const std::string & name
     if (!tools.is_array()) {
         return false;
     }
-    for (const auto & tool : tools) {
-        if (!tool.is_object() || json_value(tool, "type", std::string()) != "function") {
-            continue;
-        }
-        if (json_value(tool, "name", std::string()) == name) {
-            return true;
-        }
-    }
-    return false;
+    return std::any_of(tools.begin(), tools.end(), [&](const json & tool) {
+        return tool.is_object() &&
+               json_value(tool, "type", std::string()) == "function" &&
+               json_value(tool, "name", std::string()) == name;
+    });
 }
 
 static bool responses_tool_choice_requires_tool(const json & response_body, const std::string & tool_type) {
@@ -893,16 +899,16 @@ json server_chat_convert_responses_to_chatcmpl(
                     }
                     arguments["input"] = json_value(item, "input", std::string());
                 } else if (type == "local_shell_call") {
-                    arguments = json_value(item, "action", json::object());
+                    const json action = json_value(item, "action", json::object());
                     json bridged_arguments;
-                    if (responses_shell_bridge_to_web_search(arguments, hosted_web_search_wrapper, bridged_arguments)) {
+                    if (responses_shell_bridge_to_web_search(action, hosted_web_search_wrapper, bridged_arguments)) {
                         name = "web_search";
                         arguments = bridged_arguments;
                         const std::string call_id = json_value(item, "call_id", json_value(item, "id", std::string()));
                         if (!call_id.empty()) {
                             web_search_bridge_call_ids.insert(call_id);
                         }
-                    } else if (responses_shell_bridge_to_file_search(arguments, hosted_file_search_wrapper, bridged_arguments)) {
+                    } else if (responses_shell_bridge_to_file_search(action, hosted_file_search_wrapper, bridged_arguments)) {
                         name = "file_search";
                         arguments = bridged_arguments;
                         const std::string call_id = json_value(item, "call_id", json_value(item, "id", std::string()));
@@ -911,6 +917,7 @@ json server_chat_convert_responses_to_chatcmpl(
                         }
                     } else {
                         name = "local_shell";
+                        arguments = action;
                     }
                 } else if (type == "tool_search_call") {
                     name = "tool_search";
@@ -996,6 +1003,17 @@ json server_chat_convert_responses_to_chatcmpl(
                 }
             } else if (exists_and_is_string(item, "type") && item.at("type") == "ghost_snapshot") {
                 // Ghost snapshots are IDE side, so should not affect the prompt.
+            } else if (exists_and_is_string(item, "type") && item.at("type") == "item_reference") {
+                // The OpenAI Responses API lets a client send back just an
+                // `{type:"item_reference", id:"..."}` placeholder when it has
+                // previously stored a server-side item. We have no item store,
+                // so the only honest reply is a 400. The Vercel AI SDK
+                // (`@ai-sdk/openai` Responses provider) emits these by default
+                // whenever `store` is truthy -- non-OpenAI clients should set
+                // `providerOptions.openai.store = false` to disable.
+                const std::string id = json_value(item, "id", std::string());
+                SRV_DBG("rejecting item_reference id=%s (no server-side item store)\n", id.c_str());
+                throw std::runtime_error("item_reference inputs are not supported (no server-side item store); set store=false on the client");
             } else {
                 chatcmpl_messages.push_back(json {
                     {"role", "assistant"},
@@ -1089,7 +1107,7 @@ json server_chat_convert_responses_to_chatcmpl(
     // (e.g. Codex CLI sends store, include, prompt_cache_key, web_search)
     for (const char * key : {
         "store", "include", "prompt_cache_key", "web_search",
-        "text", "truncation", "metadata", "reasoning", "background", 
+        "text", "truncation", "metadata", "reasoning", "background",
         "service_tier", "safety_identifier", "max_tool_calls",
     }) {
         chatcmpl_body.erase(key);
