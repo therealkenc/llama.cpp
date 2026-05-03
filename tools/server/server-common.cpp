@@ -909,7 +909,7 @@ static void handle_media(
 
 // used by /chat/completions endpoint
 json oaicompat_chat_params_parse(
-    json & body, /* openai api json semantics */
+    const json & body, /* openai api json semantics */
     const server_chat_params & opt,
     std::vector<raw_buffer> & out_files,
     bool no_prefill_assistant)
@@ -963,7 +963,15 @@ json oaicompat_chat_params_parse(
     if (!body.contains("messages")) {
         throw std::invalid_argument("'messages' is required");
     }
-    json & messages = body.at("messages");
+    // Deep copy of just the messages subtree -- we rewrite image_url /
+    // input_audio content parts in place to `media_marker` after
+    // extracting their bytes into out_files. Keeping that mutation
+    // local (instead of mutating the caller's body) means the parser
+    // is referentially transparent: callers that need to parse the
+    // same body twice (e.g. the Responses bridge, which does a second
+    // pass over a tool_choice-relaxed copy for grammar inference) can
+    // just call this twice with no state to manage.
+    json messages = body.at("messages");
     if (!messages.is_array()) {
         throw std::invalid_argument("Expected 'messages' to be an array");
     }
@@ -1169,6 +1177,12 @@ json oaicompat_chat_params_parse(
     }
 
     // Copy remaining properties to llama_params
+    // Preserve the mutated messages subtree in llama_params (so the
+    // catch-all body-passthrough loop below skips body's pristine
+    // copy). Downstream consumers that read llama_params["messages"]
+    // see the same marker-stamped shape they did before this refactor.
+    llama_params["messages"] = std::move(messages);
+
     // This allows user to use llama.cpp-specific params like "mirostat", ... via OAI endpoint.
     // See "launch_slot_with_task()" for a complete list of params supported by llama.cpp
     for (const auto & item : body.items()) {
