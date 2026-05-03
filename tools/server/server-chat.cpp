@@ -1005,15 +1005,16 @@ json server_chat_convert_responses_to_chatcmpl(
                 // Ghost snapshots are IDE side, so should not affect the prompt.
             } else if (exists_and_is_string(item, "type") && item.at("type") == "item_reference") {
                 // The OpenAI Responses API lets a client send back just an
-                // `{type:"item_reference", id:"..."}` placeholder when it has
-                // previously stored a server-side item. We have no item store,
-                // so the only honest reply is a 400. The Vercel AI SDK
-                // (`@ai-sdk/openai` Responses provider) emits these by default
-                // whenever `store` is truthy -- non-OpenAI clients should set
-                // `providerOptions.openai.store = false` to disable.
+                // `{type:"item_reference", id:"..."}` placeholder when it
+                // has previously stored a server-side item. The HTTP route
+                // resolves these against `responses_item_cache` *before*
+                // calling us; reaching this arm means either a cache miss
+                // slipped through or this converter was invoked from a
+                // path that doesn't pre-resolve. Either way: 400.
                 const std::string id = json_value(item, "id", std::string());
-                SRV_DBG("rejecting item_reference id=%s (no server-side item store)\n", id.c_str());
-                throw std::runtime_error("item_reference inputs are not supported (no server-side item store); set store=false on the client");
+                SRV_DBG("rejecting unresolved item_reference id=%s\n", id.c_str());
+                throw std::invalid_argument(
+                    "item_reference_not_found: id=" + (id.empty() ? "<unset>" : id));
             } else {
                 chatcmpl_messages.push_back(json {
                     {"role", "assistant"},

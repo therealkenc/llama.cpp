@@ -5,6 +5,7 @@
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
+#include "responses_item_cache.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -647,6 +648,15 @@ public:
 
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
+
+    // LRU cache of OpenAI Responses output items, keyed by emitted item id.
+    // Resolves `{type:"item_reference", id}` inputs from clients with
+    // `store=true` (e.g. @ai-sdk/openai Responses default). See
+    // responses_item_cache.h for capacity / concurrency notes. `mutable`
+    // because route handlers see `server_context_impl` through a const
+    // reference (`server_routes::ctx_server`); cache writes are thread-
+    // safe under its internal mutex.
+    mutable responses_item_cache responses_items;
 
     ~server_context_impl() {
         if (!sleeping) {
@@ -3189,6 +3199,11 @@ void server_context::on_sleeping_changed(std::function<void(bool)> callback) con
 // server_routes
 //
 
+// Forward decls; definitions live further down with the other Responses helpers.
+static void responses_cache_capture(responses_item_cache & cache, const json & payload);
+static bool responses_resolve_item_references(
+        responses_item_cache & cache, json & input_value, std::string & missing_id);
+
 std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             const server_http_req & req,
             server_task_type type,
@@ -3272,7 +3287,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         json arr = json::array();
         for (auto & res : all_results.results) {
             GGML_ASSERT(dynamic_cast<server_task_result_cmpl_final*>(res.get()) != nullptr);
-            arr.push_back(res->to_json());
+            json result_json = res->to_json();
+            if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
+                responses_cache_capture(ctx_server.responses_items, result_json);
+            }
+            arr.push_back(std::move(result_json));
         }
         GGML_ASSERT(!arr.empty() && "empty results");
         if (arr.size() == 1) {
@@ -3312,6 +3331,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // next responses are streamed
         // to be sent immediately
         json first_result_json = first_result->to_json();
+        if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
+            responses_cache_capture(ctx_server.responses_items, first_result_json);
+        }
         if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
             res->data = format_anthropic_sse(first_result_json);
         } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
@@ -3321,7 +3343,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         }
         res->status = 200;
         res->content_type = "text/event-stream";
-        res->next = [res_this = res.get(), res_type, &req](std::string & output) -> bool {
+        res->next = [res_this = res.get(), res_type, &req, &items = ctx_server.responses_items](std::string & output) -> bool {
             static auto format_error = [](task_response_type res_type, const json & res_json) {
                 if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
                     return format_anthropic_sse({
@@ -3418,6 +3440,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     || dynamic_cast<server_task_result_cmpl_final*>(result.get()) != nullptr
                 );
                 json res_json = result->to_json();
+                if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
+                    responses_cache_capture(items, res_json);
+                }
                 if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
                     output = format_anthropic_sse(res_json);
                 } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
@@ -3480,6 +3505,70 @@ static void responses_apply_parser_fields(json & dst, const json & src) {
         }
     }
 }
+
+// Walk a Responses-API output array and feed every item with an `id`
+// into the cache. Items without ids (best-effort emission) are skipped.
+static void responses_cache_put_output(responses_item_cache & cache, const json & output) {
+    if (!output.is_array()) {
+        return;
+    }
+    for (const auto & item : output) {
+        if (!item.is_object()) {
+            continue;
+        }
+        const std::string id = json_value(item, "id", std::string{});
+        if (!id.empty()) {
+            cache.put(id, item);
+        }
+    }
+}
+
+// Capture every emit-able item from a single OAI_RESP JSON payload.
+// Handles both the non-stream final shape (`output` at the top level)
+// and the stream shape (array of SSE events; the `response.completed`
+// / `response.incomplete` events carry `data.response.output`).
+static void responses_cache_capture(responses_item_cache & cache, const json & payload) {
+    if (payload.is_object()) {
+        if (payload.contains("output")) {
+            responses_cache_put_output(cache, payload.at("output"));
+        }
+        if (payload.contains("data") && payload.at("data").is_object() &&
+                payload.at("data").contains("response") &&
+                payload.at("data").at("response").is_object() &&
+                payload.at("data").at("response").contains("output")) {
+            responses_cache_put_output(cache, payload.at("data").at("response").at("output"));
+        }
+    } else if (payload.is_array()) {
+        for (const auto & event : payload) {
+            responses_cache_capture(cache, event);
+        }
+    }
+}
+
+// Replace `{type:"item_reference", id}` items in `input_value` with the
+// cached item bodies. Returns false (and sets `missing_id`) on first miss
+// so the caller can surface a structured 400.
+static bool responses_resolve_item_references(
+        responses_item_cache & cache, json & input_value, std::string & missing_id) {
+    if (!input_value.is_array()) {
+        return true;
+    }
+    for (auto & item : input_value) {
+        if (!item.is_object() || !item.contains("type") || !item.at("type").is_string() ||
+                item.at("type").get<std::string>() != "item_reference") {
+            continue;
+        }
+        const std::string id = json_value(item, "id", std::string{});
+        json resolved;
+        if (id.empty() || !cache.get(id, resolved)) {
+            missing_id = id;
+            return false;
+        }
+        item = resolved;
+    }
+    return true;
+}
+
 
 std::unique_ptr<server_res_generator> server_routes::create_response(bool bypass_sleep) {
     return std::make_unique<server_res_generator>(queue_tasks, queue_results, params.sleep_idle_seconds, bypass_sleep);
@@ -3873,7 +3962,19 @@ void server_routes::init_routes() {
     this->post_responses_oai = [this](const server_http_req & req) {
         auto res = create_response();
         std::vector<raw_buffer> files;
-        const json response_body = json::parse(req.body);
+        json response_body = json::parse(req.body);
+        // Resolve `{type:"item_reference", id}` placeholders against the
+        // server-side LRU cache before handing off to the chatcmpl
+        // converter. Misses are a structured 400; the converter still
+        // carries a defensive throw arm in case a caller bypasses us.
+        if (response_body.contains("input")) {
+            std::string missing_id;
+            if (!responses_resolve_item_references(
+                    ctx_server.responses_items, response_body["input"], missing_id)) {
+                throw std::invalid_argument(
+                    "item_reference_not_found: id=" + (missing_id.empty() ? "<unset>" : missing_id));
+            }
+        }
         const std::string web_search_wrapper = header_value(req, "X-Llama-Responses-Web-Search-Wrapper");
         const std::string file_search_wrapper = header_value(req, "X-Llama-Responses-File-Search-Wrapper");
         json body = server_chat_convert_responses_to_chatcmpl(
