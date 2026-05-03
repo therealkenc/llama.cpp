@@ -1016,9 +1016,28 @@ json server_chat_convert_responses_to_chatcmpl(
                 throw std::invalid_argument(
                     "item_reference_not_found: id=" + (id.empty() ? "<unset>" : id));
             } else {
+                // Catch-all for input items we don't recognise. We deliberately
+                // do NOT 400 here: this converter sees replayed conversation
+                // history from IDE harnesses (Codex, Copilot, Cursor, ...),
+                // and a 400 in that path bricks the thread permanently --
+                // the harness has no way to fix the offending item, since it
+                // came from a prior turn's output. See PR #21174 review
+                // discussion (r3038046111, r3038119943) for the same call
+                // being made on input_text / input_image guards.
+                //
+                // We log a SRV_WRN (the only recipient that can act on it is
+                // a human watching the server) and inject a short prose
+                // marker so the model can at least see that *something* was
+                // skipped. Item type only -- never item.dump(), which can
+                // smuggle base64 image data or large tool payloads into the
+                // prompt.
+                const std::string item_type = json_value(item, "type", std::string("<no-type>"));
+                SRV_WRN("responses recovery: role='<top>', item_type='%s', action='skip_unknown_top_level'\n",
+                        item_type.c_str());
                 chatcmpl_messages.push_back(json {
                     {"role", "assistant"},
-                    {"content", json::array({responses_make_text_content("[unsupported Responses item: " + item.dump() + "]")})},
+                    {"content", json::array({responses_make_text_content(
+                        "[responses recovery: skipped unsupported input item of type '" + item_type + "']")})},
                 });
             }
         }
