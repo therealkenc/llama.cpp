@@ -580,12 +580,8 @@ server_tokens server_tokens::clone() const {
 
 bool json_is_array_of_numbers(const json & data) {
     if (data.is_array()) {
-        for (const auto & e : data) {
-            if (!e.is_number_integer()) {
-                return false;
-            }
-        }
-        return true;
+        return std::all_of(data.begin(), data.end(),
+                           [](const auto & e) { return e.is_number_integer(); });
     }
     return false;
 }
@@ -607,12 +603,8 @@ bool json_is_array_of_mixed_numbers_strings(const json & data) {
 
 bool json_is_array_and_contains_numbers(const json & data) {
     if (data.is_array()) {
-        for (const auto & e : data) {
-            if (e.is_number_integer()) {
-                return true;
-            }
-        }
-        return false;
+        return std::any_of(data.begin(), data.end(),
+                           [](const auto & e) { return e.is_number_integer(); });
     }
     return false;
 }
@@ -676,7 +668,9 @@ llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt,
 
 size_t validate_utf8(const std::string& text) {
     size_t len = text.size();
-    if (len == 0) return 0;
+    if (len == 0) {
+        return 0;
+    }
 
     // Check the last few bytes to see if a multi-byte character is cut off
     for (size_t i = 1; i <= 4 && i <= len; ++i) {
@@ -685,15 +679,21 @@ size_t validate_utf8(const std::string& text) {
         if ((c & 0xE0) == 0xC0) {
             // 2-byte character start: 110xxxxx
             // Needs at least 2 bytes
-            if (i < 2) return len - i;
+            if (i < 2) {
+                return len - i;
+            }
         } else if ((c & 0xF0) == 0xE0) {
             // 3-byte character start: 1110xxxx
             // Needs at least 3 bytes
-            if (i < 3) return len - i;
+            if (i < 3) {
+                return len - i;
+            }
         } else if ((c & 0xF8) == 0xF0) {
             // 4-byte character start: 11110xxx
             // Needs at least 4 bytes
-            if (i < 4) return len - i;
+            if (i < 4) {
+                return len - i;
+            }
         }
     }
 
@@ -713,9 +713,9 @@ static std::string fnv_hash(const uint8_t * data, size_t len) {
     return std::to_string(hash);
 }
 
-server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> files) {
+server_tokens process_mtmd_prompt(mtmd_context * mctx, const std::string & prompt, const std::vector<raw_buffer> & files) {
     mtmd::bitmaps bitmaps;
-    for (auto & file : files) {
+    for (const auto & file : files) {
         mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size()));
         if (!bmp.ptr) {
             throw std::runtime_error("Failed to load image or audio file");
@@ -725,9 +725,6 @@ server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::
         bmp.set_id(hash.c_str());
         bitmaps.entries.push_back(std::move(bmp));
     }
-    // process prompt
-    std::vector<server_tokens> inputs;
-    // multimodal
     mtmd_input_text inp_txt = {
         prompt.c_str(),
         /* add_special */   true,
@@ -764,15 +761,18 @@ static server_tokens tokenize_input_subprompt(const llama_vocab * vocab, mtmd_co
         // string or mixed
         llama_tokens tmp = tokenize_mixed(vocab, json_prompt, add_special, parse_special);
         return server_tokens(tmp, false);
-    } else if (json_is_array_of_numbers(json_prompt)) {
+    }
+    if (json_is_array_of_numbers(json_prompt)) {
         // array of tokens
         llama_tokens tmp = json_prompt.get<llama_tokens>();
         return server_tokens(tmp, false);
-    } else if (json_prompt.contains(JSON_STRING_PROMPT_KEY)) {
+    }
+    if (json_prompt.contains(JSON_STRING_PROMPT_KEY)) {
         // JSON object with prompt key.
         if (json_prompt.contains(JSON_MTMD_DATA_KEY)) {
-            if (!has_mtmd)
+            if (!has_mtmd) {
                 throw std::runtime_error("Multimodal data provided, but model does not support multimodal requests.");
+            }
 
             // JSON object with prompt and multimodal key.
             std::vector<raw_buffer> files;
@@ -780,14 +780,13 @@ static server_tokens tokenize_input_subprompt(const llama_vocab * vocab, mtmd_co
                 files.push_back(base64_decode(entry));
             }
             return process_mtmd_prompt(mctx, json_prompt.at(JSON_STRING_PROMPT_KEY), files);
-        } else {
-            // Not multimodal, but contains a subobject.
-            llama_tokens tmp = tokenize_mixed(vocab, json_prompt.at(JSON_STRING_PROMPT_KEY), add_special, parse_special);
-            return server_tokens(tmp, false);
         }
-   } else {
-       throw std::runtime_error("\"prompt\" elements must be a string, a list of tokens, a JSON object containing a prompt string, or a list of mixed strings & tokens.");
-   }
+        // Not multimodal, but contains a subobject.
+        llama_tokens tmp = tokenize_mixed(vocab, json_prompt.at(JSON_STRING_PROMPT_KEY), add_special, parse_special);
+        return server_tokens(tmp, false);
+    }
+    throw std::runtime_error("\"prompt\" elements must be a string, a list of tokens, a JSON object containing a prompt string, or a list of mixed strings & tokens.");
+
 }
 
 std::vector<server_tokens> tokenize_input_prompts(const llama_vocab * vocab, mtmd_context * mctx, const json & json_prompt, bool add_special, bool parse_special) {
@@ -895,15 +894,15 @@ static void handle_media(
         std::vector<std::string> parts = string_split<std::string>(url, /*separator*/ ',');
         if (parts.size() != 2) {
             throw std::runtime_error("Invalid url value");
-        } else if (!string_starts_with(parts[0], "data:image/")) {
-            throw std::runtime_error("Invalid url format: " + parts[0]);
-        } else if (!string_ends_with(parts[0], "base64")) {
-            throw std::runtime_error("url must be base64 encoded");
-        } else {
-            auto base64_data = parts[1];
-            auto decoded_data = base64_decode(base64_data);
-            out_files.push_back(decoded_data);
         }
+        if (!string_starts_with(parts[0], "data:image/")) {
+            throw std::runtime_error("Invalid url format: " + parts[0]);
+        }
+        if (!string_ends_with(parts[0], "base64")) {
+            throw std::runtime_error("url must be base64 encoded");
+        }
+        const auto & base64_data = parts[1];
+        out_files.push_back(base64_decode(base64_data));
     }
 }
 
@@ -1272,7 +1271,9 @@ json format_response_rerank(
     elements.resize(std::min(top_n, (int)elements.size()));
     json results = elements;
 
-    if (is_tei_format) return results;
+    if (is_tei_format) {
+        return results;
+    }
 
     json res = json{
         {"model", json_value(request, "model", model_name)},
@@ -1347,7 +1348,7 @@ static std::string tokens_to_str(const llama_vocab * ctx, Iter begin, Iter end) 
 }
 
 std::string tokens_to_str(llama_context * ctx, const llama_tokens & tokens) {
-    auto model = llama_get_model(ctx);
+    const auto *model = llama_get_model(ctx);
     return tokens_to_str(llama_model_get_vocab(model), tokens.begin(), tokens.end());
 }
 
@@ -1443,19 +1444,22 @@ bool is_valid_utf8(const std::string & str) {
             bytes++;
         } else if ((*bytes & 0xE0) == 0xC0) {
             // 2-byte sequence (110xxxxx 10xxxxxx)
-            if (end - bytes < 2 || (bytes[1] & 0xC0) != 0x80)
+            if (end - bytes < 2 || (bytes[1] & 0xC0) != 0x80) {
                 return false;
+            }
             bytes += 2;
         } else if ((*bytes & 0xF0) == 0xE0) {
             // 3-byte sequence (1110xxxx 10xxxxxx 10xxxxxx)
-            if (end - bytes < 3 || (bytes[1] & 0xC0) != 0x80 || (bytes[2] & 0xC0) != 0x80)
+            if (end - bytes < 3 || (bytes[1] & 0xC0) != 0x80 || (bytes[2] & 0xC0) != 0x80) {
                 return false;
+            }
             bytes += 3;
         } else if ((*bytes & 0xF8) == 0xF0) {
             // 4-byte sequence (11110xxx 10xxxxxx 10xxxxxx 10xxxxxx)
             if (end - bytes < 4 || (bytes[1] & 0xC0) != 0x80 ||
-                (bytes[2] & 0xC0) != 0x80 || (bytes[3] & 0xC0) != 0x80)
+                (bytes[2] & 0xC0) != 0x80 || (bytes[3] & 0xC0) != 0x80) {
                 return false;
+            }
             bytes += 4;
         } else {
             // Invalid UTF-8 lead byte

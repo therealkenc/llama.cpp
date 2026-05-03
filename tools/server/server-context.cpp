@@ -1633,7 +1633,7 @@ private:
         }
         res->timings         = slot.get_timings();
         res->prompt          = slot.task->tokens.detokenize(ctx, true);
-        res->response_fields = std::move(slot.task->params.response_fields);
+        res->response_fields = slot.task->params.response_fields;
 
         res->truncated             = slot.truncated;
         res->n_decoded             = slot.n_decoded;
@@ -2018,7 +2018,9 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
                 {
-                    if (!check_no_mtmd(task.id)) break;
+                    if (!check_no_mtmd(task.id)) {
+                        break;
+                    }
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -2100,7 +2102,7 @@ private:
                     res->id = task.id;
                     for (size_t i = 0; i < loras.size(); ++i) {
                         auto & lora = loras[i];
-                        std::string alora_invocation_string = "";
+                        std::string alora_invocation_string;
                         const uint64_t n_alora_tokens = llama_adapter_get_alora_n_invocation_tokens(lora.ptr);
                         llama_tokens alora_invocation_tokens;
                         if (n_alora_tokens) {
@@ -3091,16 +3093,16 @@ private:
 server_context::server_context() : impl(new server_context_impl()) {}
 server_context::~server_context() = default;
 
-bool server_context::load_model(common_params & params) {
+bool server_context::load_model(common_params & params) const {
     return impl->load_model(params);
 }
 
-void server_context::start_loop() {
+void server_context::start_loop() const {
     auto & params = impl->params_base;
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
 }
 
-void server_context::terminate() {
+void server_context::terminate() const {
     impl->queue_tasks.terminate();
 }
 
@@ -3108,7 +3110,7 @@ llama_context * server_context::get_llama_context() const {
     return impl->ctx;
 }
 
-server_response_reader server_context::get_response_reader() {
+server_response_reader server_context::get_response_reader() const {
     return impl->get_response_reader();
 }
 
@@ -3178,7 +3180,7 @@ struct server_res_generator : server_http_res {
     }
 };
 
-void server_context::on_sleeping_changed(std::function<void(bool)> callback) {
+void server_context::on_sleeping_changed(std::function<void(bool)> callback) const {
     impl->queue_tasks.on_sleeping_state(std::move(callback));
 }
 
@@ -3262,30 +3264,30 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         auto all_results = rd.wait_for_all(req.should_stop);
         if (all_results.is_terminated) {
             return res; // connection is closed
-        } else if (all_results.error) {
+        }
+        if (all_results.error) {
             res->error(all_results.error->to_json());
             return res;
+        }
+        json arr = json::array();
+        for (auto & res : all_results.results) {
+            GGML_ASSERT(dynamic_cast<server_task_result_cmpl_final*>(res.get()) != nullptr);
+            arr.push_back(res->to_json());
+        }
+        GGML_ASSERT(!arr.empty() && "empty results");
+        if (arr.size() == 1) {
+            // if single request, return single object instead of array
+            res->ok(arr[0]);
+        } else if (res_type == TASK_RESPONSE_TYPE_OAI_CHAT || res_type == TASK_RESPONSE_TYPE_OAI_CMPL) {
+            // if multiple results in OAI format, we need to re-format them
+            json & choices = arr[0]["choices"];
+            for (size_t i = 1; i < arr.size(); i++) {
+                choices.push_back(std::move(arr[i]["choices"][0]));
+            }
+            res->ok(arr[0]);
         } else {
-            json arr = json::array();
-            for (auto & res : all_results.results) {
-                GGML_ASSERT(dynamic_cast<server_task_result_cmpl_final*>(res.get()) != nullptr);
-                arr.push_back(res->to_json());
-            }
-            GGML_ASSERT(!arr.empty() && "empty results");
-            if (arr.size() == 1) {
-                // if single request, return single object instead of array
-                res->ok(arr[0]);
-            } else if (res_type == TASK_RESPONSE_TYPE_OAI_CHAT || res_type == TASK_RESPONSE_TYPE_OAI_CMPL) {
-                // if multiple results in OAI format, we need to re-format them
-                json & choices = arr[0]["choices"];
-                for (size_t i = 1; i < arr.size(); i++) {
-                    choices.push_back(std::move(arr[i]["choices"][0]));
-                }
-                res->ok(arr[0]);
-            } else {
-                // multi-results, non-OAI compat
-                res->ok(arr);
-            }
+            // multi-results, non-OAI compat
+            res->ok(arr);
         }
     } else {
         // in streaming mode, the first error must be treated as non-stream response
@@ -3326,7 +3328,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                         {"event", "error"},
                         {"data", res_json},
                     });
-                } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
+                }
+                if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
                     const std::string type = json_value(res_json, "type", std::string("server_error"));
                     std::string code = type;
                     if (type == "exceed_context_size_error") {
@@ -3359,9 +3362,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                             {"response",        response},
                         }},
                     });
-                } else {
-                    return format_oai_sse(json {{ "error", res_json }});
                 }
+                return format_oai_sse(json {{ "error", res_json }});
             };
 
             try {
@@ -3410,19 +3412,18 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     output = format_error(res_type, res_json);
                     SRV_DBG("%s", "error received during streaming, terminating stream\n");
                     return false; // terminate on error
+                }
+                GGML_ASSERT(
+                    dynamic_cast<server_task_result_cmpl_partial*>(result.get()) != nullptr
+                    || dynamic_cast<server_task_result_cmpl_final*>(result.get()) != nullptr
+                );
+                json res_json = result->to_json();
+                if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
+                    output = format_anthropic_sse(res_json);
+                } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
+                    output = format_oai_resp_sse(res_json);
                 } else {
-                    GGML_ASSERT(
-                        dynamic_cast<server_task_result_cmpl_partial*>(result.get()) != nullptr
-                        || dynamic_cast<server_task_result_cmpl_final*>(result.get()) != nullptr
-                    );
-                    json res_json = result->to_json();
-                    if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
-                        output = format_anthropic_sse(res_json);
-                    } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
-                        output = format_oai_resp_sse(res_json);
-                    } else {
-                        output = format_oai_sse(res_json);
-                    }
+                    output = format_oai_sse(res_json);
                 }
 
                 // has next data, continue
@@ -3537,7 +3538,7 @@ void server_routes::init_routes() {
         }
 
         // TODO: get rid of this dynamic_cast
-        auto res_task = dynamic_cast<server_task_result_metrics*>(result.get());
+        auto *res_task = dynamic_cast<server_task_result_metrics*>(result.get());
         GGML_ASSERT(res_task != nullptr);
 
         // metrics definition: https://prometheus.io/docs/practices/naming/#metric-names
@@ -3545,19 +3546,19 @@ void server_routes::init_routes() {
             {"counter", {{
                     {"name",  "prompt_tokens_total"},
                     {"help",  "Number of prompt tokens processed."},
-                    {"value",  (uint64_t) res_task->n_prompt_tokens_processed_total}
+                    {"value",   res_task->n_prompt_tokens_processed_total}
             }, {
                     {"name",  "prompt_seconds_total"},
                     {"help",  "Prompt process time"},
-                    {"value",  (uint64_t) res_task->t_prompt_processing_total / 1.e3}
+                    {"value",   res_task->t_prompt_processing_total / 1.e3}
             }, {
                     {"name",  "tokens_predicted_total"},
                     {"help",  "Number of generation tokens processed."},
-                    {"value",  (uint64_t) res_task->n_tokens_predicted_total}
+                    {"value",   res_task->n_tokens_predicted_total}
             }, {
                     {"name",  "tokens_predicted_seconds_total"},
                     {"help",  "Predict process time"},
-                    {"value",  (uint64_t) res_task->t_tokens_generation_total / 1.e3}
+                    {"value",   res_task->t_tokens_generation_total / 1.e3}
             }, {
                     {"name",  "n_decode_total"},
                     {"help",  "Total number of llama_decode() calls"},
@@ -4172,15 +4173,16 @@ void server_routes::init_routes() {
         // collect results
         if (all_results.is_terminated) {
             return res; // connection is closed
-        } else if (all_results.error) {
+        }
+        if (all_results.error) {
             res->error(all_results.error->to_json());
             return res;
-        } else {
-            for (auto & res : all_results.results) {
-                GGML_ASSERT(dynamic_cast<server_task_result_rerank*>(res.get()) != nullptr);
-                responses.push_back(res->to_json());
-            }
         }
+        for (auto & res : all_results.results) {
+            GGML_ASSERT(dynamic_cast<server_task_result_rerank*>(res.get()) != nullptr);
+            responses.push_back(res->to_json());
+        }
+
 
         // write JSON response
         json root = format_response_rerank(
@@ -4438,14 +4440,14 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
     // collect results
     if (all_results.is_terminated) {
         return res; // connection is closed
-    } else if (all_results.error) {
+    }
+    if (all_results.error) {
         res->error(all_results.error->to_json());
         return res;
-    } else {
-        for (auto & res : all_results.results) {
-            GGML_ASSERT(dynamic_cast<server_task_result_embd*>(res.get()) != nullptr);
-            responses.push_back(res->to_json());
-        }
+    }
+    for (auto & res : all_results.results) {
+        GGML_ASSERT(dynamic_cast<server_task_result_embd*>(res.get()) != nullptr);
+        responses.push_back(res->to_json());
     }
 
     // write JSON response

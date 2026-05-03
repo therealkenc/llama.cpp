@@ -11,7 +11,6 @@
 
 #include <string>
 #include <vector>
-#include <cinttypes>
 
 using json = nlohmann::ordered_json;
 
@@ -82,7 +81,7 @@ struct server_grammar_trigger {
     }
 };
 
-json format_error_response(const std::string & message, const enum error_type type);
+json format_error_response(const std::string & message, enum error_type type);
 
 //
 // random string / id
@@ -256,7 +255,7 @@ llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt,
 size_t validate_utf8(const std::string& text);
 
 // process mtmd prompt, return the server_tokens containing both text tokens and media chunks
-server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> files);
+server_tokens process_mtmd_prompt(mtmd_context * mctx, const std::string & prompt, const std::vector<raw_buffer> & files);
 
 /**
  * break the input "prompt" object into multiple prompt if needed, then tokenize them
@@ -336,7 +335,7 @@ std::string tokens_to_str(llama_context * ctx, const llama_tokens & tokens);
 std::string tokens_to_str(const llama_vocab * vocab, const llama_tokens & tokens);
 
 // format incomplete utf-8 multibyte character for output
-std::string tokens_to_output_formatted_string(const llama_context * ctx, const llama_token token);
+std::string tokens_to_output_formatted_string(const llama_context * ctx, llama_token token);
 
 // format server-sent event (SSE), return the formatted string to send
 // note: if data is a json array, it will be sent as multiple events, one per item
@@ -359,10 +358,10 @@ llama_tokens format_prompt_infill(
         const json & input_prefix,
         const json & input_suffix,
         const json & input_extra,
-        const int n_batch,
-        const int n_predict,
-        const int n_ctx,
-        const bool spm_infill,
+        int n_batch,
+        int n_predict,
+        int n_ctx,
+        bool spm_infill,
         const llama_tokens & tokens_prompt);
 
 // format rerank task: [BOS]query[EOS][SEP]doc[EOS].

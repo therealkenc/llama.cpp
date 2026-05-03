@@ -223,7 +223,7 @@ struct server_task {
     static task_params params_from_json_cmpl(
         const llama_vocab * vocab,
         const common_params & params_base,
-        const int n_ctx_slot,
+        int n_ctx_slot,
         const std::vector<llama_logit_bias> & logit_bias_eog,
         const json & data);
 
@@ -232,7 +232,7 @@ struct server_task {
         std::unordered_set<int> ids(tasks.size());
         for (size_t i = 0; i < tasks.size(); i++) {
             ids.insert(tasks[i].id);
-            for (auto & child : tasks[i].child_tasks) {
+            for (const auto & child : tasks[i].child_tasks) {
                 ids.insert(child.id);
             }
         }
@@ -317,7 +317,7 @@ struct server_task_result {
         // only used by server_task_result_cmpl_*
         return true;
     }
-    virtual void update(task_result_state &) {
+    virtual void update(task_result_state & /*state*/) {
         // only used by server_task_result_cmpl_*
     }
     virtual json to_json() = 0;

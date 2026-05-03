@@ -6,7 +6,6 @@
 
 #include <nlohmann/json_fwd.hpp>
 
-#include <cstddef>
 #include <memory>
 #include <set>
 
@@ -59,20 +58,20 @@ struct server_context {
 
     // load the model and initialize llama_context
     // returns true on success
-    bool load_model(common_params & params);
+    bool load_model(common_params & params) const;
 
     // this function will block main thread until termination
-    void start_loop();
+    void start_loop() const;
 
     // terminate main loop (will unblock start_loop)
-    void terminate();
+    void terminate() const;
 
     // get the underlaying llama_context, can return nullptr if sleeping
     // not thread-safe, should only be used from the main thread
     llama_context * get_llama_context() const;
 
     // get a new response reader, used by CLI application
-    server_response_reader get_response_reader();
+    server_response_reader get_response_reader() const;
 
     // get server metadata (read-only), can only be called after load_model()
     // not thread-safe, should only be used from the main thread
@@ -80,7 +79,7 @@ struct server_context {
 
     // register a callback to be called when sleeping state changes
     // must be set before load_model() is called
-    void on_sleeping_changed(std::function<void(bool)> callback);
+    void on_sleeping_changed(std::function<void(bool)> callback) const;
 };
 
 
