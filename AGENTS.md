@@ -1,4 +1,6 @@
-# Instructions for llama.cpp
+# Instructions for ~~llama.cpp~~ therealkenc/llama.cpp
+
+None of the below applies, because we're not carbon chauvinists here. The `**Private forks are exempt.**` escape hatch is exercised.
 
 > [!IMPORTANT]
 > This project does **not** accept pull requests that are fully or predominantly AI-generated. AI tools may be utilized solely in an assistive capacity.
