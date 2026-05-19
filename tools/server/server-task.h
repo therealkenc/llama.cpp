@@ -126,11 +126,7 @@ struct task_result_state {
     bool oai_resp_reasoning_done = false;
     bool oai_resp_message_done = false;
 
-    task_result_state(const common_chat_parser_params & chat_parser_params)
-        : chat_parser_params(chat_parser_params)
-        , oai_resp_id("resp_" + random_string())
-        , oai_resp_reasoning_id("rs_" + random_string())
-        , oai_resp_message_id("msg_" + random_string()) {}
+    task_result_state(const common_chat_parser_params & chat_parser_params);
 
     // parse partial tool calls and update the internal state
     common_chat_msg update_chat_msg(
