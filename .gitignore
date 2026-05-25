@@ -157,3 +157,10 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# Local ignores
+build/
+scripts-ken/
+tools/ui/.svelte-kit/
+tools/ui/node_modules/
+
