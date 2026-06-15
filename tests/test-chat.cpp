@@ -1935,6 +1935,10 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
         }
     })";
 
+    const char * const_schema = R"({
+        "const": "42"
+    })";
+
     {
         // Qwen3.5 (basically same as Nemotron, but keeping separate tests just in case)
         auto tst = peg_tester("models/templates/Qwen3.5-4B.jinja", detailed_debug);
@@ -2017,6 +2021,25 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
         })
             .expect_tool_calls({
                 { "python", "{\"code\": \"def hello():\\n    print(\\\"Hello, world!\\\")\\n\\nhello()\"}", {} },
+            })
+            .run();
+
+        // test code that starts with indent
+        tst.test(
+               "<tool_call>\n"
+               "<function=python>\n"
+               "<parameter=code>\n"
+               "    print(\"Hello, world!\")\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({
+                python_tool
+        })
+            .expect_tool_calls({
+                { "python", "{\"code\": \"    print(\\\"Hello, world!\\\")\"}", {} },
             })
             .run();
 
@@ -2645,6 +2668,100 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
     }
 
     {
+        // Cohere2 MoE (North Code) - dedicated parser.
+        // Marker-wrapped format: <|START_THINKING|>...<|END_THINKING|> then either
+        // <|START_TEXT|>...<|END_TEXT|> (content) or <|START_ACTION|>[json]<|END_ACTION|> (tools).
+        // The generation prompt forces a leading <|START_THINKING|>, so model output begins inside
+        // the thinking block: test inputs start with the reasoning body, not the <|START_THINKING|> tag.
+        auto tst = peg_tester("models/templates/Cohere2MoE.jinja", detailed_debug);
+
+        // Content with reasoning, extracted.
+        tst.test("I'm\nthinking<|END_THINKING|><|START_TEXT|>Hello, world!\nWhat's up?<|END_TEXT|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect(message_assist_thoughts)
+            .run();
+
+        // Content with reasoning, reasoning_format=NONE -> thinking kept inline in content (markers preserved).
+        tst.test("I'm\nthinking<|END_THINKING|><|START_TEXT|>Hello, world!\nWhat's up?<|END_TEXT|>")
+            .expect(message_assist_thoughts_unparsed_r7b)
+            .run();
+
+        // Content with empty thinking block.
+        tst.test("<|END_THINKING|><|START_TEXT|>Hello, world!\nWhat's up?<|END_TEXT|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect(message_assist)
+            .run();
+
+        // Single tool call with reasoning.
+        tst.test(
+               "I'm\nthinking<|END_THINKING|>"
+               "<|START_ACTION|>[\n"
+               "    {\"tool_call_id\": \"0\", \"tool_name\": \"special_function\", \"parameters\": {\"arg1\": 1}}\n"
+               "]<|END_ACTION|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ special_function_tool })
+            .expect(message_assist_thoughts_call_idx)
+            .run();
+
+        // Single tool call, empty thinking block (no reasoning content).
+        tst.test(
+               "<|END_THINKING|>"
+               "<|START_ACTION|>[\n"
+               "    {\"tool_call_id\": \"0\", \"tool_name\": \"special_function\", \"parameters\": {\"arg1\": 1}}\n"
+               "]<|END_ACTION|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ special_function_tool })
+            .expect(message_assist_call_idx)
+            .run();
+
+        // Tool call with an array argument (todo_list).
+        tst.test(
+               "<|END_THINKING|>"
+               "<|START_ACTION|>[\n"
+               "    {\"tool_call_id\": \"0\", \"tool_name\": \"todo_list\", \"parameters\": {\"todos\": [\"buy milk\", \"walk dog\"]}}\n"
+               "]<|END_ACTION|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ todo_list })
+            .expect(simple_assist_msg("", "", "todo_list", "{\"todos\": [\"buy milk\", \"walk dog\"]}", "0"))
+            .run();
+
+        // Parallel tool calls with reasoning.
+        tst.test(
+               "I'm\nthinking<|END_THINKING|>"
+               "<|START_ACTION|>[\n"
+               "    {\"tool_call_id\": \"0\", \"tool_name\": \"special_function\", \"parameters\": {\"arg1\": 1}},\n"
+               "    {\"tool_call_id\": \"1\", \"tool_name\": \"python\", \"parameters\": {\"code\": \"print('hey')\"}}\n"
+               "]<|END_ACTION|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .parallel_tool_calls(true)
+            .tools({ special_function_tool, python_tool })
+            .expect_reasoning("I'm\nthinking")
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 1})", "0" },
+                { "python", "{\"code\": \"print('hey')\"}", "1" },
+            })
+            .run();
+
+        // Tools available but the model answers with content instead of calling a tool.
+        tst.test("I'm\nthinking<|END_THINKING|><|START_TEXT|>Hello, world!\nWhat's up?<|END_TEXT|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ special_function_tool })
+            .expect(message_assist_thoughts)
+            .run();
+
+        // Partial tool call (streaming): name/id resolved before arguments arrive.
+        tst.test(
+               "I'm\nthinking<|END_THINKING|>"
+               "<|START_ACTION|>[\n"
+               "    {\"tool_call_id\": \"0\", \"tool_name\": \"special_function\", ")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ special_function_tool })
+            .is_partial(true)
+            .expect(message_assist_thoughts_partial_call)
+            .run();
+    }
+
+    {
         // Google Gemma 2 2B - does not support tool calling
         auto tst = peg_tester("models/templates/google-gemma-2-2b-it.jinja");
 
@@ -3102,18 +3219,16 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
         tst.test(
                "<seed:tool_call>\n"
                "<function=edit>\n"
-               "<parameter=filename>\n"
-               "foo.cpp\n"
+               "<parameter=filename>"
+               "foo.cpp"
                "</parameter>\n"
                "<parameter=oldString>"
                "def foo(arg = \"14\"):\n"
                "    return arg + \"bar\"\n"
-               "\n"
                "</parameter>\n"
                "<parameter=newString>"
                "def foo(arg = \"15\"):\n"
                "    pass\n"
-               "\n"
                "</parameter>\n"
                "</function>\n"
                "</seed:tool_call>")
@@ -4832,6 +4947,20 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
         // Llama 3.1
         auto tst = peg_tester("models/templates/meta-llama-Llama-3.1-8B-Instruct.jinja", detailed_debug);
         tst.test("Hello, world!\nWhat's up?").tools({ special_function_tool }).expect(message_assist).expect_reconstruction().run();
+
+        tst.test(
+             "```json\n\"42\" \n```")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .json_schema(const_schema)
+            .expect_content(R"("42")")
+            .run();
+
+        tst.test(
+             "\"42\" \n")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .json_schema(const_schema)
+            .expect_content(R"("42")")
+            .run();
 
         // Continuation tests
         tst.test("world!\nWhat's up?")
