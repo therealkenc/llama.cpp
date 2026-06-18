@@ -19,6 +19,8 @@ add_library(${TARGET} STATIC
     server-tools.h
     responses_item_cache.cpp
     responses_item_cache.h
+    server-schema.cpp
+    server-schema.h
 )
 
 if (BUILD_SHARED_LIBS)
