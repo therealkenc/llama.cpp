@@ -943,6 +943,8 @@ private:
 
     bool sleeping = false;
 
+    int64_t t_last_load_progress_ms = 0;
+
     void destroy() {
         spec.reset();
         ctx_dft.reset();
@@ -1256,6 +1258,10 @@ private:
         }
 
         if (has_mmproj) {
+            if (callback_state) {
+                callback_state(SERVER_STATE_LOADING, {{"stage", "mmproj_model"}});
+            }
+
             if (!is_resume) {
                 mtmd_helper_log_set(common_log_default_callback, nullptr);
             }
