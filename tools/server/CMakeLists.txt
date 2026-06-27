@@ -15,6 +15,8 @@ add_library(${TARGET} STATIC
     server-common.h
     server-context.cpp
     server-context.h
+    server-stream.cpp
+    server-stream.h
     server-tools.cpp
     server-tools.h
     responses_item_cache.cpp

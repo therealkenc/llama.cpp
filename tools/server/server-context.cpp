@@ -6,6 +6,7 @@
 #include "server-queue.h"
 #include "responses_item_cache.h"
 #include "server-schema.h"
+#include "server-stream.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -4039,6 +4040,15 @@ struct server_res_generator : server_http_res {
             queue_tasks.wait_until_no_sleep();
         }
     }
+    ~server_res_generator() override {
+        // cleanup() must run while rd is still alive (rd is destroyed after this body returns)
+        if (spipe) {
+            spipe->cleanup();
+        }
+    }
+    void stop() override {
+        rd.stop();
+    }
     void ok(const json & response_data) {
         status = 200;
         data = safe_json_to_str(response_data);
@@ -4274,8 +4284,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 return format_oai_sse(json {{ "error", res_json }});
             };
 
+            auto effective_should_stop = stream_aware_should_stop(res_this, req.should_stop);
+
             try {
-                if (req.should_stop()) {
+                if (effective_should_stop()) {
                     SRV_DBG("%s", "stopping streaming due to should_stop condition\n");
                     return false; // should_stop condition met
                 }
@@ -4309,8 +4321,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 // receive subsequent results
                 bool timeout = false;
                 int64_t start_time = ggml_time_ms();
-                auto result = rd.next([&timeout, &req, &start_time, &params]() {
-                    if (req.should_stop()) {
+                auto result = rd.next([&timeout, &start_time, &params, &effective_should_stop]() {
+                    if (effective_should_stop()) {
                         return true; // should_stop condition met
                     } else if (params.sse_ping_interval > 0 && ggml_time_ms() - start_time > (int64_t)params.sse_ping_interval * 1000) {
                         timeout = true;
@@ -4328,7 +4340,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
                 if (result == nullptr) {
                     SRV_DBG("%s", "stopping streaming due to should_stop condition\n");
-                    GGML_ASSERT(req.should_stop());
+                    GGML_ASSERT(effective_should_stop());
                     return false; // should_stop condition met
                 }
 
@@ -4367,6 +4379,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             }
         };
     }
+
+    // attach a producer pipe to the response when X-Conversation-Id is present.
+    // the pipe mirrors SSE chunks into the ring buffer and wires up the cancel hook.
+    stream_session_attach_pipe(*res, req.headers);
 
     return res;
 }

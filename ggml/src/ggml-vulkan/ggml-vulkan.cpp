@@ -308,6 +308,7 @@ enum vk_device_architecture {
     AMD_RDNA1,
     AMD_RDNA2,
     AMD_RDNA3,
+    INTEL_XE1,
     INTEL_XE2,
     NVIDIA_PRE_TURING,
     NVIDIA_TURING,
@@ -365,21 +366,26 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
         const std::vector<vk::ExtensionProperties> ext_props = device.enumerateDeviceExtensionProperties();
 
         bool subgroup_size_control = false;
+        bool integer_dot_product = false;
 
         for (const auto& properties : ext_props) {
             if (strcmp("VK_EXT_subgroup_size_control", properties.extensionName) == 0) {
                 subgroup_size_control = true;
+            } else if (strcmp("VK_KHR_shader_integer_dot_product", properties.extensionName) == 0) {
+                integer_dot_product = true;
             }
         }
 
-        if (!subgroup_size_control) {
+        if (!subgroup_size_control || !integer_dot_product) {
             return vk_device_architecture::OTHER;
         }
 
         vk::PhysicalDeviceProperties2 props2;
         vk::PhysicalDeviceSubgroupSizeControlPropertiesEXT subgroup_size_control_props;
+        vk::PhysicalDeviceShaderIntegerDotProductPropertiesKHR integer_dot_props;
 
         props2.pNext = &subgroup_size_control_props;
+        subgroup_size_control_props.pNext = &integer_dot_props;
         device.getProperties2(&props2);
 
         if (subgroup_size_control_props.minSubgroupSize == 16) {
@@ -388,6 +394,9 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
             // https://www.intel.com/content/www/us/en/content-details/824434/2024-intel-tech-tour-xe2-and-lunar-lake-s-gpu.html
             // https://www.intel.com/content/www/us/en/docs/oneapi/optimization-guide-gpu/2025-0/intel-xe-gpu-architecture.html
             return vk_device_architecture::INTEL_XE2;
+        } else if (subgroup_size_control_props.minSubgroupSize == 8 &&
+                 integer_dot_product && integer_dot_props.integerDotProduct4x8BitPackedSignedAccelerated) {
+            return vk_device_architecture::INTEL_XE1;
         }
     } else if (props.vendorID == VK_VENDOR_ID_NVIDIA) {
         const std::vector<vk::ExtensionProperties> ext_props = device.enumerateDeviceExtensionProperties();
@@ -699,6 +708,7 @@ struct vk_device_struct {
 
     bool add_rms_fusion;
     uint32_t partials_binding_alignment;
+    uint32_t max_nodes_per_submit;
 
     bool shader_64b_indexing;
 
@@ -3836,7 +3846,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             l_warptile = { 256, 128, 128, 16, subgroup_size_8, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
             l_warptile_mmq = l_warptile_mmq_int = { 256, 128, 128, 32, subgroup_size_8, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
             l_warptile_mmq_int_k = { 256, 128, 128, 32, subgroup_size_16, 64, 1, 4, 2, 1, subgroup_size_16 };
-        } else if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support && device->architecture == INTEL_XE2) {
+        } else if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support) {
             // Xe2/Xe3 with coopmat enabled - warptile performance tuning
             l_warptile = { 512, 128, 128, 16, subgroup_size_8, 32, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
             l_warptile_mmq = { 512, 128, 128, 32, subgroup_size_8, 32, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
@@ -4709,7 +4719,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
     uint32_t rm_iq = 2 * rm_kq;
 
-    const bool use_subgroups = device->subgroup_arithmetic && device->architecture != vk_device_architecture::AMD_GCN;
+    const bool use_subgroups = device->subgroup_arithmetic;
     // Ensure a subgroup size >= 16 is available
     const bool use_subgroups16 = use_subgroups && subgroup_min_size_16;
 
@@ -5878,6 +5888,14 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->subgroup_vote = (vk11_props.subgroupSupportedStages & vk::ShaderStageFlagBits::eCompute) &&
                                 (vk11_props.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eVote);
 
+        // Submit at least every 100 nodes, in case there are workloads without as much matmul.
+        device->max_nodes_per_submit = 100;
+        const char* GGML_VK_MAX_NODES_PER_SUBMIT = getenv("GGML_VK_MAX_NODES_PER_SUBMIT");
+        if (GGML_VK_MAX_NODES_PER_SUBMIT != nullptr) {
+            uint32_t max_nodes_per_submit = std::stoul(GGML_VK_MAX_NODES_PER_SUBMIT);
+            device->max_nodes_per_submit = std::max(max_nodes_per_submit, 1u);
+        }
+
         const bool force_disable_f16 = getenv("GGML_VK_DISABLE_F16") != nullptr;
 
         device->fp16 = !force_disable_f16 && fp16_storage && fp16_compute;
@@ -6352,9 +6370,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 break;
             case VK_VENDOR_ID_INTEL: {
                 // Current Windows driver does not expose BF16 support.
-                // We only want to use l_warptile if coopmat is available and is Xe2+
-                const bool xe2_with_coopmat = device->coopmat_support && device->architecture == INTEL_XE2;
-                const bool use_l_warptile = (i == GGML_TYPE_BF16) ? (device->coopmat_bf16_support && xe2_with_coopmat) : xe2_with_coopmat;
+                // We only want to use l_warptile if coopmat is available
+                const bool use_l_warptile = (i == GGML_TYPE_BF16) ? (device->coopmat_bf16_support && device->coopmat_support) : device->coopmat_support;
                 device->mul_mat_l[i] = use_l_warptile;
                 device->mul_mat_id_l[i] = use_l_warptile;
                 device->mul_mat_m[i] = true;
@@ -16173,8 +16190,6 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     // Submit after enough work has accumulated, to overlap CPU cmdbuffer generation with GPU execution.
     // Estimate the amount of matmul work by looking at the weight matrix size, and submit every 100MB
     // (and scaled down based on model size, so smaller models submit earlier).
-    // Also submit at least every 100 nodes, in case there are workloads without as much matmul.
-    int nodes_per_submit = 100;
     int submitted_nodes = 0;
     int submit_count = 0;
     uint64_t mul_mat_bytes = 0;
@@ -16400,7 +16415,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
         bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
-        bool submit = (submitted_nodes >= nodes_per_submit) ||
+        bool submit = ((uint32_t)submitted_nodes >= ctx->device->max_nodes_per_submit) ||
                       (mul_mat_bytes_per_submit != 0 && mul_mat_bytes >= mul_mat_bytes_per_submit) ||
                       (i + ctx->num_additional_fused_ops >= last_node) ||
                       (almost_ready && !ctx->almost_ready_fence_pending);
@@ -17883,9 +17898,9 @@ static bool ggml_vk_device_is_supported(const vk::PhysicalDevice & vkdev) {
 static bool ggml_vk_khr_cooperative_matrix_support(const vk::PhysicalDeviceProperties& props, const vk::PhysicalDeviceDriverProperties& driver_props, vk_device_architecture arch) {
     switch (props.vendorID) {
     case VK_VENDOR_ID_INTEL:
-        // Only allowing Xe2 GPU at the moment since Xe2 GPU can gain significant performance boost,
-        // while some older hardware (ex. Arc A770) has performance regressions
-        return arch == vk_device_architecture::INTEL_XE2;
+        // Only allowing Xe2/Xe3 GPU and integrated Xe GPUs at the moment since older hardware (ex. Arc A770) has performance regressions.
+        return (arch == vk_device_architecture::INTEL_XE2) ||
+            (arch == vk_device_architecture::INTEL_XE1 && props.deviceType == vk::PhysicalDeviceType::eIntegratedGpu && driver_props.driverID == vk::DriverId::eIntelProprietaryWindows);
     case VK_VENDOR_ID_AMD:
         if (driver_props.driverID == vk::DriverId::eAmdProprietary || driver_props.driverID == vk::DriverId::eAmdOpenSource) {
             // Workaround for AMD proprietary driver reporting support on all GPUs
@@ -17933,6 +17948,8 @@ static uint32_t ggml_vk_intel_shader_core_count(const vk::PhysicalDevice& vkdev)
     case 0xE20B:  // B580
     case 0xE211:  // Pro B60
         return 20;
+    case 0xB080:  // PTL Xe3 LPG 2x6 (12 subslices)
+        return 12;
     default:
         return 0;
     }
