@@ -60,7 +60,6 @@ int llama_cli(int argc, char ** argv) {
     if (!ctx_cli.init()) {
         return 1;
     }
-    ctx_cli.defaults.sampling = params.sampling;
 
     return ctx_cli.run();
 }
