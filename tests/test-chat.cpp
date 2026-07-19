@@ -1822,7 +1822,7 @@ static void test_convert_responses_to_chatcmpl() {
         assert_equals(100, result.at("max_tokens").get<int>());
     }
 
-    // Test mixed Responses tools: convert only function tools
+    // Test mixed Responses tools: convert function and locally bridged tools
     {
         json input = json::parse(R"({
             "input": "Hello",
@@ -1863,15 +1863,19 @@ static void test_convert_responses_to_chatcmpl() {
 
         assert_equals(true, result.contains("tools"));
         assert_equals(true, result.at("tools").is_array());
-        assert_equals((size_t)1, result.at("tools").size());
+        assert_equals((size_t) 2, result.at("tools").size());
 
         const auto & tool = result.at("tools")[0];
         assert_equals(std::string("function"), tool.at("type").get<std::string>());
         assert_equals(std::string("get_weather"), tool.at("function").at("name").get<std::string>());
         assert_equals(true, tool.at("function").at("strict").get<bool>());
+
+        const auto & image_tool = result.at("tools")[1];
+        assert_equals(std::string("function"), image_tool.at("type").get<std::string>());
+        assert_equals(std::string("image_generation"), image_tool.at("function").at("name").get<std::string>());
     }
 
-    // Test non-function Responses tools are ignored
+    // Test unsupported hosted tools are ignored while local image generation remains available
     {
         json input = json::parse(R"({
             "input": "Hello",
@@ -1896,8 +1900,75 @@ static void test_convert_responses_to_chatcmpl() {
 
         json result = server_chat_convert_responses_to_chatcmpl(input);
 
-        assert_equals(false, result.contains("tools"));
+        assert_equals(true, result.contains("tools"));
+        assert_equals((size_t) 1, result.at("tools").size());
+        const auto & tool = result.at("tools")[0];
+        assert_equals(std::string("image_generation"), tool.at("function").at("name").get<std::string>());
     }
+}
+
+static void assert_responses_video_content(const json & content, const std::string & expected_data) {
+    assert_equals(true, content.is_array());
+    assert_equals((size_t) 1, content.size());
+    const auto & video = content[0];
+    assert_equals(std::string("input_video"), video.at("type").get<std::string>());
+    assert_equals(expected_data, video.at("input_video").at("data").get<std::string>());
+}
+
+static void test_convert_responses_video_input_file() {
+    const json input = json::parse(R"({
+        "input": [{
+            "role": "user",
+            "content": [{
+                "type": "input_file",
+                "filename": "clip.mp4",
+                "file_data": "data:video/mp4;base64,QUJD"
+            }]
+        }]
+    })");
+
+    const json result = server_chat_convert_responses_to_chatcmpl(input);
+    assert_equals((size_t) 1, result.at("messages").size());
+    assert_equals(std::string("user"), result.at("messages")[0].at("role").get<std::string>());
+    assert_responses_video_content(result.at("messages")[0].at("content"), "QUJD");
+}
+
+static void test_convert_responses_video_tool_output() {
+    const json input = json::parse(R"({
+        "input": [{
+            "type": "function_call_output",
+            "call_id": "call_video",
+            "output": [{
+                "type": "input_file",
+                "filename": "clip.webm",
+                "file_data": "data:video/webm;base64,REVG"
+            }]
+        }]
+    })");
+
+    const json result = server_chat_convert_responses_to_chatcmpl(input);
+    assert_equals((size_t) 1, result.at("messages").size());
+    assert_equals(std::string("tool"), result.at("messages")[0].at("role").get<std::string>());
+    assert_responses_video_content(result.at("messages")[0].at("content"), "REVG");
+}
+
+static void test_convert_responses_non_video_input_file() {
+    const json input = json::parse(R"({
+        "input": [{
+            "role": "user",
+            "content": [{
+                "type": "input_file",
+                "filename": "notes.txt",
+                "file_data": "data:text/plain;base64,SEVMTE8="
+            }]
+        }]
+    })");
+
+    const json   result  = server_chat_convert_responses_to_chatcmpl(input);
+    const json & content = result.at("messages")[0].at("content");
+    assert_equals((size_t) 1, content.size());
+    assert_equals(std::string("text"), content[0].at("type").get<std::string>());
+    assert_contains(content[0].at("text").get<std::string>(), "notes.txt");
 }
 
 // Shared LFM2 parser cases - all variants use one output format and parser
@@ -6065,6 +6136,9 @@ int main(int argc, char ** argv) {
         test_msgs_oaicompat_json_conversion();
         test_msg_token_delimiters_split();
         test_tools_oaicompat_json_conversion();
+        test_convert_responses_video_input_file();
+        test_convert_responses_video_tool_output();
+        test_convert_responses_non_video_input_file();
         test_convert_responses_to_chatcmpl();
         test_developer_role_to_system_workaround();
         test_template_generation_prompt();

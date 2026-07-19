@@ -5,6 +5,9 @@
 #include <sstream>
 #include <unordered_set>
 
+static constexpr char VIDEO_DATA_URL_PREFIX[]     = "data:video/";
+static constexpr char DATA_URL_BASE64_SEPARATOR[] = ";base64,";
+
 static bool exists_and_is_array(const json & j, const char * key) { return j.contains(key) && j.at(key).is_array(); }
 static bool exists_and_is_string(const json & j, const char * key) { return j.contains(key) && j.at(key).is_string(); }
 
@@ -172,6 +175,26 @@ static std::string mcp_image_to_data_url(const json & image) {
     return "data:" + mime_type + ";base64," + data;
 }
 
+static std::string video_data_url_payload(const std::string & data_url) {
+    if (data_url.rfind(VIDEO_DATA_URL_PREFIX, 0) != 0) {
+        return "";
+    }
+    const size_t separator = data_url.find(DATA_URL_BASE64_SEPARATOR);
+    if (separator == std::string::npos) {
+        return "";
+    }
+    return data_url.substr(separator + sizeof(DATA_URL_BASE64_SEPARATOR) - 1);
+}
+
+static json responses_make_video_content(const std::string & data) {
+    return json{
+        { "input_video", json{ { "data", data } } },
+        { "type",        "input_video"            },
+    };
+}
+
+static json responses_input_file_content(const json & input_file);
+
 static json encode_tool_output_content_item(const json & item) {
     const std::string type = json_value(item, "type", std::string());
     if (type == "input_text" || type == "output_text" || type == "text") {
@@ -197,6 +220,9 @@ static json encode_tool_output_content_item(const json & item) {
             };
         }
         return responses_make_text_content("[image output item missing data]");
+    }
+    if (type == "input_file") {
+        return responses_input_file_content(item);
     }
     return responses_make_text_content("[unsupported tool output item: " + item.dump() + "]");
 }
@@ -450,6 +476,13 @@ static std::string input_file_text(const json & input_item) {
         return "[file: " + label + "]\n" + truncate_for_prompt(file_data);
     }
     return "[file: " + label + " data unavailable]";
+}
+
+static json responses_input_file_content(const json & input_file) {
+    const std::string file_data  = json_value(input_file, "file_data", std::string());
+    const std::string video_data = video_data_url_payload(file_data);
+    return video_data.empty() ? responses_make_text_content(input_file_text(input_file)) :
+                                responses_make_video_content(video_data);
 }
 
 static std::string compaction_summary_text(const json & item) {
@@ -767,7 +800,7 @@ json server_chat_convert_responses_to_chatcmpl(
                             {"type", "image_url"},
                         });
                     } else if (type == "input_file") {
-                        chatcmpl_content.push_back(responses_make_text_content(input_file_text(input_item)));
+                        chatcmpl_content.push_back(responses_input_file_content(input_item));
                     } else {
                         const std::string item_type = type.empty() ? std::string("unknown") : type;
                         responses_append_recovery_text(
