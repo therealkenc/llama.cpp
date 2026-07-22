@@ -32,6 +32,10 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb/stb_image.h"
 
+#ifdef MTMD_WEBP
+#include <webp/decode.h>
+#endif
+
 #ifdef MTMD_INTERNAL_HEADER
 #error "mtmd-helper is a public library outside of mtmd. it must not include internal headers"
 #endif
@@ -511,6 +515,28 @@ static std::string fnv_hash(const uint8_t * data, size_t len) {
     return std::to_string(hash);
 }
 
+#ifdef MTMD_WEBP
+static mtmd_bitmap * decode_static_webp(const unsigned char * buf, size_t len, bool placeholder) {
+    WebPBitstreamFeatures features;
+    if (WebPGetFeatures(buf, len, &features) != VP8_STATUS_OK || features.has_animation) {
+        return nullptr;
+    }
+    if (placeholder) {
+        return mtmd_bitmap_init(features.width, features.height, nullptr);
+    }
+
+    int width;
+    int height;
+    uint8_t * data = WebPDecodeRGB(buf, len, &width, &height);
+    if (!data) {
+        return nullptr;
+    }
+    mtmd_bitmap * bitmap = mtmd_bitmap_init(width, height, data);
+    WebPFree(data);
+    return bitmap;
+}
+#endif
+
 mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_buf(mtmd_context * ctx, const unsigned char * buf, size_t len, bool placeholder) {
     // calculate the hash if needed
     std::string id;
@@ -537,6 +563,13 @@ mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_buf(mtmd_context * ctx, 
     }
 
     // otherwise, we assume it's an image
+#ifdef MTMD_WEBP
+    result = decode_static_webp(buf, len, placeholder);
+    if (result) {
+        mtmd_bitmap_set_id(result, id.empty() ? nullptr : id.c_str());
+        return {result, nullptr};
+    }
+#endif
     if (!result) {
         int nx, ny, nc;
         auto * data = stbi_load_from_memory(buf, len, &nx, &ny, &nc, 3);
@@ -651,6 +684,7 @@ struct mtmd_helper_video {
     // RAII wrapper for managing subprocess
     struct subprocess_handle {
         struct subprocess_s proc = {};
+        bool created = false;
         bool alive = false;
         std::thread feeder;
 
@@ -660,6 +694,9 @@ struct mtmd_helper_video {
         ~subprocess_handle() { stop(); }
 
         void stop() {
+            if (!created) {
+                return;
+            }
             if (alive) {
                 subprocess_terminate(&proc);
             }
@@ -668,10 +705,10 @@ struct mtmd_helper_video {
             if (feeder.joinable()) {
                 feeder.join();
             }
-            if (alive) {
-                subprocess_destroy(&proc);
-                alive = false;
-            }
+            subprocess_join(&proc, nullptr);
+            subprocess_destroy(&proc);
+            created = false;
+            alive = false;
         }
 
         FILE * stdout_pipe() {
@@ -730,6 +767,7 @@ struct mtmd_helper_video {
             LOG_ERR("%s: failed to launch ffprobe\n", __func__);
             return false;
         }
+        probe_sp.created = true;
         probe_sp.alive = true;
 
         if (is_buf_input()) {
@@ -766,6 +804,7 @@ struct mtmd_helper_video {
             }
         }
 
+        probe_sp.alive = false;
         probe_sp.stop();
 
         if (width == 0 || height == 0 || orig_fps <= 0.0f) {
@@ -840,7 +879,8 @@ struct mtmd_helper_video {
             subprocess_option_search_user_path | subprocess_option_inherit_environment,
             &sp.proc);
 
-        sp.alive = (ret == 0);
+        sp.created = (ret == 0);
+        sp.alive = sp.created;
         LOG_DBG("%s: subprocess_create ret=%d proc_alive=%d\n", __func__, ret, (int)sp.alive);
 
         if (sp.alive && is_buf_input()) {

@@ -1,6 +1,7 @@
 # mtmd
 
 set(MTMD_VIDEO ON CACHE BOOL "enable video support in mtmd (requires ffmpeg binary in PATH)")
+set(MTMD_WEBP ON CACHE BOOL "enable native static WebP support in mtmd when libwebp is available")
 # TODO: add MTMD_VIDEO_METHOD in the future to select between ffmpeg and other backends
 
 find_package(Threads REQUIRED)
@@ -66,6 +67,19 @@ target_include_directories(mtmd PRIVATE ../..)
 target_include_directories(mtmd PRIVATE ../../vendor)
 target_compile_features   (mtmd PRIVATE cxx_std_17)
 
+set(MTMD_WEBP_ENABLED OFF)
+if (MTMD_WEBP)
+    find_package(WebP CONFIG QUIET)
+    if (TARGET WebP::webpdecoder)
+        target_link_libraries(mtmd PRIVATE WebP::webpdecoder)
+        target_compile_definitions(mtmd PRIVATE MTMD_WEBP)
+        set(MTMD_WEBP_ENABLED ON)
+        message(STATUS "mtmd: native static WebP support enabled")
+    else()
+        message(STATUS "mtmd: libwebp not found; static WebP will use the video fallback")
+    endif()
+endif()
+
 if (MTMD_VIDEO)
     target_compile_definitions(mtmd PRIVATE MTMD_VIDEO)
 endif()
@@ -104,6 +118,26 @@ endif()
 if (TARGET BUILD_INFO)
     add_dependencies(mtmd        BUILD_INFO)
     add_dependencies(mtmd-helper BUILD_INFO)
+endif()
+
+if (LLAMA_BUILD_TESTS AND BUILD_TESTING)
+    if (MTMD_VIDEO AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(test-mtmd-video ../../tests/test-mtmd-video.cpp)
+        target_link_libraries(test-mtmd-video PRIVATE mtmd)
+        add_test(
+            NAME test-mtmd-video
+            COMMAND test-mtmd-video "${CMAKE_CURRENT_SOURCE_DIR}/test-3.mp4")
+        set_tests_properties(test-mtmd-video PROPERTIES LABELS main SKIP_RETURN_CODE 77)
+    endif()
+    if (MTMD_WEBP_ENABLED)
+        add_executable(test-mtmd-webp ../../tests/test-mtmd-webp.cpp)
+        target_link_libraries(test-mtmd-webp PRIVATE mtmd)
+        add_test(
+            NAME test-mtmd-webp
+            COMMAND test-mtmd-webp
+                "${PROJECT_SOURCE_DIR}/examples/llama.android/app/src/main/res/mipmap-mdpi/ic_launcher.webp")
+        set_tests_properties(test-mtmd-webp PROPERTIES LABELS main)
+    endif()
 endif()
 
 # if mtmd is linked against llama-common, we throw an error
