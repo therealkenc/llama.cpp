@@ -21,6 +21,8 @@ add_library(${TARGET} STATIC
     server-tools.h
     responses_item_cache.cpp
     responses_item_cache.h
+    server-mcp.cpp
+    server-mcp.h
     server-schema.cpp
     server-schema.h
 )
