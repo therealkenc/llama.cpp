@@ -893,9 +893,7 @@ json server_chat_convert_responses_to_chatcmpl(
                         prev_msg["content"] = json::array();
                     }
                     auto & prev_content = prev_msg["content"];
-                    for (const auto & part : chatcmpl_content) {
-                        prev_content.push_back(part);
-                    }
+                    prev_content.insert(chatcmpl_content);
                 } else {
                     item.erase("status");
                     item.erase("type");
