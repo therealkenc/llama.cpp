@@ -10,7 +10,7 @@
 // help. Capacity is a fixed compile-time constant; promote to a CLI flag
 // only if it ever bites.
 
-#include <nlohmann/json.hpp>
+#include "json.h"
 
 #include <cstddef>
 #include <list>
@@ -20,7 +20,7 @@
 
 class responses_item_cache {
 public:
-    using json_t = nlohmann::ordered_json;
+    using json_t = common_json;
 
     static constexpr std::size_t CAPACITY = 4096;
 

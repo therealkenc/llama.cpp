@@ -1,7 +1,5 @@
 #include "responses_item_cache.h"
 
-#include <nlohmann/json.hpp>
-
 using json_t = responses_item_cache::json_t;
 
 void responses_item_cache::put(const std::string & id, const json_t & item) {
