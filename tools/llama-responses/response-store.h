@@ -62,11 +62,10 @@ class in_memory_response_store final : public response_store {
         response_output_item item;
     };
 
-    static bool valid_state(const response_state & state);
-    bool        item_ids_available(const response_state & state) const;
-    void        remove_item_index(const response_state & state);
-    void        add_item_index(const response_state & state);
-    void        detach_children(const response_state & state);
+    bool item_ids_available(const response_state & state) const;
+    void remove_item_index(const response_state & state);
+    void add_item_index(const response_state & state);
+    void detach_children(const response_state & state);
 
     mutable std::mutex                                      mutex;
     std::map<response_id, response_state>                   responses;

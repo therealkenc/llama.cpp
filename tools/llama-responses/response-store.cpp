@@ -1,5 +1,6 @@
 #include "response-store.h"
 
+#include "response-store-internal.h"
 #include "response-types.h"
 
 #include <algorithm>
@@ -35,9 +36,9 @@ const char * store_write_result_name(store_write_result result) noexcept {
     return "invalid_state";
 }
 
-bool in_memory_response_store::valid_state(const response_state & state) {
+bool response_store_detail::valid_state(const response_state & state) {
     if (state.id.empty() || !state.request.is_object() || !state.input_items.is_array() ||
-        !state.wire_snapshot.is_object()) {
+        !state.continuation_input_items.is_array() || !state.wire_snapshot.is_object()) {
         return false;
     }
     if (state.detached_context && !state.detached_context->is_array()) {
@@ -59,7 +60,46 @@ bool in_memory_response_store::valid_state(const response_state & state) {
             return false;
         }
     }
+    std::set<item_id> continuation_seen;
+    for (const common_json & item : state.continuation_input_items) {
+        if (!item.is_object() || !item.contains("id") || !item.at("id").is_string()) {
+            return false;
+        }
+        const item_id id(item.at("id").get<std::string>());
+        if (id.empty() || !continuation_seen.insert(id).second) {
+            return false;
+        }
+    }
     return true;
+}
+
+common_json response_store_detail::detached_context(const response_state & state) {
+    // input_items is the fully materialized lineage observed through this
+    // response: prior input/output followed by the current request input.
+    // Building from only the local continuation would lose a still-attached
+    // grandparent when an interior response is deleted first.
+    common_json context = common_json::array();
+    if (state.detached_context) {
+        const bool already_materialized =
+            state.input_items.size() >= state.detached_context->size() &&
+            std::equal(state.detached_context->begin(), state.detached_context->end(), state.input_items.begin());
+        if (!already_materialized) {
+            context = *state.detached_context;
+        }
+    }
+    for (const common_json & item : state.input_items) {
+        context.push_back(item);
+    }
+    for (const response_output_item & item : state.output) {
+        common_json wire_item = item.value.is_object() ? item.value : common_json::object();
+        wire_item["id"]       = item.id.str();
+        wire_item["type"]     = item.type;
+        if (item.call) {
+            wire_item["call_id"] = item.call->str();
+        }
+        context.push_back(std::move(wire_item));
+    }
+    return context;
 }
 
 bool in_memory_response_store::item_ids_available(const response_state & state) const {
@@ -85,30 +125,19 @@ void in_memory_response_store::add_item_index(const response_state & state) {
 }
 
 void in_memory_response_store::detach_children(const response_state & state) {
-    common_json context = state.detached_context.value_or(common_json::array());
-    for (const common_json & item : state.input_items) {
-        context.push_back(item);
-    }
-    for (const response_output_item & item : state.output) {
-        common_json wire_item = item.value.is_object() ? item.value : common_json::object();
-        wire_item["id"]       = item.id.str();
-        wire_item["type"]     = item.type;
-        if (item.call) {
-            wire_item["call_id"] = item.call->str();
-        }
-        context.push_back(std::move(wire_item));
-    }
+    const common_json context = response_store_detail::detached_context(state);
 
     for (auto & entry : responses) {
         response_state & child = entry.second;
         if (child.previous_response && *child.previous_response == state.id) {
             child.detached_context = context;
+            child.revision++;
         }
     }
 }
 
 store_write_result in_memory_response_store::create(response_state state) {
-    if (!valid_state(state)) {
+    if (!response_store_detail::valid_state(state)) {
         return store_write_result::invalid_state;
     }
 
@@ -142,7 +171,7 @@ store_write_result in_memory_response_store::create(response_state state) {
 }
 
 store_write_result in_memory_response_store::replace(response_state state) {
-    if (!valid_state(state)) {
+    if (!response_store_detail::valid_state(state)) {
         return store_write_result::invalid_state;
     }
 

@@ -1,0 +1,750 @@
+#include "generation.h"
+
+#include "json.h"
+#include "protocol-codec.h"
+#include "response-types.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <variant>
+#include <vector>
+
+namespace llama_responses {
+namespace {
+
+class scripted_generation_session final : public generation_session {
+  public:
+    explicit scripted_generation_session(std::vector<generation_update> script) : script(std::move(script)) {}
+
+    std::optional<generation_update> next() override {
+        if (terminal_emitted) {
+            return std::nullopt;
+        }
+        if (cancelled.load()) {
+            terminal_emitted = true;
+            cursor           = script.size();
+            return generation_cancelled{};
+        }
+        if (cursor == script.size()) {
+            return std::nullopt;
+        }
+
+        generation_update result = script[cursor++];
+        terminal_emitted         = generation_update_is_terminal(result);
+        return result;
+    }
+
+    void request_cancel() noexcept override { cancelled.store(true); }
+
+    bool cancel_requested() const noexcept override { return cancelled.load(); }
+
+  private:
+    std::vector<generation_update> script;
+    std::size_t                    cursor = 0;
+    std::atomic_bool               cancelled{ false };
+    bool                           terminal_emitted = false;
+};
+
+common_json reasoning_part(const std::string & text) {
+    return {
+        { "type", "summary_text" },
+        { "text", text           },
+    };
+}
+
+common_json reasoning_content(const std::string & text) {
+    return {
+        { "type", "reasoning_text" },
+        { "text", text             },
+    };
+}
+
+common_json text_part(const std::string & text) {
+    return {
+        { "type",        "output_text"        },
+        { "annotations", common_json::array() },
+        { "logprobs",    common_json::array() },
+        { "text",        text                 },
+    };
+}
+
+response_event_type terminal_event_type(response_status status) {
+    switch (status) {
+        case response_status::completed:
+            return response_event_type::completed;
+        case response_status::incomplete:
+            return response_event_type::incomplete;
+        case response_status::failed:
+            return response_event_type::failed;
+        case response_status::cancelled:
+            return response_event_type::cancelled;
+        case response_status::queued:
+        case response_status::in_progress:
+            throw std::invalid_argument("terminal event requires a terminal response status");
+    }
+    throw std::invalid_argument("unknown response status");
+}
+
+std::string normalized_namespace(std::string value) {
+    if (value.empty()) {
+        return "generation";
+    }
+    return value;
+}
+
+}  // namespace
+
+bool generation_update_is_terminal(const generation_update & update) noexcept {
+    return std::holds_alternative<generation_completed>(update) ||
+           std::holds_alternative<generation_incomplete>(update) || std::holds_alternative<generation_failed>(update) ||
+           std::holds_alternative<generation_cancelled>(update);
+}
+
+scripted_generation_port::scripted_generation_port(std::vector<generation_update> script) : script(std::move(script)) {}
+
+std::unique_ptr<generation_session> scripted_generation_port::start(const generation_request & /*request*/) {
+    return std::make_unique<scripted_generation_session>(script);
+}
+
+counter_generation_id_source::counter_generation_id_source(std::string namespace_value) :
+    namespace_value(normalized_namespace(std::move(namespace_value))) {}
+
+std::string counter_generation_id_source::next_value(const char * prefix, std::uint64_t & counter) {
+    std::lock_guard<std::mutex> lock(mutex);
+    return std::string(prefix) + namespace_value + '_' + std::to_string(counter++);
+}
+
+response_id counter_generation_id_source::next_response_id() {
+    return response_id(next_value("resp_", response_counter));
+}
+
+item_id counter_generation_id_source::next_item_id(generation_item_kind kind) {
+    switch (kind) {
+        case generation_item_kind::reasoning:
+            return item_id(next_value("rs_", reasoning_counter));
+        case generation_item_kind::message:
+            return item_id(next_value("msg_", message_counter));
+        case generation_item_kind::function_call:
+            return item_id(next_value("fc_", function_counter));
+        case generation_item_kind::custom_tool_call:
+            return item_id(next_value("ctc_", custom_counter));
+    }
+    throw std::invalid_argument("unknown generation item kind");
+}
+
+call_id counter_generation_id_source::next_call_id(const std::string & upstream_call_id) {
+    if (upstream_call_id.rfind("call_", 0) == 0) {
+        return call_id(upstream_call_id);
+    }
+    if (!upstream_call_id.empty()) {
+        return call_id("call_" + upstream_call_id);
+    }
+    return call_id(next_value("call_", call_counter));
+}
+
+common_json render_generation_event(const response_event & event) {
+    common_json result        = event.data.is_object() ? event.data : common_json::object();
+    result["type"]            = response_event_type_name(event.type);
+    result["sequence_number"] = event.sequence_number;
+    return result;
+}
+
+class native_response_state_machine::impl {
+  public:
+    impl(generation_response_context context, generation_id_source & ids) : ids(ids) {
+        if (!context.request.is_object()) {
+            throw std::invalid_argument("generation response request must be an object");
+        }
+        if (!context.input_items.is_array()) {
+            throw std::invalid_argument("generation response input_items must be an array");
+        }
+        if (!context.continuation_input_items.is_null() && !context.continuation_input_items.is_array()) {
+            throw std::invalid_argument("generation response continuation_input_items must be an array");
+        }
+        if (!context.wire_snapshot.is_object()) {
+            throw std::invalid_argument("generation response wire_snapshot must be an object");
+        }
+
+        response.id                       = ids.next_response_id();
+        response.status                   = response_status::in_progress;
+        response.created_at               = context.created_at;
+        response.model                    = std::move(context.model);
+        response.request                  = std::move(context.request);
+        response.input_items              = std::move(context.input_items);
+        response.continuation_input_items = context.continuation_input_items.is_null() ?
+                                                response.input_items :
+                                                std::move(context.continuation_input_items);
+        response.wire_snapshot            = std::move(context.wire_snapshot);
+        response.previous_response        = std::move(context.previous_response);
+        if (response.id.empty()) {
+            throw std::invalid_argument("generation id source returned an empty response id");
+        }
+        if (!response.previous_response && response.request.contains("previous_response_id") &&
+            response.request.at("previous_response_id").is_string()) {
+            const std::string previous = response.request.at("previous_response_id").get<std::string>();
+            if (!previous.empty()) {
+                response.previous_response = response_id(previous);
+            }
+        }
+        if (response.request.contains("metadata") && response.request.at("metadata").is_object()) {
+            response.metadata = response.request.at("metadata");
+        }
+    }
+
+    std::vector<response_event> start() {
+        const std::size_t first = emitted.size();
+        ensure_started();
+        return events_since(first);
+    }
+
+    std::vector<response_event> apply(const generation_update & update) {
+        if (is_terminal) {
+            throw std::logic_error("generation update arrived after the terminal update");
+        }
+
+        const std::size_t first = emitted.size();
+        ensure_started();
+        std::visit([this](const auto & value) { apply_one(value); }, update);
+        return events_since(first);
+    }
+
+    const response_state & state() const noexcept { return response; }
+
+    common_json snapshot() const { return render_response(response); }
+
+    const std::vector<response_event> & events() const noexcept { return emitted; }
+
+    bool terminal() const noexcept { return is_terminal; }
+
+  private:
+    struct tool_state {
+        generation_tool_kind kind                = generation_tool_kind::function;
+        std::size_t          output_index        = 0;
+        std::size_t          response_item_index = 0;
+        item_id              item;
+        call_id              call;
+        std::string          name;
+        std::string          value;
+        bool                 done = false;
+    };
+
+    generation_id_source &            ids;
+    response_state                    response;
+    std::vector<response_event>       emitted;
+    std::optional<std::size_t>        open_reasoning;
+    std::optional<std::size_t>        open_message;
+    std::string                       reasoning_text;
+    std::string                       message_text;
+    std::map<std::size_t, tool_state> tools;
+    bool                              started     = false;
+    bool                              is_terminal = false;
+
+    std::vector<response_event> events_since(std::size_t first) const {
+        return { emitted.begin() + static_cast<std::ptrdiff_t>(first), emitted.end() };
+    }
+
+    response_event & emit(response_event_type        type,
+                          common_json                data,
+                          std::optional<item_id>     item          = std::nullopt,
+                          std::optional<std::size_t> output_index  = std::nullopt,
+                          std::optional<std::size_t> content_index = std::nullopt) {
+        response_event event;
+        event.type            = type;
+        event.sequence_number = response.next_sequence_number++;
+        event.response        = response.id;
+        event.item            = std::move(item);
+        event.output_index    = output_index;
+        event.content_index   = content_index;
+        event.data            = std::move(data);
+        emitted.push_back(std::move(event));
+        return emitted.back();
+    }
+
+    void emit_response(response_event_type type) {
+        emit(type, {
+                       { "response", snapshot() }
+        });
+    }
+
+    void ensure_started() {
+        if (started) {
+            return;
+        }
+        started = true;
+        emit_response(response_event_type::created);
+        emit_response(response_event_type::in_progress);
+    }
+
+    bool item_id_exists(const item_id & candidate) const {
+        return std::any_of(response.output.begin(), response.output.end(),
+                           [&candidate](const response_output_item & item) { return item.id == candidate; });
+    }
+
+    std::size_t append_item(response_output_item item) {
+        if (item.id.empty()) {
+            throw std::invalid_argument("generation id source returned an empty item id");
+        }
+        if (item_id_exists(item.id)) {
+            throw std::invalid_argument("generation id source returned a duplicate item id");
+        }
+        response.output.push_back(std::move(item));
+        return response.output.size() - 1;
+    }
+
+    response_output_item & output_item(std::size_t index) { return response.output.at(index); }
+
+    void open_reasoning_item() {
+        if (open_reasoning) {
+            return;
+        }
+        response_output_item item;
+        item.id    = ids.next_item_id(generation_item_kind::reasoning);
+        item.type  = "reasoning";
+        item.value = {
+            { "id",                item.id.str()        },
+            { "type",              item.type            },
+            { "status",            "in_progress"        },
+            { "summary",           common_json::array() },
+            { "content",           common_json::array() },
+            { "encrypted_content", ""                   },
+        };
+        open_reasoning                 = append_item(std::move(item));
+        const std::size_t output_index = *open_reasoning;
+        const auto &      stored       = output_item(output_index);
+        emit(response_event_type::output_item_added,
+             {
+                 { "output_index", output_index               },
+                 { "item",         render_output_item(stored) },
+        },
+             stored.id, output_index);
+        emit(response_event_type::reasoning_summary_part_added,
+             {
+                 { "output_index",  output_index       },
+                 { "summary_index", 0                  },
+                 { "item_id",       stored.id.str()    },
+                 { "part",          reasoning_part("") },
+        },
+             stored.id, output_index);
+    }
+
+    void update_reasoning_item() {
+        if (!open_reasoning) {
+            return;
+        }
+        response_output_item & item = output_item(*open_reasoning);
+        item.value["summary"]       = common_json::array({ reasoning_part(reasoning_text) });
+        item.value["content"]       = common_json::array({ reasoning_content(reasoning_text) });
+    }
+
+    void close_reasoning_item(const char * status) {
+        if (!open_reasoning) {
+            return;
+        }
+        const std::size_t      output_index = *open_reasoning;
+        response_output_item & item         = output_item(output_index);
+        item.value["status"]                = status;
+        update_reasoning_item();
+        emit(response_event_type::reasoning_summary_text_done,
+             {
+                 { "output_index",  output_index   },
+                 { "summary_index", 0              },
+                 { "item_id",       item.id.str()  },
+                 { "text",          reasoning_text },
+        },
+             item.id, output_index);
+        emit(response_event_type::reasoning_summary_part_done,
+             {
+                 { "output_index",  output_index                   },
+                 { "summary_index", 0                              },
+                 { "item_id",       item.id.str()                  },
+                 { "part",          reasoning_part(reasoning_text) },
+        },
+             item.id, output_index);
+        emit(response_event_type::output_item_done,
+             {
+                 { "output_index", output_index             },
+                 { "item",         render_output_item(item) },
+        },
+             item.id, output_index);
+        open_reasoning.reset();
+    }
+
+    void open_message_item() {
+        if (open_message) {
+            return;
+        }
+        close_reasoning_item("completed");
+        response_output_item item;
+        item.id    = ids.next_item_id(generation_item_kind::message);
+        item.type  = "message";
+        item.value = {
+            { "id",      item.id.str()        },
+            { "type",    item.type            },
+            { "status",  "in_progress"        },
+            { "role",    "assistant"          },
+            { "phase",   "commentary"         },
+            { "content", common_json::array() },
+        };
+        open_message                   = append_item(std::move(item));
+        const std::size_t output_index = *open_message;
+        const auto &      stored       = output_item(output_index);
+        emit(response_event_type::output_item_added,
+             {
+                 { "output_index", output_index               },
+                 { "item",         render_output_item(stored) },
+        },
+             stored.id, output_index);
+        emit(response_event_type::content_part_added,
+             {
+                 { "output_index",  output_index    },
+                 { "content_index", 0               },
+                 { "item_id",       stored.id.str() },
+                 { "part",          text_part("")   },
+        },
+             stored.id, output_index, 0);
+    }
+
+    void update_message_item() {
+        if (!open_message) {
+            return;
+        }
+        response_output_item & item = output_item(*open_message);
+        item.value["content"]       = common_json::array({ text_part(message_text) });
+    }
+
+    void close_message_item(const char * status, bool has_tools) {
+        if (!open_message) {
+            return;
+        }
+        const std::size_t      output_index = *open_message;
+        response_output_item & item         = output_item(output_index);
+        item.value["status"]                = status;
+        item.value["phase"]                 = has_tools ? "commentary" : "final_answer";
+        update_message_item();
+        const common_json part = text_part(message_text);
+        emit(response_event_type::output_text_done,
+             {
+                 { "output_index",  output_index         },
+                 { "content_index", 0                    },
+                 { "item_id",       item.id.str()        },
+                 { "text",          message_text         },
+                 { "logprobs",      common_json::array() },
+        },
+             item.id, output_index, 0);
+        emit(response_event_type::content_part_done,
+             {
+                 { "output_index",  output_index  },
+                 { "content_index", 0             },
+                 { "item_id",       item.id.str() },
+                 { "part",          part          },
+        },
+             item.id, output_index, 0);
+        emit(response_event_type::output_item_done,
+             {
+                 { "output_index", output_index             },
+                 { "item",         render_output_item(item) },
+        },
+             item.id, output_index);
+        open_message.reset();
+    }
+
+    void apply_one(const generation_started & /*update*/) {}
+
+    void apply_one(const generation_progress & /*update*/) { emit_response(response_event_type::in_progress); }
+
+    void apply_one(const generation_reasoning_delta & update) {
+        if (update.delta.empty()) {
+            return;
+        }
+        if (open_message || !tools.empty()) {
+            throw std::logic_error("reasoning delta arrived after answer or tool output began");
+        }
+        open_reasoning_item();
+        if (!open_reasoning) {
+            throw std::logic_error("reasoning item was not opened");
+        }
+        const std::size_t output_index = open_reasoning.value();
+        reasoning_text += update.delta;
+        update_reasoning_item();
+        const response_output_item & item = output_item(output_index);
+        emit(response_event_type::reasoning_summary_text_delta,
+             {
+                 { "output_index",  output_index  },
+                 { "summary_index", 0             },
+                 { "item_id",       item.id.str() },
+                 { "delta",         update.delta  },
+        },
+             item.id, output_index);
+    }
+
+    void apply_one(const generation_text_delta & update) {
+        if (update.delta.empty()) {
+            return;
+        }
+        if (!tools.empty()) {
+            throw std::logic_error("text delta arrived after tool output began");
+        }
+        open_message_item();
+        if (!open_message) {
+            throw std::logic_error("message item was not opened");
+        }
+        const std::size_t output_index = open_message.value();
+        message_text += update.delta;
+        update_message_item();
+        const response_output_item & item = output_item(output_index);
+        emit(response_event_type::output_text_delta,
+             {
+                 { "output_index",  output_index  },
+                 { "content_index", 0             },
+                 { "item_id",       item.id.str() },
+                 { "delta",         update.delta  },
+        },
+             item.id, output_index, 0);
+    }
+
+    void apply_one(const generation_tool_call_started & update) {
+        if (update.name.empty()) {
+            throw std::invalid_argument("generation tool call name must not be empty");
+        }
+        if (tools.find(update.index) != tools.end()) {
+            throw std::invalid_argument("generation tool call index was started more than once");
+        }
+        close_reasoning_item("completed");
+        close_message_item("completed", true);
+
+        tool_state tool;
+        tool.kind = update.kind;
+        tool.name = update.name;
+        tool.item =
+            ids.next_item_id(update.kind == generation_tool_kind::function ? generation_item_kind::function_call :
+                                                                             generation_item_kind::custom_tool_call);
+        tool.call = ids.next_call_id(update.upstream_call_id);
+        if (tool.call.empty()) {
+            throw std::invalid_argument("generation id source returned an empty call id");
+        }
+        const bool duplicate_call = std::any_of(tools.begin(), tools.end(),
+                                                [&tool](const auto & entry) { return entry.second.call == tool.call; });
+        if (duplicate_call) {
+            throw std::invalid_argument("generation id source returned a duplicate call id");
+        }
+
+        response_output_item item;
+        item.id    = tool.item;
+        item.call  = tool.call;
+        item.type  = update.kind == generation_tool_kind::function ? "function_call" : "custom_tool_call";
+        item.value = {
+            { "id",      item.id.str()   },
+            { "call_id", tool.call.str() },
+            { "type",    item.type       },
+            { "status",  "in_progress"   },
+            { "name",    update.name     },
+        };
+        item.value[update.kind == generation_tool_kind::function ? "arguments" : "input"] = "";
+        tool.response_item_index       = append_item(std::move(item));
+        tool.output_index              = tool.response_item_index;
+        const auto         inserted    = tools.emplace(update.index, std::move(tool));
+        const tool_state & stored_tool = inserted.first->second;
+        const auto &       stored_item = output_item(stored_tool.response_item_index);
+        emit(response_event_type::output_item_added,
+             {
+                 { "output_index", stored_tool.output_index        },
+                 { "item",         render_output_item(stored_item) },
+        },
+             stored_tool.item, stored_tool.output_index);
+    }
+
+    void apply_one(const generation_tool_call_delta & update) {
+        const auto found = tools.find(update.index);
+        if (found == tools.end()) {
+            throw std::invalid_argument("generation tool call delta has no matching start update");
+        }
+        tool_state & tool = found->second;
+        if (tool.done) {
+            throw std::logic_error("generation tool call delta arrived after the item was closed");
+        }
+        if (update.delta.empty()) {
+            return;
+        }
+        tool.value += update.delta;
+        response_output_item & item = output_item(tool.response_item_index);
+        if (tool.kind == generation_tool_kind::function) {
+            item.value["arguments"] = tool.value;
+            emit(response_event_type::function_call_arguments_delta,
+                 {
+                     { "output_index", tool.output_index },
+                     { "item_id",      tool.item.str()   },
+                     { "delta",        update.delta      },
+            },
+                 tool.item, tool.output_index);
+            return;
+        }
+        item.value["input"] = tool.value;
+        emit(response_event_type::custom_tool_call_input_delta,
+             {
+                 { "output_index", tool.output_index },
+                 { "item_id",      tool.item.str()   },
+                 { "delta",        update.delta      },
+        },
+             tool.item, tool.output_index);
+    }
+
+    void apply_one(const generation_usage_update & update) { response.usage = update.usage; }
+
+    std::vector<tool_state *> tools_in_output_order() {
+        std::vector<tool_state *> ordered;
+        ordered.reserve(tools.size());
+        for (auto & entry : tools) {
+            ordered.push_back(&entry.second);
+        }
+        std::sort(ordered.begin(), ordered.end(),
+                  [](const tool_state * lhs, const tool_state * rhs) { return lhs->output_index < rhs->output_index; });
+        return ordered;
+    }
+
+    void close_tool(tool_state & tool, const char * status) {
+        if (tool.done) {
+            return;
+        }
+        response_output_item & item = output_item(tool.response_item_index);
+        item.value["status"]        = status;
+        if (tool.kind == generation_tool_kind::function) {
+            item.value["arguments"] = tool.value;
+            emit(response_event_type::function_call_arguments_done,
+                 {
+                     { "output_index", tool.output_index },
+                     { "item_id",      tool.item.str()   },
+                     { "name",         tool.name         },
+                     { "arguments",    tool.value        },
+            },
+                 tool.item, tool.output_index);
+        } else {
+            item.value["input"] = tool.value;
+            emit(response_event_type::custom_tool_call_input_done,
+                 {
+                     { "output_index", tool.output_index },
+                     { "item_id",      tool.item.str()   },
+                     { "input",        tool.value        },
+            },
+                 tool.item, tool.output_index);
+        }
+        emit(response_event_type::output_item_done,
+             {
+                 { "output_index", tool.output_index        },
+                 { "item",         render_output_item(item) },
+        },
+             tool.item, tool.output_index);
+        tool.done = true;
+    }
+
+    void close_outputs(const char * status) {
+        close_reasoning_item(status);
+        close_message_item(status, !tools.empty());
+        for (tool_state * tool : tools_in_output_order()) {
+            close_tool(*tool, status);
+        }
+    }
+
+    void finish(response_status                       status,
+                const std::optional<response_usage> & usage,
+                const std::optional<response_error> & error,
+                common_json                           incomplete_details,
+                std::optional<std::uint64_t>          completed_at) {
+        const char * item_status = status == response_status::completed ? "completed" : "incomplete";
+        close_outputs(item_status);
+        response.status             = status;
+        response.error              = error;
+        response.incomplete_details = std::move(incomplete_details);
+        response.completed_at       = completed_at;
+        if (usage) {
+            response.usage = *usage;
+            response.wire_snapshot.erase("usage");
+        } else {
+            response.wire_snapshot["usage"] = nullptr;
+        }
+        is_terminal = true;
+        emit_response(terminal_event_type(status));
+    }
+
+    void apply_one(const generation_completed & update) {
+        const std::uint64_t completed_at = update.completed_at == 0 ? response.created_at : update.completed_at;
+        finish(response_status::completed, update.usage, std::nullopt, nullptr, completed_at);
+    }
+
+    void apply_one(const generation_incomplete & update) {
+        common_json details = {
+            { "reason", update.reason.empty() ? "max_output_tokens" : update.reason },
+        };
+        finish(response_status::incomplete, update.usage, std::nullopt, std::move(details), std::nullopt);
+    }
+
+    void apply_one(const generation_failed & update) {
+        close_outputs("incomplete");
+        response.error = update.error;
+        emit(response_event_type::error,
+             {
+                 { "code",    update.error.code                                                                   },
+                 { "message", update.error.message                                                                },
+                 { "param",   update.error.param.empty() ? common_json(nullptr) : common_json(update.error.param) },
+        });
+        finish(response_status::failed, update.usage, update.error, nullptr, std::nullopt);
+    }
+
+    void apply_one(const generation_cancelled & update) {
+        finish(response_status::cancelled, update.usage, std::nullopt, nullptr, std::nullopt);
+    }
+};
+
+native_response_state_machine::native_response_state_machine(generation_response_context context,
+                                                             generation_id_source &      ids) :
+    implementation(std::make_unique<impl>(std::move(context), ids)) {}
+
+native_response_state_machine::~native_response_state_machine() = default;
+
+native_response_state_machine::native_response_state_machine(native_response_state_machine &&) noexcept = default;
+
+native_response_state_machine & native_response_state_machine::operator=(native_response_state_machine &&) noexcept =
+    default;
+
+std::vector<response_event> native_response_state_machine::start() {
+    return implementation->start();
+}
+
+std::vector<response_event> native_response_state_machine::apply(const generation_update & update) {
+    return implementation->apply(update);
+}
+
+const response_state & native_response_state_machine::state() const noexcept {
+    return implementation->state();
+}
+
+common_json native_response_state_machine::snapshot() const {
+    return implementation->snapshot();
+}
+
+const std::vector<response_event> & native_response_state_machine::events() const noexcept {
+    return implementation->events();
+}
+
+std::vector<common_json> native_response_state_machine::rendered_events() const {
+    std::vector<common_json> result;
+    result.reserve(events().size());
+    for (const response_event & event : events()) {
+        result.push_back(render_generation_event(event));
+    }
+    return result;
+}
+
+bool native_response_state_machine::terminal() const noexcept {
+    return implementation->terminal();
+}
+
+}  // namespace llama_responses

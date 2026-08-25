@@ -16,6 +16,8 @@ using namespace llama_responses;
 // NOLINTNEXTLINE(misc-use-internal-linkage)
 int test_codex_models();
 // NOLINTNEXTLINE(misc-use-internal-linkage)
+int test_generation();
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 int test_protocol();
 
 namespace {
@@ -72,6 +74,21 @@ response_state make_state(const char * response_value, const char * item_value) 
     item.value["type"] = "message";
     state.output.push_back(std::move(item));
     return state;
+}
+
+common_json make_input_item(const char * id) {
+    return {
+        { "id",   id        },
+        { "type", "message" },
+        { "role", "user"    },
+    };
+}
+
+common_json render_first_output(const response_state & state) {
+    common_json result = state.output.at(0).value;
+    result["id"]       = state.output.at(0).id.str();
+    result["type"]     = state.output.at(0).type;
+    return result;
 }
 
 void test_types() {
@@ -180,6 +197,46 @@ void test_store() {
     CHECK(response_d_stored->detached_context->size() == 3);
     CHECK(response_d_stored->detached_context->at(2).at("id") == "msg_c");
 
+    // Deleting an interior node must carry the complete materialized lineage
+    // into its child even while the grandparent remains attached.
+    in_memory_response_store lineage;
+    response_state           lineage_root   = make_state("resp_lineage_root", "msg_lineage_root_output");
+    response_state           lineage_middle = make_state("resp_lineage_middle", "msg_lineage_middle_output");
+    response_state           lineage_leaf   = make_state("resp_lineage_leaf", "msg_lineage_leaf_output");
+    const common_json        root_input     = make_input_item("msg_lineage_root_input");
+    const common_json        middle_input   = make_input_item("msg_lineage_middle_input");
+    const common_json        leaf_input     = make_input_item("msg_lineage_leaf_input");
+
+    lineage_root.input_items.push_back(root_input);
+    lineage_root.continuation_input_items.push_back(root_input);
+
+    lineage_middle.previous_response = lineage_root.id;
+    lineage_middle.input_items       = lineage_root.input_items;
+    lineage_middle.input_items.push_back(render_first_output(lineage_root));
+    lineage_middle.input_items.push_back(middle_input);
+    lineage_middle.continuation_input_items.push_back(middle_input);
+
+    lineage_leaf.previous_response = lineage_middle.id;
+    lineage_leaf.input_items       = lineage_middle.input_items;
+    lineage_leaf.input_items.push_back(render_first_output(lineage_middle));
+    lineage_leaf.input_items.push_back(leaf_input);
+    lineage_leaf.continuation_input_items.push_back(leaf_input);
+
+    CHECK(lineage.create(lineage_root) == store_write_result::stored);
+    CHECK(lineage.create(lineage_middle) == store_write_result::stored);
+    CHECK(lineage.create(lineage_leaf) == store_write_result::stored);
+    CHECK(lineage.erase(lineage_middle.id));
+    CHECK(lineage.find(lineage_root.id).has_value());
+    const auto detached_leaf = lineage.find(lineage_leaf.id);
+    CHECK(detached_leaf && detached_leaf->detached_context.has_value());
+    if (detached_leaf && detached_leaf->detached_context) {
+        CHECK(detached_leaf->detached_context->size() == 4);
+        CHECK(detached_leaf->detached_context->at(0).at("id") == "msg_lineage_root_input");
+        CHECK(detached_leaf->detached_context->at(1).at("id") == "msg_lineage_root_output");
+        CHECK(detached_leaf->detached_context->at(2).at("id") == "msg_lineage_middle_input");
+        CHECK(detached_leaf->detached_context->at(3).at("id") == "msg_lineage_middle_output");
+    }
+
     response_state invalid;
     CHECK(store.create(invalid) == store_write_result::invalid_state);
 }
@@ -215,6 +272,7 @@ int main() try {
     test_store();
     test_hosted_tools();
     failures += test_codex_models();
+    failures += test_generation();
     failures += test_protocol();
 
     if (failures != 0) {

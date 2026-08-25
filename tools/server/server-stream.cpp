@@ -679,27 +679,23 @@ void server_res_spipe::on_complete() {
     std::string chunk;
     while (!spipe->is_cancelled()) {
         chunk.clear();
-        bool has_next = next_orig(chunk);
-        if (chunk_observer) {
-            chunk_observer(chunk);
-        }
-        if (!chunk.empty()) {
-            spipe->write(chunk.data(), chunk.size());
-        }
+        const bool has_next = next_chunk(chunk);
         if (!has_next) {
             break;
         }
     }
 }
 
+void server_res_spipe::on_filtered_chunk(const std::string & chunk) {
+    if (spipe && !chunk.empty()) {
+        spipe->write(chunk.data(), chunk.size());
+    }
+}
+
 void server_res_spipe::set_next(std::function<bool(std::string &)> next_fn) {
     next_orig = std::move(next_fn);
     next = [this](std::string & out) {
-        bool has_next = next_orig(out);
-        if (spipe) {
-            // if spipe is set, tee-style pipe input to both HTTP and spipe
-            spipe->write(out.data(), out.size());
-        }
+        const bool has_next = next_orig(out);
         if (!has_next) {
             next_finished = true;
         }

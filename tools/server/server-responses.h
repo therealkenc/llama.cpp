@@ -1,6 +1,7 @@
 #ifndef LLAMA_SERVER_RESPONSES_H
 #define LLAMA_SERVER_RESPONSES_H
 
+#include "server-generation.h"
 #include "server-http.h"
 
 #include <functional>
@@ -15,6 +16,12 @@
 // and receive a standard not-supported response when left empty.
 struct server_responses_routes {
     std::shared_ptr<void> owner;
+
+    // Internal generation seam. This is not registered as an HTTP route.
+    // Decorators may use it to retain llama-server's prompt/MTMD/slot/reader
+    // machinery while replacing only the protocol projection. It is optional
+    // so an ordinary legacy bundle remains behaviorally unchanged.
+    std::function<server_http_res_ptr(const server_http_req &, server_generation_sink_ptr)> generate;
 
     server_http_context::handler_t create;
     server_http_context::handler_t input_tokens;

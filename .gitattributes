@@ -1,2 +1,2 @@
-# Preserve byte-identical third-party prompt snapshots.
-tools/llama-responses/prompts/codex-0.148.0.md whitespace=-trailing-space
+# Preserve the imported third-party base instructions without whitespace churn.
+tools/llama-responses/prompts/codex-base-instructions.md whitespace=-trailing-space

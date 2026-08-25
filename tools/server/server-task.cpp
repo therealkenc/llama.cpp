@@ -992,7 +992,7 @@ static json server_build_responses_tool_output_item(
     const std::string tool_name = json_value(meta, "name", tool_call.name);
 
     if (tool_type == "custom") {
-        return json {
+        json output_item = {
             {"type",    "custom_tool_call"},
             {"status",  status},
             { "id", item_id.empty() ? responses_tool_item_id(tool_type) : item_id },
@@ -1000,6 +1000,10 @@ static json server_build_responses_tool_output_item(
             {"name",    tool_name},
             {"input",   get_custom_tool_input_value(tool_name, parsed_args, tool_call.arguments)},
         };
+        if (meta.contains("namespace") && meta.at("namespace").is_string()) {
+            output_item["namespace"] = meta.at("namespace");
+        }
+        return output_item;
     }
 
     if (tool_type == "local_shell") {
@@ -1118,7 +1122,7 @@ static json server_build_responses_tool_output_item(
         arguments = args.dump();
     }
 
-    return json {
+    json output_item = {
         {"type",      "function_call"},
         {"id",        item_id.empty() ? "fc_" + random_string() : item_id},
         { "call_id",   responses_call_id(tool_call.id)                     },
@@ -1126,6 +1130,10 @@ static json server_build_responses_tool_output_item(
         { "arguments", arguments                                           },
         {"status",    status},
     };
+    if (meta.contains("namespace") && meta.at("namespace").is_string()) {
+        output_item["namespace"] = meta.at("namespace");
+    }
+    return output_item;
 }
 
 static json build_responses_reasoning_item(const std::string & id,
@@ -1217,7 +1225,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
     std::string output_text = build_output_text(output);
     json res = build_oai_resp_metadata(oai_resp_id, oaicompat_model, output, output_text, n_prompt_tokens, n_decoded,
                                        n_prompt_tokens_cache, oai_resp_created_at, generation_params.responses_request);
-    if (stop == STOP_TYPE_LIMIT && msg.content.empty() && msg.tool_calls.empty()) {
+    if (stop == STOP_TYPE_LIMIT) {
         res["status"]             = "incomplete";
         res["completed_at"]       = nullptr;
         res["incomplete_details"] = json{
@@ -1337,7 +1345,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
                                 n_prompt_tokens_cache, oai_resp_created_at, generation_params.responses_request);
 
     const char * event = "response.completed";
-    if (stop == STOP_TYPE_LIMIT && oaicompat_msg.content.empty() && oaicompat_msg.tool_calls.empty()) {
+    if (stop == STOP_TYPE_LIMIT) {
         resp["status"]             = "incomplete";
         resp["completed_at"]       = nullptr;
         resp["incomplete_details"] = json{

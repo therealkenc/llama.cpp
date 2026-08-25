@@ -27,21 +27,33 @@ struct server_http_res {
 
     std::function<bool(std::string &)> next = nullptr;
 
-    // Optional lifetime and stream-observation seams for in-process route
-    // decorators. The owner remains alive through on_complete(); the observer
-    // sees complete chunks whether they are sent to HTTP or drained into a
-    // resumable stream after disconnect.
+    // Optional lifetime and stream-filtering seams for in-process route
+    // decorators. The owner remains alive through on_complete(); the filter
+    // may buffer or replace chunks before they are sent to HTTP or drained
+    // into a resumable stream after disconnect.
     std::shared_ptr<void> lifetime_owner;
-    std::function<void(const std::string &)> chunk_observer;
+    std::function<void(std::string &)> chunk_filter;
 
     bool is_stream() const {
         return next != nullptr;
+    }
+
+    bool next_chunk(std::string & output) {
+        const bool has_next = next(output);
+        if (chunk_filter) {
+            chunk_filter(output);
+        }
+        on_filtered_chunk(output);
+        return has_next;
     }
 
     // fired before req and res are destroyed
     virtual void on_complete() {}
 
     virtual ~server_http_res() = default;
+
+  protected:
+    virtual void on_filtered_chunk(const std::string & /*chunk*/) {}
 };
 
 // unique pointer, used by set_chunked_content_provider

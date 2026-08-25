@@ -230,7 +230,8 @@ response_state capture_response_state(const common_json & wire_response,
                                     return item_id(prefix + state.id.str() + "_input_" + std::to_string(index));
                                 }) :
             input_items;
-    state.wire_snapshot = wire_response;
+    state.continuation_input_items = state.input_items;
+    state.wire_snapshot            = wire_response;
 
     if (wire_response.contains("completed_at") && wire_response.at("completed_at").is_number_integer()) {
         state.completed_at = uint_field(wire_response, "completed_at");
@@ -335,8 +336,12 @@ common_json render_response(const response_state & state) {
     set_request_field(result, state.request, "parallel_tool_calls", true);
     set_request_field(result, state.request, "text",
                       common_json{
-                          { "format", common_json{ { "type", "text" } } }
+                          { "format",    common_json{ { "type", "text" } } },
+                          { "verbosity", "medium"                          },
     });
+    if (result.at("text").is_object() && !result.at("text").contains("verbosity")) {
+        result["text"]["verbosity"] = "medium";
+    }
     set_request_field(result, state.request, "top_p", 1.0);
     set_request_field(result, state.request, "presence_penalty", 0.0);
     set_request_field(result, state.request, "frequency_penalty", 0.0);

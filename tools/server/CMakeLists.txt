@@ -15,6 +15,8 @@ add_library(${TARGET} STATIC
     server-common.h
     server-context.cpp
     server-context.h
+    server-generation.cpp
+    server-generation.h
     server-responses.h
     server-stream.cpp
     server-stream.h
@@ -43,6 +45,13 @@ if (LLAMA_BUILD_TESTS)
     target_link_libraries(test-llama-responses-server-chat PRIVATE server-context llama-responses)
     target_compile_features(test-llama-responses-server-chat PRIVATE cxx_std_17)
     add_test(NAME test-llama-responses-server-chat COMMAND test-llama-responses-server-chat)
+
+    add_executable(test-server-generation-sink
+        tests/test-generation-sink.cpp
+    )
+    target_link_libraries(test-server-generation-sink PRIVATE server-context)
+    target_compile_features(test-server-generation-sink PRIVATE cxx_std_17)
+    add_test(NAME test-server-generation-sink COMMAND test-server-generation-sink)
 endif()
 
 # llama-server-impl: server logic, reusable by app

@@ -3,7 +3,7 @@
 
 namespace llama_responses {
 
-inline constexpr char CODEX_BASE_INSTRUCTIONS[] = R"codex_0148(@CODEX_PROMPT_TEXT@)codex_0148";
+inline constexpr char CODEX_BASE_INSTRUCTIONS[] = R"codex_prompt(@CODEX_PROMPT_TEXT@)codex_prompt";
 
 }  // namespace llama_responses
 

@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <exception>
 #include <map>
@@ -68,6 +69,31 @@ static std::string sanitize_tool_name(const std::string & name, const std::strin
         out.resize(64);
     }
     return out;
+}
+
+static std::string responses_namespace_chat_tool_name(
+        const std::string & namespace_name,
+        const std::string & tool_name) {
+    const std::string identity = namespace_name + "\n" + tool_name;
+    std::uint64_t hash = 14695981039346656037ULL;
+    for (unsigned char character : identity) {
+        hash ^= character;
+        hash *= 1099511628211ULL;
+    }
+
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string suffix(16, '0');
+    for (std::size_t index = 0; index < suffix.size(); ++index) {
+        suffix[suffix.size() - index - 1] = hex[hash & 0x0fU];
+        hash >>= 4U;
+    }
+
+    std::string prefix = sanitize_tool_name(namespace_name + "_" + tool_name, "namespace_tool");
+    constexpr std::size_t max_prefix = 64U - 1U - 16U;
+    if (prefix.size() > max_prefix) {
+        prefix.resize(max_prefix);
+    }
+    return prefix + "_" + suffix;
 }
 
 static json responses_object_schema(json properties, json required = json::array()) {
@@ -604,7 +630,9 @@ static json responses_tool_to_chatcmpl_tool(
                 responses_custom_tool_description(resp_tool, name),
                 responses_custom_tool_parameters(name));
     } else if (tool_type == "local_shell") {
-        name = sanitize_tool_name(json_value(resp_tool, "name", std::string("local_shell")), "local_shell");
+        // local_shell has one protocol identity; an unknown extension field
+        // must not rename it behind request-policy collision checks.
+        name = "local_shell";
         fn = responses_function_tool(
                 name,
                 "Run a local shell command.",
@@ -942,8 +970,12 @@ json server_chat_convert_responses_to_chatcmpl(
                 item.at("type") == "function_call"
             ) {
                 // #responses_create-input-input_item_list-item-function_tool_call
+                const std::string name = item.contains("namespace") && item.at("namespace").is_string()
+                    ? responses_namespace_chat_tool_name(
+                        item.at("namespace").get<std::string>(), item.at("name").get<std::string>())
+                    : item.at("name").get<std::string>();
                 append_assistant_tool_call(chatcmpl_messages, make_tool_call(
-                    item.at("name").get<std::string>(),
+                    name,
                     item.at("call_id").get<std::string>(),
                     parse_arguments_best_effort(item.at("arguments"))));
             } else if (exists_and_is_string(item, "type") &&
@@ -1005,6 +1037,10 @@ json server_chat_convert_responses_to_chatcmpl(
                 } else if (type == "function_call") {
                     if (name.empty()) {
                         name = "function";
+                    }
+                    if (item.contains("namespace") && item.at("namespace").is_string()) {
+                        name = responses_namespace_chat_tool_name(
+                            item.at("namespace").get<std::string>(), name);
                     }
                     arguments = parse_arguments_best_effort(json_value(item, "arguments", json::object()));
                 }
@@ -1132,6 +1168,61 @@ json server_chat_convert_responses_to_chatcmpl(
             !hosted_web_search_wrapper.empty() || responses_tool_choice_requires_tool(response_body, "web_search");
         const bool expose_file_search = !hosted_file_search_wrapper.empty();
         for (const json & resp_tool : response_tools) {
+            if (resp_tool.is_object() && json_value(resp_tool, "type", std::string()) == "namespace") {
+                const std::string namespace_name = json_value(resp_tool, "name", std::string());
+                const std::string namespace_description = json_value(resp_tool, "description", std::string());
+                if (namespace_name.empty() || !resp_tool.contains("tools") || !resp_tool.at("tools").is_array()) {
+                    SRV_WRN("skipping malformed Responses namespace tool: %s\n", resp_tool.dump().c_str());
+                    continue;
+                }
+                for (const json & nested_tool : resp_tool.at("tools")) {
+                    if (!nested_tool.is_object()) {
+                        SRV_WRN("skipping malformed nested Responses tool: %s\n", nested_tool.dump().c_str());
+                        continue;
+                    }
+                    const std::string nested_name = json_value(nested_tool, "name", std::string());
+                    const std::string nested_type = json_value(nested_tool, "type", std::string());
+                    if (nested_name.empty() || (nested_type != "function" && nested_type != "custom")) {
+                        SRV_WRN("skipping malformed nested Responses tool: %s\n", nested_tool.dump().c_str());
+                        continue;
+                    }
+
+                    const std::string chat_name =
+                        responses_namespace_chat_tool_name(namespace_name, nested_name);
+                    json flattened_tool = nested_tool;
+                    flattened_tool["name"] = chat_name;
+                    flattened_tool.erase("defer_loading");
+                    if (!namespace_description.empty()) {
+                        const std::string nested_description =
+                            json_value(flattened_tool, "description", std::string());
+                        std::string combined_description = namespace_description;
+                        if (!nested_description.empty()) {
+                            combined_description += "\n\n";
+                            combined_description += nested_description;
+                        }
+                        flattened_tool["description"] = std::move(combined_description);
+                    }
+                    // The second JSON is the output metadata map and the third
+                    // is the original declared-tool list. Their common JSON
+                    // type is intentional and the parameter order is correct.
+                    // NOLINTNEXTLINE(readability-suspicious-call-argument)
+                    json chatcmpl_tool = responses_tool_to_chatcmpl_tool(
+                            flattened_tool,
+                            responses_tool_metadata,
+                            response_tools,
+                            expose_web_search,
+                            expose_file_search);
+                    if (!chatcmpl_tool.is_null()) {
+                        chatcmpl_tools.push_back(std::move(chatcmpl_tool));
+                        json metadata = nested_tool;
+                        metadata["name"] = nested_name;
+                        metadata["namespace"] = namespace_name;
+                        metadata["type"] = nested_type;
+                        responses_tool_metadata[chat_name] = std::move(metadata);
+                    }
+                }
+                continue;
+            }
             json chatcmpl_tool = responses_tool_to_chatcmpl_tool(
                     resp_tool,
                     responses_tool_metadata,

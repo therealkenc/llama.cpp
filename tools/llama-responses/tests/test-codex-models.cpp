@@ -98,8 +98,9 @@ void test_qwen_projection_accepts_version_bags() {
         return make_response(legacy);
     });
 
-    for (const std::string & version :
-         { std::string("0.148.0"), std::string("99.0.0"), std::string("opaque-preview") }) {
+    for (const std::string & version : { std::string("0.148.0"), std::string("0.149.0-alpha.4.3"),
+                                         std::string("1.148.0"), std::string("99.0.0"),
+                                         std::string("opaque-preview") }) {
         auto response = handler(make_request({
             { "client_version", version },
             { "reload",         "1"     }
@@ -134,13 +135,13 @@ void test_qwen_projection_accepts_version_bags() {
         CODEX_MODELS_CHECK(model.at("max_context_window") == 32768);
         CODEX_MODELS_CHECK(model.at("input_modalities") == common_json::array({ "text", "image" }));
         const std::string instructions = model.at("base_instructions").get<std::string>();
-        CODEX_MODELS_CHECK(instructions.size() == 20903);
+        CODEX_MODELS_CHECK(instructions.size() > 1000);
         CODEX_MODELS_CHECK(instructions.find("You are a coding agent running in the Codex CLI") == 0);
         CODEX_MODELS_CHECK(instructions.find("Do NOT guess or make up an answer") != std::string::npos);
         CODEX_MODELS_CHECK(instructions.find("AGENTS.md") != std::string::npos);
         CODEX_MODELS_CHECK(instructions.find("apply_patch") != std::string::npos);
     }
-    CODEX_MODELS_CHECK(calls == 3);
+    CODEX_MODELS_CHECK(calls == 5);
 }
 
 void test_router_projection() {

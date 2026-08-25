@@ -1,10 +1,12 @@
 set(TARGET llama-responses)
 
-set(CODEX_PROMPT_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/prompts/codex-0.148.0.md")
+find_package(SQLite3 REQUIRED)
+
+set(CODEX_PROMPT_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/prompts/codex-base-instructions.md")
 set(CODEX_PROMPT_HEADER "${CMAKE_CURRENT_BINARY_DIR}/codex-models-prompt.h")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CODEX_PROMPT_SOURCE}")
 file(READ "${CODEX_PROMPT_SOURCE}" CODEX_PROMPT_TEXT)
-string(FIND "${CODEX_PROMPT_TEXT}" ")codex_0148\"" CODEX_PROMPT_DELIMITER_OFFSET)
+string(FIND "${CODEX_PROMPT_TEXT}" ")codex_prompt\"" CODEX_PROMPT_DELIMITER_OFFSET)
 if (NOT CODEX_PROMPT_DELIMITER_OFFSET EQUAL -1)
     message(FATAL_ERROR "Codex prompt contains the generated C++ raw-string delimiter")
 endif()
@@ -17,12 +19,17 @@ add_library(${TARGET} STATIC
     ${CODEX_PROMPT_HEADER}
     codex-models.cpp
     codex-models.h
+    generation.cpp
+    generation.h
     hosted-tools.cpp
     hosted-tools.h
     protocol-codec.cpp
     protocol-codec.h
     response-store.cpp
     response-store.h
+    response-store-internal.h
+    sqlite-response-store.cpp
+    sqlite-response-store.h
     response-service.cpp
     response-service.h
     response-types.cpp
@@ -38,7 +45,7 @@ target_include_directories(${TARGET}
     PRIVATE
         ${CMAKE_CURRENT_BINARY_DIR}
 )
-target_link_libraries(${TARGET} PUBLIC llama-common ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${TARGET} PUBLIC llama-common ${CMAKE_THREAD_LIBS_INIT} PRIVATE SQLite::SQLite3)
 target_compile_features(${TARGET} PUBLIC cxx_std_17)
 
 if (BUILD_SHARED_LIBS)
@@ -49,9 +56,17 @@ if (LLAMA_BUILD_TESTS)
     add_executable(test-llama-responses-foundation
         tests/test-codex-models.cpp
         tests/test-foundation.cpp
+        tests/test-generation.cpp
         tests/test-protocol.cpp
     )
     target_link_libraries(test-llama-responses-foundation PRIVATE llama-responses)
     target_compile_features(test-llama-responses-foundation PRIVATE cxx_std_17)
     add_test(NAME test-llama-responses-foundation COMMAND test-llama-responses-foundation)
+
+    add_executable(test-llama-responses-sqlite-store
+        tests/test-sqlite-store.cpp
+    )
+    target_link_libraries(test-llama-responses-sqlite-store PRIVATE llama-responses)
+    target_compile_features(test-llama-responses-sqlite-store PRIVATE cxx_std_17)
+    add_test(NAME test-llama-responses-sqlite-store COMMAND test-llama-responses-sqlite-store)
 endif()

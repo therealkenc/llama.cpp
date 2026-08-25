@@ -591,10 +591,7 @@ static void process_handler_response(server_http_req_ptr && request, server_http
 
         const auto chunked_content_provider = [response = r_ptr](size_t, httplib::DataSink & sink) -> bool {
             std::string chunk;
-            const bool has_next = response->next(chunk);
-            if (response->chunk_observer) {
-                response->chunk_observer(chunk);
-            }
+            const bool has_next = response->next_chunk(chunk);
             if (!chunk.empty()) {
                 if (!sink.write(chunk.data(), chunk.size())) {
                     return false;

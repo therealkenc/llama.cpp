@@ -10,6 +10,9 @@ MODEL_DRAFT_FILE_URL = "https://huggingface.co/ggml-org/tiny-llamas/resolve/main
 def create_server():
     global server
     server = ServerPreset.stories15m_moe()
+    # Port 8080 is commonly occupied by local MCP/HTTP services, and 8081 is
+    # reserved for the live Qwen profile.
+    server.server_port = 18090
     # set default values
     server.model_draft = download_file(MODEL_DRAFT_FILE_URL)
     server.spec_type = "draft-simple"
@@ -51,6 +54,28 @@ def test_with_and_without_draft():
     tokens_draft = res.body["tokens"]
 
     assert tokens_no_draft == tokens_draft
+
+
+def test_logprobs_are_populated_for_speculatively_accepted_tokens():
+    global server
+    server.start()
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "top_k": 5,
+        "seed": 4242,
+        "n_predict": 16,
+        "n_probs": 3,
+    })
+
+    assert res.status_code == 200
+    assert res.body["timings"]["draft_n"] > 0
+    probabilities = res.body["completion_probabilities"]
+    assert len(probabilities) == res.body["tokens_predicted"]
+    assert len(probabilities) > 1
+    for token in probabilities:
+        assert token["logprob"] <= 0.0
+        assert len(token["top_logprobs"]) == 3
 
 
 def test_different_draft_min_draft_max():

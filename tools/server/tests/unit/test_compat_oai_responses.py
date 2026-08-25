@@ -5,26 +5,38 @@ from utils import *
 server: ServerProcess
 
 @pytest.fixture(autouse=True)
-def create_server():
+def create_server(tmp_path, monkeypatch):
     global server
+    monkeypatch.setenv("LLAMA_RESPONSES_DB", str(tmp_path / "responses.sqlite3"))
     server = ServerPreset.tinyllama2()
+    server.server_port = 18089
 
 def make_responses_request(input_items, **kwargs):
     global server
     data = {
         "model": "gpt-4.1",
         "input": input_items,
-        "max_output_tokens": 8,
+        "max_output_tokens": 16,
         "temperature": 0.8,
     }
     data.update(kwargs)
     return server.make_request("POST", "/v1/responses", data=data)
 
-def assert_completed_response(input_items, **kwargs):
+def assert_terminal_response(response):
+    assert response.status_code == 200
+    body = response.body
+    assert body["status"] in {"completed", "incomplete"}
+    if body["status"] == "completed":
+        assert isinstance(body["completed_at"], int)
+        assert body["incomplete_details"] is None
+    else:
+        assert body["completed_at"] is None
+        assert body["incomplete_details"] == {"reason": "max_output_tokens"}
+    return response
+
+def assert_terminal_response_for_input(input_items, **kwargs):
     res = make_responses_request(input_items, **kwargs)
-    assert res.status_code == 200
-    assert res.body["status"] == "completed"
-    return res
+    return assert_terminal_response(res)
 
 def test_responses_with_openai_library():
     global server
@@ -36,13 +48,14 @@ def test_responses_with_openai_library():
             {"role": "system", "content": "Book"},
             {"role": "user", "content": "What is the best book"},
         ],
-        max_output_tokens=8,
+        max_output_tokens=16,
         temperature=0.8,
     )
     assert res.id.startswith("resp_")
     assert res.output[0].id is not None
     assert res.output[0].id.startswith("msg_")
     assert match_regex("(Suddenly)+", res.output_text)
+    assert res.status in {"completed", "incomplete"}
 
 def test_responses_stream_with_openai_library():
     global server
@@ -54,7 +67,7 @@ def test_responses_stream_with_openai_library():
             {"role": "system", "content": "Book"},
             {"role": "user", "content": "What is the best book"},
         ],
-        max_output_tokens=8,
+        max_output_tokens=16,
         temperature=0.8,
         stream=True,
     )
@@ -82,7 +95,7 @@ def test_responses_stream_with_openai_library():
 
         if r.type == "response.output_text.delta":
             gathered_text += r.delta
-        if r.type == "response.completed":
+        if r.type in {"response.completed", "response.incomplete"}:
             assert r.response.id.startswith("resp_")
             assert r.response.output[0].id is not None
             assert r.response.output[0].id.startswith("msg_")
@@ -97,7 +110,7 @@ def test_responses_schema_fields():
     res = server.make_request("POST", "/v1/responses", data={
         "model": "gpt-4.1",
         "input": "Book",
-        "max_output_tokens": 8,
+        "max_output_tokens": 16,
         "temperature": 0.8,
     })
     assert res.status_code == 200
@@ -108,8 +121,7 @@ def test_responses_schema_fields():
     assert isinstance(usage["output_tokens_details"]["reasoning_tokens"], int)
     # Response lifecycle and API defaults.
     assert isinstance(body["created_at"], int)
-    assert isinstance(body["completed_at"], int)
-    assert body["incomplete_details"] is None
+    assert_terminal_response(res)
     assert body["previous_response_id"] is None
     assert body["instructions"] is None
     assert body["error"] is None
@@ -117,14 +129,14 @@ def test_responses_schema_fields():
     assert body["tool_choice"] == "auto"
     assert body["truncation"] == "disabled"
     assert body["parallel_tool_calls"] is True
-    assert body["text"] == {"format": {"type": "text"}}
+    assert body["text"] == {"format": {"type": "text"}, "verbosity": "medium"}
     assert body["top_p"] == 1.0
     assert body["temperature"] == 0.8
     assert body["presence_penalty"] == 0.0
     assert body["frequency_penalty"] == 0.0
     assert body["top_logprobs"] == 0
     assert body["reasoning"] is None
-    assert body["max_output_tokens"] == 8
+    assert body["max_output_tokens"] == 16
     assert body["store"] is True
     assert body["service_tier"] == "default"
     assert body["metadata"] == {}
@@ -146,7 +158,7 @@ def test_responses_stream_schema_fields():
     res = server.make_stream_request("POST", "/v1/responses", data={
         "model": "gpt-4.1",
         "input": "Book",
-        "max_output_tokens": 8,
+        "max_output_tokens": 16,
         "temperature": 0.8,
         "stream": True,
     })
@@ -155,7 +167,7 @@ def test_responses_stream_schema_fields():
     saw_content_part_done = False
     saw_output_item_done = False
     initial_created_at = None
-    completed_response = None
+    terminal_response = None
     for data in res:
         assert "sequence_number" in data, f"missing sequence_number in {data.get('type')}"
         seen_seq_nums.append(data["sequence_number"])
@@ -178,8 +190,8 @@ def test_responses_stream_schema_fields():
         if data.get("type") == "response.output_item.done":
             saw_output_item_done = True
             assert "output_index" in data
-        if data.get("type") == "response.completed":
-            completed_response = data["response"]
+        if data.get("type") in {"response.completed", "response.incomplete"}:
+            terminal_response = data["response"]
     # Must have seen all done-event types
     assert saw_output_text_done, "never received response.output_text.done"
     assert saw_content_part_done, "never received response.content_part.done"
@@ -187,23 +199,24 @@ def test_responses_stream_schema_fields():
     # sequence_number must be present on done events and monotonically increasing
     assert len(seen_seq_nums) >= 4, f"expected >= 4 sequenced events, got {len(seen_seq_nums)}"
     assert all(a < b for a, b in zip(seen_seq_nums, seen_seq_nums[1:])), "sequence_numbers not strictly increasing"
-    # The completed response must retain request metadata and lifecycle state.
+    # The terminal response must retain request metadata and lifecycle state.
     assert initial_created_at is not None
-    assert completed_response is not None
-    assert completed_response["created_at"] == initial_created_at
-    assert completed_response["metadata"] == {}
-    assert completed_response["store"] is True
-    assert completed_response["temperature"] == 0.8
-    assert completed_response["max_output_tokens"] == 8
-    assert completed_response["truncation"] == "disabled"
-    assert completed_response["usage"]["output_tokens_details"]["reasoning_tokens"] == 0
+    assert terminal_response is not None
+    assert terminal_response["created_at"] == initial_created_at
+    assert terminal_response["metadata"] == {}
+    assert terminal_response["store"] is True
+    assert terminal_response["temperature"] == 0.8
+    assert terminal_response["max_output_tokens"] == 16
+    assert terminal_response["truncation"] == "disabled"
+    assert terminal_response["usage"]["output_tokens_details"]["reasoning_tokens"] == 0
 
 
-def test_responses_non_function_tool_skipped():
-    """Non-function tool types must be silently skipped, producing a valid
-    completion with no tools field in the converted chat request. Upstream
-    rejects non-function types with 400; our code must return 200 and
-    generate output as if no tools were provided."""
+def test_responses_unavailable_hosted_tools_fail_closed():
+    """A valid hosted-tool declaration must not be silently discarded.
+
+    Providers are a later phase, so this profile reports the missing
+    capability before inference rather than pretending no tools were sent.
+    """
     global server
     server.start()
     res = server.make_request("POST", "/v1/responses", data={
@@ -212,60 +225,46 @@ def test_responses_non_function_tool_skipped():
             {"role": "system", "content": "Book"},
             {"role": "user", "content": "What is the best book"},
         ],
-        "max_output_tokens": 8,
+        "max_output_tokens": 16,
         "temperature": 0.8,
         "tools": [
             {"type": "web_search"},
             {"type": "code_interpreter"},
         ],
     })
-    assert res.status_code == 200
-    assert res.body["status"] == "completed"
-    # With all tools skipped, the model must still produce text output
-    assert len(res.body["output"]) > 0
-    assert len(res.body["output_text"]) > 0
+    assert res.status_code == 400
+    assert res.body["error"]["type"] == "invalid_request_error"
+    assert res.body["error"]["code"] == "unsupported_parameter"
+    assert res.body["error"]["param"] == "tools[0].type"
 
 
-def test_responses_only_non_function_tools_same_as_no_tools():
-    """When ALL tools are non-function types, they should all be filtered out
-    and the result should be identical to a request with no tools at all.
-    Compare token counts to confirm the tools field was truly empty."""
+def test_responses_unknown_tool_type_is_not_silently_dropped():
     global server
     server.start()
-    no_tools = server.make_request("POST", "/v1/responses", data={
+    res = server.make_request("POST", "/v1/responses", data={
         "model": "gpt-4.1",
         "input": [
             {"role": "system", "content": "Book"},
             {"role": "user", "content": "What is the best book"},
         ],
-        "max_output_tokens": 8,
-        "temperature": 0.8,
-    })
-    with_skipped_tools = server.make_request("POST", "/v1/responses", data={
-        "model": "gpt-4.1",
-        "input": [
-            {"role": "system", "content": "Book"},
-            {"role": "user", "content": "What is the best book"},
-        ],
-        "max_output_tokens": 8,
+        "max_output_tokens": 16,
         "temperature": 0.8,
         "tools": [
-            {"type": "web_search"},
-            {"type": "code_interpreter"},
-            {"type": "file_search"},
+            {"type": "future_magic"},
         ],
     })
-    assert no_tools.status_code == 200
-    assert with_skipped_tools.status_code == 200
-    # If tools were truly stripped, prompt token count must be identical
-    assert with_skipped_tools.body["usage"]["input_tokens"] == no_tools.body["usage"]["input_tokens"]
+    assert res.status_code == 400
+    assert res.body["error"]["type"] == "invalid_request_error"
+    assert res.body["error"]["code"] == "invalid_value"
+    assert res.body["error"]["param"] == "tools[0].type"
 
 
-def test_responses_extra_keys_stripped():
-    """Responses-only request keys (store, include, prompt_cache_key, etc.)
-    must be stripped before forwarding to the chat completions handler.
-    The completion must succeed and produce the same output as a request
-    without those keys."""
+def test_responses_inert_local_metadata_does_not_change_generation():
+    """Validated identity/cache metadata may be locally inert.
+
+    Fields with unavailable response semantics are covered by explicit-error
+    tests instead of being silently stripped here.
+    """
     global server
     server.start()
     # Baseline without extra keys
@@ -275,7 +274,7 @@ def test_responses_extra_keys_stripped():
             {"role": "system", "content": "Book"},
             {"role": "user", "content": "What is the best book"},
         ],
-        "max_output_tokens": 8,
+        "max_output_tokens": 16,
         "temperature": 0.8,
     })
     assert baseline.status_code == 200
@@ -286,18 +285,18 @@ def test_responses_extra_keys_stripped():
             {"role": "system", "content": "Book"},
             {"role": "user", "content": "What is the best book"},
         ],
-        "max_output_tokens": 8,
+        "max_output_tokens": 16,
         "temperature": 0.8,
         "store": True,
-        "include": ["usage"],
+        # Codex requests this projection. Local models do not produce an
+        # encrypted reasoning payload, so it is a compatibility no-op here.
+        "include": ["reasoning.encrypted_content"],
         "prompt_cache_key": "test_key",
-        "web_search": {"enabled": True},
         "text": {"format": {"type": "text"}},
-        "truncation": "auto",
+        "truncation": "disabled",
         "metadata": {"key": "value"},
     })
-    assert res.status_code == 200
-    assert res.body["status"] == "completed"
+    assert_terminal_response(res)
     # Extra keys must not affect token consumption
     assert res.body["usage"]["input_tokens"] == baseline.body["usage"]["input_tokens"]
 
@@ -322,7 +321,7 @@ def test_responses_developer_role_merging():
             ]},
             {"role": "user", "content": [{"type": "input_text", "text": "What is the best book"}]},
         ],
-        "max_output_tokens": 8,
+        "max_output_tokens": 16,
         "temperature": 0.8,
     })
     assert combined.status_code == 200
@@ -334,11 +333,10 @@ def test_responses_developer_role_merging():
             {"role": "user", "content": [{"type": "input_text", "text": "What is the best book"}]},
             {"role": "developer", "content": [{"type": "input_text", "text": "Keep it short"}]},
         ],
-        "max_output_tokens": 8,
+        "max_output_tokens": 16,
         "temperature": 0.8,
     })
-    assert split.status_code == 200
-    assert split.body["status"] == "completed"
+    assert_terminal_response(split)
     # Merged prompt should consume same number of input tokens
     assert split.body["usage"]["input_tokens"] == combined.body["usage"]["input_tokens"]
 
@@ -360,16 +358,15 @@ def test_responses_input_text_type_multi_turn():
             },
             {"role": "user", "content": [{"type": "input_text", "text": "How are you"}]},
         ],
-        "max_output_tokens": 8,
+        "max_output_tokens": 16,
         "temperature": 0.8,
     })
-    assert res.status_code == 200
-    assert res.body["status"] == "completed"
+    assert_terminal_response(res)
     # Multi-turn input should result in more prompt tokens than single-turn
     single = server.make_request("POST", "/v1/responses", data={
         "model": "gpt-4.1",
         "input": "How are you",
-        "max_output_tokens": 8,
+        "max_output_tokens": 16,
         "temperature": 0.8,
     })
     assert single.status_code == 200
@@ -388,7 +385,7 @@ def test_responses_output_text_matches_content():
             {"role": "system", "content": "Book"},
             {"role": "user", "content": "What is the best book"},
         ],
-        "max_output_tokens": 8,
+        "max_output_tokens": 16,
         "temperature": 0.8,
     })
     assert res.status_code == 200
@@ -404,7 +401,7 @@ def test_responses_output_text_matches_content():
 
 
 def test_responses_stream_output_text_consistency():
-    """Streaming gathered text must match the output_text in response.completed."""
+    """Streaming gathered text must match output_text in the terminal event."""
     global server
     server.start()
     res = server.make_stream_request("POST", "/v1/responses", data={
@@ -413,25 +410,25 @@ def test_responses_stream_output_text_consistency():
             {"role": "system", "content": "Book"},
             {"role": "user", "content": "What is the best book"},
         ],
-        "max_output_tokens": 8,
+        "max_output_tokens": 16,
         "temperature": 0.8,
         "stream": True,
     })
     gathered_text = ""
-    completed_output_text = None
+    terminal_output_text = None
     for data in res:
         if data.get("type") == "response.output_text.delta":
             gathered_text += data["delta"]
-        if data.get("type") == "response.completed":
-            completed_output_text = data["response"]["output_text"]
+        if data.get("type") in {"response.completed", "response.incomplete"}:
+            terminal_output_text = data["response"]["output_text"]
             # Also verify content parts match
             for item in data["response"]["output"]:
                 if item.get("type") == "message":
                     for part in item["content"]:
                         if part.get("type") == "output_text":
                             assert part["text"] == gathered_text
-    assert completed_output_text is not None
-    assert gathered_text == completed_output_text
+    assert terminal_output_text is not None
+    assert gathered_text == terminal_output_text
     assert len(gathered_text) > 0
 
 
@@ -447,7 +444,7 @@ def test_responses_stream_created_event_has_full_response():
             {"role": "system", "content": "Book"},
             {"role": "user", "content": "What is the best book"},
         ],
-        "max_output_tokens": 8,
+        "max_output_tokens": 16,
         "temperature": 0.8,
         "stream": True,
     })
@@ -498,7 +495,7 @@ def test_responses_stream_all_events_have_sequence_number():
             {"role": "system", "content": "Book"},
             {"role": "user", "content": "What is the best book"},
         ],
-        "max_output_tokens": 8,
+        "max_output_tokens": 16,
         "temperature": 0.8,
         "stream": True,
     })
@@ -527,7 +524,7 @@ def test_responses_stream_delta_events_have_indices():
             {"role": "system", "content": "Book"},
             {"role": "user", "content": "What is the best book"},
         ],
-        "max_output_tokens": 8,
+        "max_output_tokens": 16,
         "temperature": 0.8,
         "stream": True,
     })
@@ -566,11 +563,10 @@ def test_responses_reasoning_content_array():
              "content": [{"type": "output_text", "text": "Hello"}]},
             {"role": "user", "content": [{"type": "input_text", "text": "How are you"}]},
         ],
-        "max_output_tokens": 8,
+        "max_output_tokens": 16,
         "temperature": 0.8,
     })
-    assert res.status_code == 200
-    assert res.body["status"] == "completed"
+    assert_terminal_response(res)
 
 
 def test_responses_reasoning_content_string():
@@ -586,11 +582,10 @@ def test_responses_reasoning_content_string():
              "content": [{"type": "output_text", "text": "Hello"}]},
             {"role": "user", "content": [{"type": "input_text", "text": "How are you"}]},
         ],
-        "max_output_tokens": 8,
+        "max_output_tokens": 16,
         "temperature": 0.8,
     })
-    assert res.status_code == 200
-    assert res.body["status"] == "completed"
+    assert_terminal_response(res)
 
 
 def test_responses_reasoning_content_null():
@@ -608,11 +603,10 @@ def test_responses_reasoning_content_null():
              "content": [{"type": "output_text", "text": "Hello"}]},
             {"role": "user", "content": [{"type": "input_text", "text": "How are you"}]},
         ],
-        "max_output_tokens": 8,
+        "max_output_tokens": 16,
         "temperature": 0.8,
     })
-    assert res.status_code == 200
-    assert res.body["status"] == "completed"
+    assert_terminal_response(res)
 
 
 def test_responses_reasoning_content_omitted():
@@ -628,11 +622,10 @@ def test_responses_reasoning_content_omitted():
              "content": [{"type": "output_text", "text": "Hello"}]},
             {"role": "user", "content": [{"type": "input_text", "text": "How are you"}]},
         ],
-        "max_output_tokens": 8,
+        "max_output_tokens": 16,
         "temperature": 0.8,
     })
-    assert res.status_code == 200
-    assert res.body["status"] == "completed"
+    assert_terminal_response(res)
 
 
 def test_responses_input_file_with_data_graceful():
@@ -648,11 +641,10 @@ def test_responses_input_file_with_data_graceful():
                 {"type": "input_file", "file_data": "hello world", "filename": "test.txt"},
             ]},
         ],
-        "max_output_tokens": 8,
+        "max_output_tokens": 16,
         "temperature": 0.8,
     })
-    assert res.status_code == 200
-    assert res.body["status"] == "completed"
+    assert_terminal_response(res)
     # The file content must reach the model as prompt tokens
     baseline = server.make_request("POST", "/v1/responses", data={
         "model": "gpt-4.1",
@@ -661,7 +653,7 @@ def test_responses_input_file_with_data_graceful():
                 {"type": "input_text", "text": "Summarize this file"},
             ]},
         ],
-        "max_output_tokens": 8,
+        "max_output_tokens": 16,
         "temperature": 0.8,
     })
     assert baseline.status_code == 200
@@ -681,11 +673,10 @@ def test_responses_input_file_filename_only():
                 {"type": "input_file", "filename": "report.pdf"},
             ]},
         ],
-        "max_output_tokens": 8,
+        "max_output_tokens": 16,
         "temperature": 0.8,
     })
-    assert res.status_code == 200
-    assert res.body["status"] == "completed"
+    assert_terminal_response(res)
 
 
 def test_responses_unknown_content_type_recovery_visible():
@@ -693,12 +684,12 @@ def test_responses_unknown_content_type_recovery_visible():
     visible recovery text into the converted prompt."""
     global server
     server.start()
-    baseline = assert_completed_response([
+    baseline = assert_terminal_response_for_input([
         {"role": "user", "content": [
             {"type": "input_text", "text": "Hello"},
         ]},
     ])
-    recovered = assert_completed_response([
+    recovered = assert_terminal_response_for_input([
         {"role": "user", "content": [
             {"type": "input_text", "text": "Hello"},
             {"type": "input_audio", "data": "base64stuff"},
@@ -712,14 +703,14 @@ def test_responses_unknown_assistant_content_type_recovery_visible():
     visible recovery text into the converted prompt."""
     global server
     server.start()
-    baseline = assert_completed_response([
+    baseline = assert_terminal_response_for_input([
         {"role": "user", "content": [{"type": "input_text", "text": "Hi"}]},
         {"role": "assistant", "type": "message", "content": [
             {"type": "output_text", "text": "Hello"},
         ]},
         {"role": "user", "content": [{"type": "input_text", "text": "How are you"}]},
     ])
-    recovered = assert_completed_response([
+    recovered = assert_terminal_response_for_input([
         {"role": "user", "content": [{"type": "input_text", "text": "Hi"}]},
         {"role": "assistant", "type": "message", "content": [
             {"type": "output_text", "text": "Hello"},
@@ -734,7 +725,7 @@ def test_responses_unknown_toplevel_item_skipped():
     """Unknown top-level item types must be skipped rather than rejecting."""
     global server
     server.start()
-    assert_completed_response([
+    assert_terminal_response_for_input([
         {"role": "user", "content": [{"type": "input_text", "text": "Hi"}]},
         {"type": "some_new_item_type", "data": "whatever"},
         {"role": "user", "content": [{"type": "input_text", "text": "How are you"}]},
@@ -746,12 +737,12 @@ def test_responses_malformed_input_text_recovery_visible():
     recovery text instead of silently disappearing."""
     global server
     server.start()
-    baseline = assert_completed_response([
+    baseline = assert_terminal_response_for_input([
         {"role": "user", "content": [
             {"type": "input_text", "text": "Hello"},
         ]},
     ])
-    recovered = assert_completed_response([
+    recovered = assert_terminal_response_for_input([
         {"role": "user", "content": [
             {"type": "input_text", "text": "Hello"},
             {"type": "input_text"},
@@ -765,12 +756,12 @@ def test_responses_malformed_input_image_recovery_visible():
     recovery text into the converted prompt."""
     global server
     server.start()
-    baseline = assert_completed_response([
+    baseline = assert_terminal_response_for_input([
         {"role": "user", "content": [
             {"type": "input_text", "text": "Describe this attachment"},
         ]},
     ])
-    recovered = assert_completed_response([
+    recovered = assert_terminal_response_for_input([
         {"role": "user", "content": [
             {"type": "input_text", "text": "Describe this attachment"},
             {"type": "input_image"},
@@ -784,12 +775,12 @@ def test_responses_malformed_input_file_recovery_visible():
     recovery text into the converted prompt."""
     global server
     server.start()
-    baseline = assert_completed_response([
+    baseline = assert_terminal_response_for_input([
         {"role": "user", "content": [
             {"type": "input_text", "text": "Summarize this upload"},
         ]},
     ])
-    recovered = assert_completed_response([
+    recovered = assert_terminal_response_for_input([
         {"role": "user", "content": [
             {"type": "input_text", "text": "Summarize this upload"},
             {"type": "input_file"},
@@ -803,14 +794,14 @@ def test_responses_malformed_assistant_output_text_recovery_visible():
     and inject visible recovery text."""
     global server
     server.start()
-    baseline = assert_completed_response([
+    baseline = assert_terminal_response_for_input([
         {"role": "user", "content": [{"type": "input_text", "text": "Hi"}]},
         {"role": "assistant", "type": "message", "content": [
             {"type": "output_text", "text": "Hello"},
         ]},
         {"role": "user", "content": [{"type": "input_text", "text": "How are you"}]},
     ])
-    recovered = assert_completed_response([
+    recovered = assert_terminal_response_for_input([
         {"role": "user", "content": [{"type": "input_text", "text": "Hi"}]},
         {"role": "assistant", "type": "message", "content": [
             {"type": "output_text", "text": "Hello"},
@@ -826,14 +817,14 @@ def test_responses_malformed_assistant_refusal_recovery_visible():
     visible recovery text."""
     global server
     server.start()
-    baseline = assert_completed_response([
+    baseline = assert_terminal_response_for_input([
         {"role": "user", "content": [{"type": "input_text", "text": "Hi"}]},
         {"role": "assistant", "type": "message", "content": [
             {"type": "output_text", "text": "Hello"},
         ]},
         {"role": "user", "content": [{"type": "input_text", "text": "How are you"}]},
     ])
-    recovered = assert_completed_response([
+    recovered = assert_terminal_response_for_input([
         {"role": "user", "content": [{"type": "input_text", "text": "Hi"}]},
         {"role": "assistant", "type": "message", "content": [
             {"type": "output_text", "text": "Hello"},
@@ -853,11 +844,11 @@ def test_responses_stream_with_llama_telemetry():
 
     saw_progress = False
     saw_delta_timings = False
-    completed = None
+    terminal = None
 
     res = server.make_stream_request("POST", "/responses", data={
         "input": "This is a test" * 10,
-        "max_output_tokens": 8,
+        "max_output_tokens": 16,
         "temperature": 0.8,
         "stream": True,
         "timings_per_token": True,
@@ -875,11 +866,11 @@ def test_responses_stream_with_llama_telemetry():
             assert "predicted_per_second" in data["timings"]
             if data["type"] == "response.output_text.delta":
                 saw_delta_timings = True
-        if data["type"] == "response.completed":
-            completed = data
+        if data["type"] in {"response.completed", "response.incomplete"}:
+            terminal = data
 
     assert saw_progress
     assert saw_delta_timings
-    assert completed is not None
-    assert "usage" in completed["response"]
-    assert "timings" in completed
+    assert terminal is not None
+    assert "usage" in terminal["response"]
+    assert "timings" in terminal

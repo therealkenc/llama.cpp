@@ -192,7 +192,11 @@ private:
             server_task_type type,
             const json & data,
             const std::vector<raw_buffer> & files,
-            task_response_type res_type);
+            task_response_type res_type,
+            server_generation_sink_ptr generation_sink = nullptr);
+    std::unique_ptr<server_res_generator> handle_responses_impl(
+            const server_http_req & req,
+            server_generation_sink_ptr generation_sink);
     std::unique_ptr<server_res_generator> handle_slots_save(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_restore(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_erase(const server_http_req & /*req*/, int id_slot);

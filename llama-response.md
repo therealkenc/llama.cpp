@@ -1,6 +1,7 @@
 # A first-class OpenAI Responses API in `llama-server`
 
-Status: phases 1--3 first implementation pass in progress
+Status: architecture checkpoints 1 and 2 complete; conformance groundwork and
+Phases 3 and 3.5 in progress
 Spec snapshot: 2026-08-24
 
 ## Decision
@@ -145,7 +146,7 @@ The route bundle eventually owns handlers for:
 - `GET /v1/responses/{response_id}`;
 - `DELETE /v1/responses/{response_id}`;
 - `POST /v1/responses/{response_id}/cancel`;
-- `POST /v1/responses/{response_id}/compact`;
+- `POST /v1/responses/compact`;
 - `GET /v1/responses/{response_id}/input_items`;
 - streaming and WebSocket entry points required by the current contract.
 
@@ -233,10 +234,12 @@ response ID and sequence stream; they do not create a replacement response.
 ### Response storage
 
 State is a first-class service, not an item LRU attached to request conversion.
-Define a `response_store` interface with an in-memory implementation first.
-The interface owns atomic response snapshots, original input items, generated
-output items, status transitions, metadata, expiration, pagination, and
-response-to-router ownership.
+The `response_store` interface has both a bounded in-memory test implementation
+and the production SQLite implementation.
+The interface currently owns atomic response snapshots, original input items,
+generated output items, status transitions, metadata, pagination, and
+compare-and-swap revisions. Expiry, canonical event history, active ownership,
+and response-to-router recovery remain extensions of that contract.
 
 Required semantics include:
 
@@ -248,9 +251,12 @@ Required semantics include:
 - compacted context and conversation attachment;
 - bounded memory and deterministic eviction errors.
 
-Persistence across process restart is a separate backend decision. The API must
-not bake an in-memory assumption into its domain types; an optional SQLite or
-external store can be added without changing route or orchestration code.
+Production foreground resources persist in
+`~/.cache/llama.cpp/responses.sqlite3`; `LLAMA_RESPONSES_DB` can override the
+complete path. The versioned schema stores canonical snapshots, continuation
+lineage, detached descendant context, and item indices transactionally. It does
+not yet persist active event history, background scheduling, expiry, or router
+ownership. Those additions must not change the route or orchestration API.
 
 ### Hosted tools
 
@@ -301,66 +307,123 @@ The fork already has valuable behavior which must become regression coverage:
 - `apply_patch` and `update_plan` custom-tool wire behavior used by Codex. A
   real Codex run advertises the dedicated `apply_patch` tool only when its
   model catalog says the model supports it; see the client-metadata section
-  below.
+  below;
+- Codex namespace containers for installed app/plugin tools. The boundary
+  validates nested client-executed function/custom declarations, lowers them
+  to collision-safe Chat-template names, and restores the namespace on
+  generated call items and replay.
 
-Known areas to correct or complete include:
+Remaining areas to correct or complete include:
 
-- independent item IDs and call IDs;
-- per-tool streaming state for interleaved parallel calls;
-- stable `created_at`, initial null usage, and request-dependent envelope fields;
-- structured `text.format` preservation;
-- exact failure/cancellation identity and event ordering;
-- complete `store`/`previous_response_id` behavior;
+- native per-tool streaming state for genuinely generated, interleaved parallel
+  calls;
+- stable active-state snapshots, initial null usage, cancellation identity, and
+  exact event ordering;
+- the rest of the create-field and request-dependent envelope matrix;
 - file resolution rather than graceful-but-lossy placeholders;
-- strict validation and OpenAI-compatible errors instead of skipping unknown or
-  unsupported content;
-- retrieve, delete, cancel, compact, and list-input-items resources;
+- strict validation and OpenAI-compatible errors for every unknown or
+  unsupported field and content variant;
+- cancel, compact, active event history, and background resource state;
 - background mode, conversations, WebSocket/resume behavior, and router-aware
   state ownership;
 - real hosted-tool execution.
 
 The baseline is an asset, not proof that the current structure should be kept.
 
+### Speculative decoding and logprobs side quest
+
+On 2026-08-24 we audited llama.cpp
+[PR #27196](https://github.com/ggml-org/llama.cpp/pull/27196), which remains open
+and unmerged. It fixes missing probability population for tokens accepted by
+the shared speculative-decoding path. That path is also used by
+`--spec-type draft-mtp`: without the patch, the first ordinary token has real
+probabilities, while later accepted tokens can report `logprob: 0` and an empty
+`top_logprobs` array. We manually carried the PR's minimal target-logit-index
+fix and added a speculative regression. `post_sampling_probs` under speculative
+decoding remains unsupported.
+
+This is not the same defect as Responses `top_logprobs: 0`. The latter was a
+valid Responses default leaking into the transitional Chat-shaped inference
+lowering, where the presence of `top_logprobs` implies Chat `logprobs: true`.
+The sidecar therefore still removes the zero-valued field only from the private
+forwarded request while retaining it in the public Responses object. PR #27196
+is immediately useful for native completion logprobs under MTP and removes a
+future blocker for nonzero Responses logprobs; it cannot replace that boundary
+normalization or the Responses error contract.
+
 ## Implementation checkpoint: 2026-08-24
 
-The first pass now has a statically linked `tools/llama-responses/` module, an
-explicit route-bundle factory, typed IDs and response snapshots, a bounded
-in-memory response store, provider strategy interfaces with fail-closed stubs,
-and route handlers for create, input-token counting, retrieve, delete, and
-input-item pagination. Continuation and `item_reference` resolution honor
-`store`, survive deletion correctly, and preserve prompt-visible descendant
-context when a bounded store evicts an ancestor.
+The current pass has a statically linked `tools/llama-responses/` module, an
+explicit route-bundle factory, typed IDs and response snapshots, provider
+strategy interfaces with fail-closed stubs, and route handlers for create,
+input-token counting, retrieve, delete, and input-item pagination. Production
+resources use a versioned SQLite store in the llama.cpp cache. Stored terminal
+responses, item indices, and continuation context survive process restart;
+deleting a parent transactionally detaches enough context for an existing
+child to survive another restart and produce a grandchild.
+
+Every stored response also owns its fully materialized input snapshot. A
+continuation therefore needs one parent read rather than a live ancestor walk:
+deleting an interior ancestor, or deleting the parent after generation starts
+but before the child is committed, cannot strand the child's future lineage.
+For `stream: true, store: true`, complete SSE frames are held until a terminal
+snapshot commits; a storage failure replaces the would-be terminal with an
+SDK-decodable `response_store_error` event before either HTTP or resumable
+stream storage sees it.
 
 The create path accepts string and typed-item inputs, string or typed-item-array
 instructions, structured `text.format`, function/custom tool round trips, and
 multimodal tool results. Sync and SSE responses share stable response, item,
 and call identities. The server observes complete SSE frames even when an HTTP
 write splits a frame, and response storage outlives asynchronous HTTP writes
-without retaining dangling route pointers.
+without retaining dangling route pointers. A dated OpenAI oracle establishes
+that `/input_items` materializes prior input, prior output, and current input;
+the implementation and fixture now follow that lineage exactly, including
+resolved `item_reference` values.
 
-This is not yet the final Phase 2 architecture. Generation still passes through
-the existing in-process server task machinery and its Chat-shaped adapter as a
-behavioral oracle. There is no HTTP call to Chat Completions, and the public
-wire contract remains Responses, but the neutral generation port and native
-event-owner extraction are still the largest structural work left. The module
-already owns request normalization, resource state, storage policy, and route
-orchestration; generic `server-task` code still owns too much Responses event
-construction.
+Phase 3 now has a typed, cancellable generation contract, deterministic scripted
+port, and native Responses state machine which owns IDs, output assembly,
+lifecycle, sequence numbers, sync snapshots, and SSE projections in focused
+tests. The real task/response-reader drain also exposes an optional neutral sink
+for parsed deltas, tool metadata, usage, errors, cancellation, and terminal
+state while retaining slots, MTMD, pings, reader cancellation RAII, and
+resumable streams. The sidecar does not yet implement that sink or call the
+internal `generate(request, sink)` hook. The legacy create route therefore
+remains the production default and generic `server-task` code still owns the
+bytes returned by real generation.
+
+The request-policy layer now normalizes documented nullable defaults; validates
+metadata and identifier character limits; handles max-output and incomplete
+lifecycle correctly even with partial output; validates reasoning, stream,
+context, text-format, client-tool, Codex `client_metadata`, and service-tier
+shapes; and rejects recognized unavailable fields and hosted tools with
+parameter-attributed OpenAI error envelopes. Codex telemetry is retained at the
+Responses boundary and removed before the private Chat-shaped inference DTO.
+Codex namespace tools are treated as client-executed containers, not as hosted
+providers: nested declarations are validated and deterministically flattened
+for current llama.cpp chat templates, with reversible metadata retained for
+Responses output and replay.
+
+These decisions are backed by cheap dated probes against the real OpenAI
+endpoint as well as the local SDK suite. The matrix is intentionally incomplete
+rather than silently permissive.
 
 The first advertised profile deliberately fails closed for long-tail or
 stateful features which are not implemented yet:
 
-- `background`, conversations, cancel, and compact;
+- `background`, conversation resources, cancel, and compact;
 - streamed retrieval/resume and WebSocket transport;
-- durable storage, expiry, and cross-process/router response ownership;
+- active-response/event-history persistence, expiry, and cross-process/router
+  response ownership;
 - hosted web/file/computer/MCP tool execution;
-- all `include` projections and some newer create-request policy fields.
+- projected retrieval and most `include` values. Codex's
+  `reasoning.encrypted_content` projection is accepted as a documented no-op
+  because local generation produces no opaque encrypted payload;
+- some newer create-request fields and long-tail typed variants.
 
-The in-memory store is bounded by response count, not bytes. Inline media can
-therefore consume substantial memory even below the entry cap. `/input_items`
-currently exposes the items supplied for the current response rather than a
-materialized copy of its whole continuation lineage; this needs an OpenAI
-oracle fixture before changing it.
+SQLite deliberately has no 30-day eviction machine in this phase. It also does
+not yet impose a byte budget on inline media. Those are operational policies,
+not prerequisites for honest foreground resource semantics.
 
 ## Codex CLI model-catalog compatibility
 
@@ -373,30 +436,34 @@ Codex behavior.
 The public Codex configuration supports custom providers with a `base_url` and
 `wire_api = "responses"`. Codex also implements a private model-catalog
 discovery contract which is documented by its source rather than by the OpenAI
-Responses specification. The first implementation is pinned against Codex
-0.148, commit `3ba0f711`, including the
+Responses specification. We first investigated that contract in OpenAI Codex
+commit `3ba0f711`, including the
 [request construction](https://github.com/openai/codex/blob/3ba0f711642a888aec92a611a3f3b2211157ff89/codex-rs/codex-api/src/endpoint/models.rs#L31),
 [catalog shape](https://github.com/openai/codex/blob/3ba0f711642a888aec92a611a3f3b2211157ff89/codex-rs/protocol/src/openai_models.rs#L683),
 and [fallback constructor](https://github.com/openai/codex/blob/3ba0f711642a888aec92a611a3f3b2211157ff89/codex-rs/models-manager/src/model_info.rs#L138-L215).
+That commit is provenance, not a compatibility pin.
 
-When its remote-refresh policy permits a network fetch, Codex 0.148 sends the
-following request for a provider whose base URL is
+When its remote-refresh policy permits a network fetch, Codex sends this shape
+for a provider whose base URL is
 `http://127.0.0.1:8081/v1`:
 
 ```text
-GET /v1/models?client_version=0.148.0
+GET /v1/models?client_version=<opaque client value>
 ```
 
 It expects `{"models":[ModelInfo,...]}`, not the public OpenAI
 `{"object":"list","data":[...]}` shape. The tagged schema is a fixture for the
 fields we deliberately emit, not a routing version lock: the endpoint is a
-forward/backward-compatible JSON bag, and unknown fields are ignored by Codex.
+forward/backward-compatible JSON bag. The server never parses or compares the
+version and tests release, prerelease, future, and opaque values. Compatible
+field additions require no version-specific server branch.
 
 ### When Codex calls the route
 
 The endpoint and the client's decision to call it are separate compatibility
-seams. Codex 0.148 refreshes remote model metadata only when the retained auth
-manager currently uses the first-party Codex backend or the custom provider
+seams. In the inspected client source, Codex refreshes remote model metadata
+only when the retained auth manager currently uses the first-party Codex
+backend or the custom provider
 defines `auth.command`. An `env_key` does not independently satisfy that gate,
 although an existing ChatGPT login can satisfy it for the same custom provider.
 With neither qualifying auth source, Codex deliberately skips the network fetch
@@ -409,14 +476,20 @@ For a local provider, command-backed bearer authentication opts into the
 refresh and sends `Authorization: Bearer <token>` on model and Responses
 requests. The canonical profile exports one `LLAMA_API_KEY` from `~/.env` to
 both the authenticated llama-server and Codex's token command. This policy is
-verified against Codex 0.148's
+verified against the inspected source's
 [refresh gate](https://github.com/openai/codex/blob/3ba0f711642a888aec92a611a3f3b2211157ff89/codex-rs/models-manager/src/manager.rs#L437)
-and with the installed CLI under isolated/no-OpenAI-auth state: no command auth
+and with installed clients under isolated/no-OpenAI-auth state: no command auth
 produced the unknown-model warning without a model request, while command auth
-consumed this catalog and removed the warning. A separate capture with the
-machine's ChatGPT login retained confirmed that first-party auth also opens the
-gate. Command auth is used below because it is deterministic across operator
-login and cache state.
+fetched and cached this catalog. A separate capture with the machine's ChatGPT
+login retained confirmed that first-party auth also opens the gate. Command
+auth is used below because it is deterministic across operator login state.
+
+`~/.codex` is shared by the standalone CLI, editor helpers, and the desktop
+application, which may install different Codex versions and share catalog
+cache state. A pinned-model process can select fallback metadata on a cold
+cache before a successful refresh becomes visible; the next process then uses
+the refreshed catalog. Record the resolved `codex` binary and its version in a
+smoke transcript, and do not infer route failure from one cold-start warning.
 
 ### Implemented route chain
 
@@ -436,8 +509,9 @@ handler as `next`:
 
 This is a chain-of-responsibility seam. Additional harness-specific query
 contracts can be inserted ahead of or behind it without adding query-policy
-branches to generic llama-server code. Tests intentionally include a future
-`client_version=99.0.0` to prevent an accidental exact-version gate.
+branches to generic llama-server code. Tests intentionally include release,
+prerelease, future, and non-version `client_version` bags to prevent an
+accidental exact-version gate.
 
 The current projection uses the following policies:
 
@@ -448,7 +522,7 @@ The current projection uses the following policies:
 | `input_modalities` | Router `architecture.input_modalities`, or `text` plus `image` for the known single-model Qwen+mmproj alias; otherwise explicit `text`. The generic single-model `multimodal` bit cannot distinguish image from audio, so the projection fails closed. |
 | shell and patch tools | `shell_type = "unified_exec"` and `apply_patch_tool_type = "freeform"`; both shapes are already accepted by the Responses bridge. |
 | hosted search | Not advertised; the C++ provider interfaces exist but the implementations are still stubs. |
-| instructions | The exact 20,903-byte Codex 0.148 fallback base prompt, embedded from the inspectable [prompt snapshot](tools/llama-responses/prompts/codex-0.148.0.md). `base_instructions` replaces the fallback rather than extending it, so matching the known baseline avoids an accidental prompt regression. Model-tuned prompts remain future, eval-driven policy. |
+| instructions | One inspectable Apache-2.0 [base-instructions file](tools/llama-responses/prompts/codex-base-instructions.md), initially imported from OpenAI Codex. It is a locally owned deployment baseline, not selected by `client_version` and not a prompt registry. Model-tuned changes remain future, eval-driven policy. |
 
 ### Qwen reasoning policy
 
@@ -494,11 +568,12 @@ non-terminal error item saying fallback metadata is in use. The turn continues
 on `wire_api = "responses"`. This is not a fallback to Chat Completions and does
 not mean `/v1/responses` failed.
 
-For Codex 0.148, the important compiled fallback differences are:
+At the source-provenance commit above, the important compiled fallback
+differences were:
 
 | Area | Client fallback | Consequence |
 | --- | --- | --- |
-| Instructions | The same generic 20,903-byte Codex 0.148 prompt embedded by this endpoint | Equivalent at this pinned client snapshot; the endpoint owns a stable, inspectable baseline instead of inheriting future client drift. |
+| Instructions | The generic prompt from which this endpoint's current baseline was imported | Later clients may move independently; the endpoint owns one inspectable baseline rather than keying prompts by client version. |
 | Context | 272,000 maximum, 95% effective budget, automatic compaction at 90% | Can be materially wrong for the loaded runtime. |
 | Shell | `default`, resolving to UnifiedExec with stock features | Terminal tools remain available. |
 | Patch | Dedicated `apply_patch` disabled | Codex exposes a different tool set. |
@@ -506,17 +581,39 @@ For Codex 0.148, the important compiled fallback differences are:
 | Modalities | Defaults to text and image | Wrong for text-only deployments. |
 | Tool output | 10,000-byte truncation | Independent of actual context and the endpoint's new 10,000-token policy. |
 
-The prompt snapshot is OpenAI Codex's Apache-2.0-licensed CLI fallback, not
+The initial prompt import is OpenAI Codex's Apache-2.0-licensed CLI fallback, not
 evidence that every hosted OpenAI model catalog entry uses identical
 instructions. Its source commit, checksum, license, and NOTICE are recorded in
 the adjacent [prompt README](tools/llama-responses/prompts/README.md).
 
 The fallback is useful but not capability-neutral. With command auth enabling
 refresh and the decorator active, the canonical Qwen alias resolves from the
-remote catalog without this warning. A future Codex client that adds a required
-field may fall back until we advance the schema fixture; accepting its
-`client_version` is intentional, because compatible JSON additions require no
-server change.
+remote catalog after refresh. A cold pinned-model turn may still warn before
+the refreshed cache is selected. A future Codex client that adds an actually
+required field may fall back until the projection is extended; compatible JSON
+additions require no server change and never justify an exact-version route.
+
+### Codex namespace tool containers
+
+Installed Codex apps/plugins can contribute top-level `namespace` tool
+containers. They are not OpenAI-hosted tools: Codex remains responsible for
+executing the nested client function/custom calls. On the 2026-08-24 live
+smoke, the client sent nine namespaces containing 211 nested functions in
+addition to ordinary function and custom tools.
+
+Current Qwen chat templates accept only a flat tool list and cap function names
+at 64 characters. The Responses boundary therefore validates each namespace,
+deterministically lowers every `{namespace, name}` pair to a collision-safe
+flat name, retains reversible metadata, restores the public namespace/name on
+generated call items, and applies the same mapping to replayed calls. Focused
+tests cover validation, collision handling, lowering, and replay. Forced
+namespace `tool_choice`, deferred loading/tool search, and an end-to-end model
+call of a nested connector remain explicit future coverage.
+
+The complete installed catalog is large enough to be a deployment concern. It
+tokenized to 86,729 prompt tokens in the live run; accepting namespace syntax
+does not make those schemas free. The canonical server profile below allocates
+90,112 tokens so the real request fits without hiding installed tools.
 
 ### What Ollama does
 
@@ -543,213 +640,369 @@ any compatible harness willing to request it.
 ## Delivery phases
 
 Each phase ends with a gate. A phase is not complete merely because its code
-compiles.
+compiles. `✅` marks a completed checkpoint, `🚧` active work, and `🕒` a later
+phase with some foundations already in place. Checked items are evidence in the
+tree; unchecked items remain obligations. The phases describe architectural
+checkpoints, not a strict landing order.
 
-### Phase 0: freeze the oracle and the specification
+### Phase 0: freeze the oracle and the specification 🚧
 
 Purpose: make the current behavior and desired contract measurable before
 moving code.
 
-Work:
+Completed work:
 
-- Build the current fork with `ninja -j32` in `build/` and record the test
-  baseline.
-- Inventory current Responses tests and fill gaps for every behavior listed
-  above, especially multimodal tool outputs.
-- Capture deterministic non-streaming and SSE fixtures from the current handler.
-- Capture the Codex CLI request/event subset with a deterministic fake model or
-  scripted generation source.
-- Create a dated conformance matrix from the official Responses schema: request
-  fields, item variants, event variants, resources, status transitions, and
-  error cases.
-- Preserve selected PR-era fixtures only when they describe behavior we still
-  want; do not import its architecture wholesale.
+- [x] Build the fork with `ninja -j32` in `build/` and establish focused C++ and
+  authenticated HTTP/SDK baselines.
+- [x] Pin this roadmap to a dated OpenAI contract snapshot and preserve the
+  useful fork behaviors as explicit compatibility requirements.
+- [x] Capture deterministic sync and SSE fixtures for stable IDs, tool calls,
+  structured output, and SDK decoding.
+- [x] Complete PR archaeology without importing the rejected PR's architecture
+  wholesale.
+
+Outstanding work:
+
+- [ ] Fill baseline fixture gaps for every behavior listed above, especially
+  multimodal tool-result continuation and genuinely generated parallel calls.
+- [ ] Capture the Codex CLI request/event subset with a deterministic fake model
+  or scripted generation source.
+- [ ] Finish the dated conformance matrix across request fields, item and event
+  variants, resources, transitions, and error cases.
+- [ ] Preserve additional PR-era fixtures only when they describe behavior we
+  still want.
 
 Gate:
 
-- The existing code builds.
-- Current behavior is green in CI or explicitly documented as an existing
-  failure.
-- Every target feature has a conformance-matrix row and an owning phase.
+- [x] The existing code builds.
+- [x] The currently exercised behavior is green or explicitly documented as an
+  existing failure.
+- [ ] Every target feature has a conformance-matrix row and an owning phase.
 
-### Phase 1: introduce the two seams without changing behavior
+### Phase 1: establish the sidecar and route seam ✅
 
-Purpose: make Responses independently replaceable while keeping one server.
+Purpose: give fork-owned Responses code a stable home and one narrow injection
+point inside the existing server lifecycle.
 
-Work:
+Completed:
 
-- Add `tools/llama-responses/` as a library linked into `llama-server`; do not
-  add a new executable or listening socket.
-- Introduce the Responses route-bundle factory and give it explicit lifetime in
+- [x] Link `tools/llama-responses/` as a static library owned by
+  `llama-server`.
+- [x] Add a neutral route-extension bundle whose lifetime is explicit in
   `llama_server()`.
-- Extract the smallest viable neutral generation port from the current task/
-  response-reader path.
-- Implement a legacy adapter so the existing handler can run through the new
-  route seam during comparison.
-- Add typed request context, ID generation, cancellation context, response
-  store interface, event sink, hosted-tool provider interface, registry, and
-  unavailable-provider stubs.
-- Make no public CLI changes unless the seam cannot be tested otherwise. Prefer
-  construction-time injection in unit/integration tests over a permanent
-  implementation-selection flag.
-- Verify single-model and router-mode route registration.
-
-Upstream-owned patch budget for this phase should be approximately:
-
-- one CMake linkage change;
-- a small route/factory declaration;
-- a small hook in `server.cpp`;
-- the neutral generation-port declaration and adapter;
-- no broad Responses rewrite in `server-task.cpp`.
+- [x] Install the Responses route factory after normal single-model or router
+  handler construction, so the fully configured legacy routes are dependencies
+  rather than hidden globals.
+- [x] Keep the legacy create and input-token handlers as an injected adapter and
+  behavioral oracle while the sidecar takes ownership incrementally.
+- [x] Keep upstream-owned changes to a CMake edge, neutral declarations, and a
+  small server construction hook.
+- [x] Preserve existing CLI and non-Responses route behavior; focused route
+  tests prove decorated and delegated paths.
+- [x] Build successfully with `ninja -j32`.
 
 Gate:
 
-- All existing endpoints and CLI behavior are unchanged.
-- Legacy Responses output is fixture-equivalent through the new route seam.
-- The new module can be substituted with a fake generation port in a unit test.
-- `ninja -j32` succeeds.
+- [x] `llama-server` constructs and owns the sidecar through the neutral seam.
+- [x] The existing Responses generator remains usable through dependency
+  injection rather than direct sidecar knowledge of server internals.
+- [x] The seam survives the exercised single-model, authenticated HTTP, and live
+  Qwen paths.
 
-### Phase 2: reach feature parity with a native Responses state machine
+### Phase 2: establish native protocol and resource foundations ✅
 
-Purpose: replace Chat-JSON conversion and interleaved output construction while
-losing none of the fork's present utility.
+Purpose: move Responses identity, storage, resource policy, and provider
+boundaries into the sidecar without waiting for native generation extraction.
 
-Work:
+Completed:
 
-- Parse Requests directly into the typed Responses domain.
-- Resolve references and media before lowering items to shared prompt/runtime
-  structures.
-- Port all existing item types, reasoning forms, compaction snapshots, Codex
-  custom tools, and multimodal tool-result behavior.
-- Build sync output and SSE events from the same state machine.
-- Implement independent `fc_*` item IDs and `call_*` correlation IDs first, with
-  stable replay behavior and tests.
-- Track every parallel tool call independently by stable call key.
-- Move Responses envelope/event construction out of generic generation tasks.
-- Differential-test native versus legacy behavior, allowing only reviewed
-  conformance corrections.
-- Run Codex CLI against scripted output, then against Qwen3.8-27B.
-
-Gate:
-
-- The native implementation passes all baseline fixtures and Codex contract
+- [x] Add distinct typed response, item, and call IDs; response statuses; usage;
+  errors; output items; and extensible event/snapshot types.
+- [x] Add normalization, capture, and rendering codecs that preserve
+  forward-compatible wire fields while overlaying typed authoritative state.
+- [x] Add a thread-safe `response_store` interface and bounded in-memory
+  implementation with revisions, item indexing, transition checks, and
+  descendant-context preservation across deletion or eviction.
+- [x] Add resource services for retrieve, delete, and input-item pagination with
+  structured errors.
+- [x] Add route orchestration for `store`,
+  `previous_response_id`, continuation expansion, and `item_reference`
+  resolution.
+- [x] Add transport-neutral hosted-tool provider interfaces, capability
+  reporting, progress/cancellation hooks, a registry, and fail-closed stubs.
+- [x] Add stable `fc_*` versus `call_*` contract fixtures, SDK-decodable
+  sync/SSE transcripts, split-frame storage coverage, and store/resource unit
   tests.
-- Media tool outputs survive a complete call/output/continuation round trip.
-- Parallel/interleaved tool streams are deterministic and correctly indexed.
-- Native becomes the default; legacy remains only as a short-lived test oracle.
-- `ninja -j32` succeeds.
-
-### Phase 3: complete the core HTTP Responses resource
-
-Purpose: move from fork parity to strict OpenAI resource semantics.
-
-Work:
-
-- Implement the complete create-request field matrix, including structured
-  output, truncation/context policy, include fields, prompt/cache fields,
-  moderation/safety identifiers where applicable, parallel-tool policy, and
-  request-dependent echo fields.
-- Implement exact response objects, status transitions, incomplete details,
-  usage, and errors for sync and streaming paths.
-- Implement real `store`, `previous_response_id`, and item-reference semantics.
-- Add retrieve, delete, list-input-items with pagination, and exact input-token
-  counting over the same normalization path used for generation.
-- Add cancel for active foreground work even before background mode is exposed.
-- Reject unsupported capabilities explicitly and compatibly.
-- Run current OpenAI SDKs against the local endpoint, including typed event
-  decoding and resource helpers.
+- [x] Keep generation behind the injected legacy adapter deliberately; Phase 2
+  establishes native protocol/resource ownership, not native token-event
+  production.
+- [x] Build and pass the focused C++ and HTTP/SDK suites.
 
 Gate:
 
-- The Phase 3 conformance matrix is green for all advertised HTTP capabilities.
-- Official SDK objects round-trip without local patches.
-- Stored continuation and deletion tests cover text, reasoning, tool calls, and
-  multimodal tool outputs.
-- Error fixtures cover malformed, unsupported, missing, expired, conflicting,
-  and cancelled resources.
+- [x] The sidecar owns response identity, resource state, storage policy, and
+  hosted-tool strategy contracts.
+- [x] The legacy generator can feed the native resource layer without an HTTP
+  Chat Completions hop.
+- [x] Stored continuation, retrieval, deletion, pagination, streamed terminal
+  capture, and item-reference behavior pass the current SDK suite.
 
-### Phase 4: execute hosted tools through providers
+### Phase 3: converge on the core OpenAI Responses resource 🚧
+
+Purpose: finish the generation/event spine and move from the working
+transitional endpoint to strict OpenAI HTTP semantics.
+
+Completed work:
+
+- [x] Implement stable function/custom call identity and validate interleaved
+  tool-call ordering with SDK-decodable golden transcripts.
+- [x] Implement durable foreground `store`, `previous_response_id`,
+  `item_reference`, retrieve, delete, materialized input-item pagination, and
+  normalized input-token counting over a versioned SQLite backend. Terminal
+  snapshots, item indices, continuation context, and descendant detachment
+  survive restart.
+- [x] Capture a dated OpenAI `/input_items` oracle and implement the observed
+  prior-input, prior-output, current-input lineage, including resolved
+  `item_reference` values.
+- [x] Preserve structured output and request-dependent wire fields through the
+  native snapshot/codec layer.
+- [x] Persist completed sync and split-frame SSE terminal responses without
+  dangling route lifetimes. Stored streams release only complete frames and do
+  not expose or cache a success terminal until SQLite commits it.
+- [x] Make continuation snapshots self-contained, including middle-node
+  deletion, restart, grandchild, and delete-during-generation races. Future
+  continuation performs one parent snapshot read rather than walking live
+  ancestors.
+- [x] Reject the currently recognized unavailable stateful features—background,
+  conversations, cancel, and compact—with structured errors.
+- [x] Pass current synchronous and asynchronous OpenAI Python SDK coverage for
+  foreground create, stream, continuation, retrieve, delete, input-item
+  pagination, item references, input-token counting, and validation errors.
+- [x] Define a typed generation request/session/port and typed cancellation,
+  text, reasoning, function/custom-call, usage, and terminal updates, with a
+  deterministic scripted implementation.
+- [x] Implement one native Responses state machine which owns response/item/call
+  IDs, output assembly, lifecycle, sequence numbers, synchronous snapshots, and
+  SSE projections in focused scripted tests, including interleaved calls and
+  completed/incomplete/failed/cancelled terminals.
+- [x] Expose the real llama-server completion reader through an optional
+  protocol-neutral generation sink carrying begin/progress, parsed message
+  diffs plus tool metadata, usage, errors, cancellation, and terminal state.
+  Keep the legacy renderer as the production default and preserve slots, MTMD,
+  pings, reader cancellation RAII, and resumable stream plumbing.
+- [x] Accept Codex namespace tool containers, lower nested declarations to
+  deterministic flat chat-template names, and preserve reversible call/replay
+  metadata.
+- [x] Complete an authenticated installed-Codex + Qwen3.8-27B Responses turn.
+
+Outstanding spine:
+
+- [ ] Implement the `tools/llama-responses` adapter for
+  `server_generation_sink`: translate parsed reader diffs into native text,
+  reasoning, stable per-index tool-start, tool-delta, usage, and terminal
+  updates, including raw-argument accumulation and semantic custom-tool deltas.
+- [ ] Route the supported foreground profile through the injected internal
+  `generate(request, sink)` hook so `native_response_state_machine` owns the
+  actual synchronous body and SSE bytes; persist typed snapshots directly
+  instead of recovering terminal state from legacy wire output.
+- [ ] Differential-test native projection against the legacy oracle for sync,
+  split-frame SSE, late errors, limits, cancellation, and genuinely generated
+  interleaved tool calls.
+- [ ] Move Responses event/envelope construction out of generic
+  `server-task`/`server-context` code after the native path is proven.
+- [ ] Lower references and multimodal tool results from the typed domain rather
+  than through the transitional Chat-shaped request adapter.
+- [ ] Make native generation the default for every advertised supported shape
+  and retain legacy only as a short-lived test oracle/fallback.
+
+Outstanding HTTP/resource work:
+
+- [ ] Complete the create-request field matrix, including remaining `include`,
+  prompt/cache, moderation/safety, parallel-tool, and request-echo policy.
+- [ ] Implement exact production active-state transitions, incomplete details,
+  usage, and error/event ordering for sync and streaming.
+- [ ] Add foreground cancellation before advertising background mode; the
+  neutral sink currently supplies only the polling and cancelled-update seam.
+- [ ] Audit every accepted create field so unsupported behavior is rejected
+  explicitly rather than ignored by the transitional adapter.
+- [ ] Add remaining typed resource and content variants beyond the foreground
+  SDK subset already covered synchronously and asynchronously.
+- [ ] Connect native active snapshots to store compare-and-swap and persist a
+  canonical event history; production SQLite currently captures terminal
+  foreground state even though the backend supports revisions/transitions.
+- [ ] Add expiry/GC, byte accounting and inline-media budgets, and operational
+  retention policy without changing the resource API.
+
+Gate:
+
+- [ ] Native generation is the default and no Responses event construction
+  remains in generic task code.
+- [ ] The Phase 3 conformance matrix is green for all advertised HTTP
+  capabilities.
+- [ ] Official SDK objects round-trip without local patches across the complete
+  advertised matrix.
+- [ ] Stored continuation and deletion tests cover text, reasoning, tool calls,
+  and multimodal tool outputs.
+- [ ] Error fixtures cover malformed, unsupported, missing, expired,
+  conflicting, and cancelled resources.
+
+### Phase 3.5: advertise truthful Codex model capabilities 🚧
+
+Purpose: make Codex choose the correct prompt, context, modalities, tools, and
+reasoning policy without changing public model-list behavior.
+
+Completed work:
+
+- [x] Add a neutral chain-of-responsibility decorator for `/v1/models` after
+  normal single-model or router handler selection.
+- [x] Intercept any nonempty `client_version`, call the downstream handler
+  once, and preserve absent/unrelated queries, downstream errors, malformed
+  bodies, and already-private catalogs.
+- [x] Leave `/models` and undecorated `/v1/models` responses unchanged.
+- [x] Project live context, text/image modalities, Codex shell/patch tools, and
+  Qwen `low`/`medium`/`xhigh` reasoning with a low default.
+- [x] Embed one Apache-2.0 Codex-derived base-instructions file with import
+  provenance, license, and NOTICE. It is intentionally independent of
+  `client_version`.
+- [x] Document Codex's auth/cache refresh gate and use one bearer token for both
+  Codex command auth and llama-server authentication.
+- [x] Verify unit, authenticated HTTP/SDK, and live Codex + Qwen behavior,
+  including cold fallback followed by refreshed-catalog selection.
+
+Outstanding work:
+
+- [ ] Replace the Qwen-alias special case with configurable or model-derived
+  capability policy for arbitrary local and router models.
+- [ ] Add end-to-end fixtures for API prefixes, sleeping/cached models, and
+  actual router-process handler substitution; router-shaped catalog projection
+  already has focused unit coverage.
+- [ ] Advertise reasoning summaries, verbosity, hosted search, and other Codex
+  capabilities only as their server implementations become truthful.
+- [ ] Capture Codex request/tool negotiation as a deterministic black-box
+  fixture rather than relying only on the live smoke transcript.
+- [ ] Track genuinely required catalog-field changes with tolerant fixtures;
+  keep the one base-instructions policy independent of client versions.
+
+Gate:
+
+- [x] The canonical Qwen deployment is discovered after catalog refresh and
+  completes an authenticated Codex Responses turn; a cold pinned-model turn is
+  allowed to use client fallback once while refresh populates shared cache.
+- [x] Public model-list clients observe the original llama-server response.
+- [ ] Generic single-model, sleeping, prefixed, and router deployments have
+  deterministic integration coverage.
+- [ ] A non-Qwen deployment can advertise truthful capabilities without source
+  changes.
+
+### Phase 4: execute hosted tools through providers 🕒
 
 Purpose: support the hosted-tool part of the real Responses contract without
 coupling the API to one deployment.
 
-Work:
+Completed foundations:
 
-- Implement the provider registry, capability negotiation, execution policy,
-  progress events, cancellation, and tool-round loop.
-- Start with MCP adapters for the locally available terminal and web-search
-  services, while keeping the interfaces transport-neutral.
-- Add file-search and image-generation providers as separate strategies.
-- Preserve typed media/file results through provider output, storage, prompt
+- [x] Define transport-neutral provider contracts, capability reporting,
+  progress/cancellation hooks, a registry, and fail-closed unavailable-provider
+  stubs.
+- [x] Keep provider transport independent of the public Responses item model;
+  MCP is an adapter option, not the architecture.
+
+Outstanding work:
+
+- [ ] Implement execution policy and the hosted-tool inference-round loop.
+- [ ] Start with MCP adapters for the locally available terminal and web-search
+  services while keeping the interfaces transport-neutral.
+- [ ] Add file-search and image-generation providers as separate strategies.
+- [ ] Preserve typed media/file results through provider output, storage, prompt
   lowering, and streaming.
-- Add deterministic fake providers for every provider contract test.
-- Add timeouts, size limits, approval/permission hooks, maximum rounds, loop
+- [ ] Add deterministic fake providers for every provider contract test.
+- [ ] Add timeouts, size limits, approval/permission hooks, maximum rounds, loop
   detection, and audit logging.
 
 Gate:
 
-- Hosted tool calls can drive multiple inference rounds inside one response.
-- Cancellation interrupts both inference and provider work.
-- Missing providers fail closed with compatible errors.
-- Provider failures never corrupt stored response state or event sequences.
-- MCP is one passing adapter, not a special case in the protocol layer.
+- [ ] Hosted tool calls can drive multiple inference rounds inside one response.
+- [ ] Cancellation interrupts both inference and provider work.
+- [x] Missing providers fail closed with compatible errors.
+- [ ] Provider failures never corrupt stored response state or event sequences.
+- [ ] MCP is one passing adapter, not a special case in the protocol layer.
 
-### Phase 5: background, compaction, conversations, and alternate transports
+### Phase 5: background, compaction, conversations, and alternate transports 🕒
 
 Purpose: finish the stateful and long-running portions of the API.
 
-Work:
+Completed foundations:
 
-- Implement background scheduling and atomic queued/in-progress/terminal state
-  transitions.
-- Complete cancel and retrieve behavior for active background responses.
-- Implement compact using the same response/item store and context policy.
-- Implement conversation attachment and any companion conversation resources
-  required for a client to use the create contract normally.
-- Implement WebSocket events, reconnection/resume semantics, and event cursors
-  from the same canonical event log used by SSE.
-- Make router mode retain or discover which child owns a response. Do not rely
-  on random proxy selection for retrieve/cancel/delete.
-- Decide and implement the first persistent `response_store` backend if process
-  restart continuity is part of the advertised deployment profile.
+- [x] Define typed response statuses and enforce basic terminal transition and
+  revision invariants in the store.
+- [x] Reject background, conversations, cancel, and compact explicitly while
+  their lifecycle semantics are unavailable.
+
+Outstanding work:
+
+- [ ] Implement background scheduling and atomic queued/in-progress/terminal
+  state transitions.
+- [ ] Complete cancel and retrieve behavior for active background responses.
+- [ ] Implement compact using the same response/item store and context policy.
+- [ ] Implement conversation attachment and any companion conversation
+  resources required for a client to use the create contract normally.
+- [ ] Implement WebSocket events, reconnection/resume semantics, and event
+  cursors from the same canonical event log used by SSE.
+- [ ] Make router mode retain or discover which child owns a response. Do not
+  rely on random proxy selection for retrieve/cancel/delete.
+- [ ] Extend the Phase 3 persistent backend for background scheduling, event
+  cursors, router ownership, expiry, and restart recovery.
 
 Gate:
 
-- State-machine race tests cover cancel-versus-complete, delete-versus-retrieve,
-  disconnect/reconnect, expiry, and router child loss.
-- SSE and WebSocket views are projections of one canonical event history.
-- Background and compact pass SDK-level tests.
-- Router mode passes create/continue/retrieve/cancel/delete end to end.
+- [ ] State-machine race tests cover cancel-versus-complete,
+  delete-versus-retrieve, disconnect/reconnect, expiry, and router child loss.
+- [ ] SSE and WebSocket views are projections of one canonical event history.
+- [ ] Background and compact pass SDK-level tests.
+- [ ] Router mode passes create/continue/retrieve/cancel/delete end to end.
 
-### Phase 6: convergence and hardening
+### Phase 6: convergence and hardening 🕒
 
 Purpose: earn the claim of production-quality OpenAI compatibility and make it
 cheap to maintain.
 
-Work:
+Completed foundations:
 
-- Run an optional differential suite against the dated real OpenAI endpoint for
-  schema, validation, errors, and event ordering. Sanitize and commit fixtures;
-  normal development must not require credentials.
-- Run Codex black-box suites with scripted generation and live Qwen smoke tests.
-- Fuzz request parsing, SSE framing, replayed items, provider output, and
+- [x] Establish focused domain, server-conversion, authenticated HTTP/SDK, and
+  live Qwen/Codex tests.
+- [x] Adopt a touched-file clang-tidy policy and keep the new Responses-owned
+  code clean under the repository configuration.
+- [x] Keep the fork-owned server seam small enough to remain mechanically
+  reviewable against upstream changes.
+- [x] Run targeted dated probes against the real OpenAI endpoint for defaults,
+  validation errors, max-output lifecycle, structured output, tool policy, and
+  continuation lineage; commit the sanitized `/input_items` lineage fixture.
+
+Outstanding work:
+
+- [ ] Build an optional differential suite against the dated real OpenAI endpoint
+  for schema, validation, errors, and event ordering. Sanitize and commit
+  fixtures; normal development must not require credentials.
+- [ ] Expand Codex black-box suites with scripted generation and live Qwen smoke
+  tests beyond the single canonical turn.
+- [ ] Fuzz request parsing, SSE framing, replayed items, provider output, and
   cancellation sequences.
-- Soak parallel responses, storage eviction, disconnects, router churn, and
+- [ ] Soak parallel responses, storage eviction, disconnects, router churn, and
   hosted-tool loops.
-- Audit authorization boundaries, SSRF/path traversal, subprocess handling,
+- [ ] Audit authorization boundaries, SSRF/path traversal, subprocess handling,
   secret redaction, size limits, and denial-of-service surfaces.
-- Remove the legacy Responses output path and compatibility-only special headers
-  after the native path has been the sole default for a release window.
-- Document supported, experimental, and unavailable capabilities and automate
-  advancement of the OpenAI spec snapshot.
+- [ ] Remove the legacy Responses output path and compatibility-only special
+  headers after the native path has been the sole default for a release window.
+- [ ] Document supported, experimental, and unavailable capabilities and
+  automate advancement of the OpenAI spec snapshot.
 
 Gate:
 
-- All advertised conformance rows pass across sync, SSE, and applicable
+- [ ] All advertised conformance rows pass across sync, SSE, and applicable
   WebSocket modes.
-- Codex completes a broad tool/media/state test corpus against Qwen.
-- No Responses JSON/event logic remains in generic sampling/task code.
-- Replaying the fork's server seam after a representative upstream merge is a
+- [ ] Codex completes a broad tool/media/state test corpus against Qwen.
+- [ ] No Responses JSON/event logic remains in generic sampling/task code.
+- [ ] Replaying the fork's server seam after a representative upstream merge is a
   small, mechanical operation.
 
 ## Test strategy
@@ -801,6 +1054,7 @@ $SERVER \
     --alias qwen3.8-27b-local \
     --port 8081 \
     --host 0.0.0.0 \
+    --ctx-size 90112 \
     --reasoning auto \
     --reasoning-effort low \
     --temperature 1.0 \
@@ -856,23 +1110,30 @@ The launcher sources `~/.env`, which exports `LLAMA_API_KEY`; llama-server
 consumes that supported environment variable directly and requires bearer
 authentication on its protected routes. The Codex process inherits the same
 variable, and its `auth.command` asks `/usr/bin/printenv` for the token without
-putting the secret in this document or the process arguments. Codex 0.148 also
-treats command-backed provider auth as permission to refresh remote model
-metadata; an `env_key` alone does not open that gate.
+putting the secret in this document or the process arguments. The inspected
+Codex refresh policy treats command-backed provider auth as permission to
+refresh remote model metadata; an `env_key` alone does not open that gate.
 
 The command deliberately has no reasoning override or static
 `model_catalog_json`: it exercises remote
 `/v1/models?client_version=...` discovery, selects the catalog's low default,
-and fails visibly if Codex falls back to compiled metadata.
+and reports visibly if Codex selects compiled fallback metadata.
 
-Verified live on 2026-08-24 with Codex CLI 0.148 and the Qwen profile above:
-the loaded slot reported 91,136 context tokens; an unauthenticated catalog
-request returned 401; the authenticated catalog returned the Qwen alias,
-text/image modalities, `low`/`medium`/`xhigh`, low default, and the exact prompt
-checksum. The smoke command exited 0 with no unknown-model warning and produced
-exactly `LOCAL_RESPONSES_OK` through `/v1/responses` (9,684 input tokens and 34
-generated tokens). This is an end-to-end compatibility observation, not a
-performance or output-determinism contract.
+Verified live on 2026-08-24 with the `codex` resolved from `PATH` and the Qwen
+profile above. That process resolved `/home/ken/.local/bin/codex`, which
+reported `codex-cli 0.149.1`; separate desktop/editor helper binaries were also
+installed but were not the smoke process. The loaded slot reported 90,112
+context tokens; an unauthenticated catalog request returned 401; and the
+authenticated catalog
+returned the Qwen alias, loaded context, text/image modalities,
+`low`/`medium`/`xhigh`, low default, and the shared base instructions. The first
+cold pinned-model process warned that it selected unknown-model fallback while
+also refreshing the catalog, yet completed exactly `LOCAL_RESPONSES_OK` through
+`/v1/responses` (86,729 input tokens, including nine connector namespaces with
+211 nested functions, and 39 output tokens). The second identical process used
+the refreshed catalog with no warning, reused 86,725 cached prompt tokens, and
+again completed exactly. This is an end-to-end compatibility observation, not
+a performance or output-determinism contract.
 
 ## Upstream merge discipline
 
@@ -918,14 +1179,16 @@ This keeps the fork's test ownership and tidy boundary explicit.
 These do not change the architectural decision, but they affect implementation
 details:
 
-- What is the smallest generation-port extraction that supports typed,
-  interleaved tool deltas without perturbing Chat Completions?
+- Which supported request/tool subset should first select the optional native
+  generation sink, and what explicit capability predicate prevents a silent
+  semantic downgrade to or from the legacy oracle?
 - Should response ownership in router mode be encoded in IDs, stored in the
   router, or both?
 - Which create fields are meaningful for local inference and which require an
   explicit unsupported-capability response?
-- Is in-process lifetime storage sufficient for the first advertised profile,
-  or should SQLite land before background mode?
+- What canonical event-log schema and active ownership metadata should augment
+  the existing versioned SQLite snapshot store for cancellation, resume, and
+  router recovery?
 - Which OpenAI WebSocket/resume behavior belongs in the first conformance
   snapshot?
 - Where should model-specific opaque reasoning state live so that replay is
@@ -937,27 +1200,28 @@ Each spike should end in a small test or an ADR amendment in this document.
 
 ## Next implementation slice
 
-The route, domain, storage, ID, and provider foundations now exist. The next
-slice should finish the architectural move rather than widening the transitional
-adapter indefinitely:
+The neutral generation foundation, real-reader sink, terminal SQLite backend,
+and continuation-lineage oracle now exist. The next slice is the sidecar-owned
+production adapter, not another seam or storage spike.
 
-1. Extract the neutral generation port and a scripted fake from the current
-   task/response-reader path.
-2. Move text, reasoning, and interleaved tool-call event ownership into one
-   native Responses state machine, then differential-test it against the legacy
-   oracle.
-3. Add an exact split-frame/interleaved-stream fixture at the generation seam,
-   including deferred web/file shell-wrapper identity.
-4. Capture an OpenAI oracle fixture for continued-response `/input_items`
-   semantics before changing the current-turn representation.
-5. Exercise the implemented Codex catalog decorator with the real CLI, then
-   capture its request and tool-set negotiation as a deterministic fixture.
-6. Put a byte budget around stored inline media before advertising the
-   in-memory store beyond development use.
-7. Continue Phase 3 field/error coverage, then begin real hosted providers as
-   Phase 4 rather than embedding transport choices in the API layer.
+Recommended next checkpoint:
 
-The central remaining question is now concrete: how small the generation seam
-can be while preserving the mature slot, parser, chat-template, and media
-runtime and letting `tools/llama-responses` become the sole owner of Responses
-items and events.
+1. Implement `server_generation_sink` in `tools/llama-responses` and translate
+   real parsed reader updates into the native state machine.
+2. Differential-test the adapter against the legacy oracle for sync/SSE,
+   function/custom interleaving, limits, errors, and cancellation.
+3. Route only the proven foreground capability subset through the internal
+   `generate(request, sink)` hook; keep legacy as explicit oracle/fallback.
+4. Register response identity before task submission, poll one atomic cancel
+   flag from the owning reader thread, and persist native active/terminal state
+   with compare-and-swap.
+5. Flip native generation to the default only after SDK and live-Qwen smoke
+   coverage proves that the advertised profile no longer depends on legacy
+   Responses rendering.
+
+Lower-risk conformance work can accompany that checkpoint without obscuring
+it: add an inline-media byte budget; continue the accepted/unsupported create
+field audit; and turn live Codex catalog negotiation into a deterministic
+fixture. Generic model-policy and router/prefix/sleep catalog coverage are the
+next natural Phase 3.5 work, but they are not a substitute for production
+Responses state-machine ownership.

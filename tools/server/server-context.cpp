@@ -6,6 +6,7 @@
 #include "responses_item_cache.h"
 #include "server-chat.h"
 #include "server-common.h"
+#include "server-generation.h"
 #include "server-http.h"
 #include "server-queue.h"
 #include "server-responses.h"
@@ -38,6 +39,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -45,6 +47,7 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <variant>
 #include <vector>
 
 // fix problem with std::min and std::max
@@ -3838,13 +3841,17 @@ private:
 
             GGML_ASSERT(n_draft > 0);
 
+            // Preserve the target-logit row for every speculative token so
+            // accepted tokens can carry real probabilities. See llama.cpp
+            // PR #27196; post_sampling_probs still needs separate support.
+            auto spec_i_batch = std::move(slot.spec_i_batch);
+
             // verify and try to accept the draft
             {
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
-                GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
-                slot.spec_i_batch.clear();
+                GGML_ASSERT(spec_i_batch.size() == n_draft + 1);
+                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
 
                 GGML_ASSERT(!accepted.empty());
 
@@ -3931,7 +3938,10 @@ private:
                 result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
                 result.prob         = 1.0f; // set later
 
-                // TODO: set result.probs
+                // post_sampling_probs is not supported with speculative decoding
+                if (slot.task->params.sampling.n_probs > 0 && !slot.task->params.post_sampling_probs) {
+                    populate_token_probs(slot, result, false, params_base.special, spec_i_batch[i]);
+                }
 
                 slot.stats.n_gen += 1;
 
@@ -4274,12 +4284,80 @@ static std::string format_oai_responses_stream_error(
     }));
 }
 
+namespace {
+
+class server_generation_projection {
+  public:
+    explicit server_generation_projection(server_generation_sink_ptr sink) : sink(std::move(sink)) {}
+
+    bool enabled() const noexcept { return sink != nullptr; }
+
+    bool cancel_requested() const noexcept {
+        return sink != nullptr && !terminal && sink->cancel_requested();
+    }
+
+    std::string accept(const server_task_result & result) {
+        return accept(server_generation_updates_from_result(result, !started));
+    }
+
+    std::string cancel() {
+        if (sink == nullptr || terminal) {
+            return {};
+        }
+        std::vector<server_generation_update> updates;
+        if (!started) {
+            updates.emplace_back(server_generation_started{});
+        }
+        updates.emplace_back(server_generation_cancelled{});
+        return accept(updates);
+    }
+
+    std::string fail(const std::string & message) {
+        if (sink == nullptr || terminal) {
+            return {};
+        }
+        std::vector<server_generation_update> updates;
+        if (!started) {
+            updates.emplace_back(server_generation_started{});
+        }
+        updates.emplace_back(server_generation_failed{
+            { "server_error", message, "" },
+            std::nullopt,
+        });
+        return accept(updates);
+    }
+
+    common_json snapshot() const {
+        GGML_ASSERT(sink != nullptr);
+        return sink->snapshot();
+    }
+
+  private:
+    std::string accept(const std::vector<server_generation_update> & updates) {
+        GGML_ASSERT(sink != nullptr);
+        std::string output;
+        for (const server_generation_update & update : updates) {
+            output += sink->accept(update);
+            started |= std::holds_alternative<server_generation_started>(update);
+            terminal |= server_generation_update_is_terminal(update);
+        }
+        return output;
+    }
+
+    server_generation_sink_ptr sink;
+    bool                       started  = false;
+    bool                       terminal = false;
+};
+
+}  // namespace
+
 std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             const server_http_req & req,
             server_task_type type,
             const json & data,
             const std::vector<raw_buffer> & files,
-            task_response_type res_type) {
+            task_response_type res_type,
+            server_generation_sink_ptr generation_sink) {
     GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
 
     auto res = create_response();
@@ -4365,16 +4443,43 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         return res;
     }
 
-    bool stream = json_value(data, "stream", false);
+    bool                         stream = json_value(data, "stream", false);
+    server_generation_projection projection(std::move(generation_sink));
 
     if (!stream) {
         // non-stream, wait for the results
-        auto all_results = rd.wait_for_all(req.should_stop);
+        auto all_results = rd.wait_for_all([&req, &projection]() {
+            return req.should_stop() || projection.cancel_requested();
+        });
         if (all_results.is_terminated) {
+            if (projection.enabled()) {
+                projection.cancel();
+            }
             return res; // connection is closed
         }
         if (all_results.error) {
+            if (projection.enabled()) {
+                try {
+                    projection.accept(*all_results.error);
+                } catch (const std::exception & e) {
+                    SRV_ERR("neutral generation sink failed while recording an error: %s\n", e.what());
+                }
+            }
             res->error(all_results.error->to_json());
+            return res;
+        }
+        if (projection.enabled()) {
+            if (all_results.results.size() != 1) {
+                res->error(format_error_response(
+                    "neutral generation projection requires exactly one completion", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            try {
+                projection.accept(*all_results.results.front());
+                res->ok(projection.snapshot());
+            } catch (const std::exception & e) {
+                res->error(format_error_response(e.what(), ERROR_TYPE_SERVER));
+            }
             return res;
         }
         json arr = json::array();
@@ -4405,13 +4510,25 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // in streaming mode, the first error must be treated as non-stream response
         // this is to match the OAI API behavior
         // ref: https://github.com/ggml-org/llama.cpp/pull/16486#discussion_r2419657309
-        auto first_result = rd.next(req.should_stop);
+        auto first_result = rd.next([&req, &projection]() {
+            return req.should_stop() || projection.cancel_requested();
+        });
         if (first_result == nullptr) {
-            GGML_ASSERT(req.should_stop());
+            GGML_ASSERT(req.should_stop() || projection.cancel_requested());
+            if (projection.enabled()) {
+                projection.cancel();
+            }
             return res; // connection is closed
         }
 
         if (first_result->is_error()) {
+            if (projection.enabled()) {
+                try {
+                    projection.accept(*first_result);
+                } catch (const std::exception & e) {
+                    SRV_ERR("neutral generation sink failed while recording an error: %s\n", e.what());
+                }
+            }
             res->error(first_result->to_json());
             return res;
         }
@@ -4423,27 +4540,37 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
         // next responses are streamed
         // to be sent immediately
-        json first_result_json = first_result->to_json();
         responses_stream_state responses_stream;
-        if (first_result_json == nullptr) {
-            res->data = ""; // simply send HTTP headers and status code
-        } else {
-            if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
-                responses_cache_capture(ctx_server.responses_items, first_result_json);
+        if (projection.enabled()) {
+            try {
+                res->data = projection.accept(*first_result);
+            } catch (const std::exception & e) {
+                res->error(format_error_response(e.what(), ERROR_TYPE_SERVER));
+                return res;
             }
-            if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
-                res->data = format_anthropic_sse(first_result_json);
-            } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
-                res->data = format_oai_resp_sse(first_result_json);
-                responses_stream_observe(responses_stream, first_result_json);
+        } else {
+            json first_result_json = first_result->to_json();
+            if (first_result_json == nullptr) {
+                res->data = ""; // simply send HTTP headers and status code
             } else {
-                res->data = format_oai_sse(first_result_json);
+                if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
+                    responses_cache_capture(ctx_server.responses_items, first_result_json);
+                }
+                if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
+                    res->data = format_anthropic_sse(first_result_json);
+                } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
+                    res->data = format_oai_resp_sse(first_result_json);
+                    responses_stream_observe(responses_stream, first_result_json);
+                } else {
+                    res->data = format_oai_sse(first_result_json);
+                }
             }
         }
         res->status = 200;
         res->content_type = "text/event-stream";
         res->set_next([res_this = res.get(), res_type, sse_ping_interval, &items = ctx_server.responses_items,
-                responses_stream = std::move(responses_stream)](std::string & output) mutable -> bool {
+                responses_stream = std::move(responses_stream),
+                projection = std::move(projection)](std::string & output) mutable -> bool {
             static auto format_error = [](
                     task_response_type res_type,
                     const json & res_json,
@@ -4460,13 +4587,18 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 return format_oai_sse(json {{ "error", res_json }});
             };
 
-            auto effective_should_stop = [&res_this]() {
-                return res_this->should_stop();
+            auto effective_should_stop = [&res_this, &projection]() {
+                return res_this->should_stop() || projection.cancel_requested();
             };
 
             try {
                 if (effective_should_stop()) {
                     SRV_DBG("%s", "stopping streaming due to should_stop condition\n");
+                    if (projection.enabled()) {
+                        output = std::move(res_this->data);
+                        res_this->data.clear();
+                        output += projection.cancel();
+                    }
                     return false; // should_stop condition met
                 }
 
@@ -4520,13 +4652,20 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 if (result == nullptr) {
                     SRV_DBG("%s", "stopping streaming due to should_stop condition\n");
                     GGML_ASSERT(effective_should_stop());
+                    if (projection.enabled()) {
+                        output = projection.cancel();
+                    }
                     return false; // should_stop condition met
                 }
 
                 // send the results
                 if (result->is_error()) {
-                    json res_json = result->to_json();
-                    output = format_error(res_type, res_json, responses_stream);
+                    if (projection.enabled()) {
+                        output = projection.accept(*result);
+                    } else {
+                        json res_json = result->to_json();
+                        output = format_error(res_type, res_json, responses_stream);
+                    }
                     SRV_DBG("%s", "error received during streaming, terminating stream\n");
                     return false; // terminate on error
                 }
@@ -4534,25 +4673,39 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     dynamic_cast<server_task_result_cmpl_partial*>(result.get()) != nullptr
                     || dynamic_cast<server_task_result_cmpl_final*>(result.get()) != nullptr
                 );
-                json res_json = result->to_json();
-                if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
-                    responses_cache_capture(items, res_json);
-                }
-                if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
-                    output = format_anthropic_sse(res_json);
-                } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
-                    output = format_oai_resp_sse(res_json);
-                    responses_stream_observe(responses_stream, res_json);
+                if (projection.enabled()) {
+                    output = projection.accept(*result);
                 } else {
-                    output = format_oai_sse(res_json);
+                    json res_json = result->to_json();
+                    if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
+                        responses_cache_capture(items, res_json);
+                    }
+                    if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
+                        output = format_anthropic_sse(res_json);
+                    } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
+                        output = format_oai_resp_sse(res_json);
+                        responses_stream_observe(responses_stream, res_json);
+                    } else {
+                        output = format_oai_sse(res_json);
+                    }
                 }
 
                 // has next data, continue
                 return true;
 
             } catch (const std::exception & e) {
-                json error_json = format_error_response(e.what(), ERROR_TYPE_SERVER);
-                output = format_error(res_type, error_json, responses_stream);
+                if (projection.enabled()) {
+                    try {
+                        output = projection.fail(e.what());
+                    } catch (const std::exception & projection_error) {
+                        output = format_oai_sse(json{
+                            { "error", format_error_response(projection_error.what(), ERROR_TYPE_SERVER) },
+                        });
+                    }
+                } else {
+                    json error_json = format_error_response(e.what(), ERROR_TYPE_SERVER);
+                    output = format_error(res_type, error_json, responses_stream);
+                }
 
                 // terminate on exception
                 return false;
@@ -4799,6 +4952,85 @@ static json get_res_props(const server_context_meta & meta, const common_params 
 
 json server_routes::get_model_info() const {
     return get_res_model_info(*meta);
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_responses_impl(
+        const server_http_req & req,
+        server_generation_sink_ptr generation_sink) {
+    // Wake the model before request conversion reads model-owned chat
+    // templates. handle_completions_impl creates the response that ultimately
+    // owns the task reader and stream pipe.
+    auto wake_guard = create_response();
+    GGML_UNUSED(wake_guard);
+
+    std::vector<raw_buffer> files;
+    json response_body = json::parse(req.body);
+    json public_response_body = response_body;
+    if (response_body.contains("__llama_responses_request")) {
+        if (!response_body.at("__llama_responses_request").is_object()) {
+            throw std::invalid_argument("__llama_responses_request must be an object");
+        }
+        public_response_body = response_body.at("__llama_responses_request");
+        response_body.erase("__llama_responses_request");
+    }
+    // Resolve `{type:"item_reference", id}` placeholders against the
+    // server-side LRU cache before handing off to the chatcmpl converter.
+    // Misses are a structured 400; the converter still carries a defensive
+    // throw arm in case a caller bypasses us.
+    if (response_body.contains("input")) {
+        std::string missing_id;
+        if (!responses_resolve_item_references(ctx_server.responses_items, response_body["input"], missing_id)) {
+            throw std::invalid_argument(
+                "item_reference_not_found: id=" + (missing_id.empty() ? "<unset>" : missing_id));
+        }
+    }
+    const std::string web_search_wrapper = header_value(req, "X-Llama-Responses-Web-Search-Wrapper");
+    const std::string file_search_wrapper = header_value(req, "X-Llama-Responses-File-Search-Wrapper");
+    json body = server_chat_convert_responses_to_chatcmpl(
+        response_body,
+        web_search_wrapper,
+        file_search_wrapper);
+    body["__responses_request"] = public_response_body;
+    if (!web_search_wrapper.empty()) {
+        body["__responses_web_search_wrapper"] = web_search_wrapper;
+    }
+    if (!file_search_wrapper.empty()) {
+        body["__responses_file_search_wrapper"] = file_search_wrapper;
+    }
+    SRV_DBG("%s\n", "Request converted: OpenAI Responses -> OpenAI Chat Completions");
+    json debug_body = body;
+    for (const char * key : { "__responses_web_search_wrapper", "__responses_file_search_wrapper" }) {
+        if (debug_body.contains(key)) {
+            debug_body[key] = "<redacted>";
+        }
+    }
+    SRV_DBG("converted request: %s\n", debug_body.dump().c_str());
+    json body_parsed = oaicompat_chat_params_parse(
+        body,
+        meta->chat_params,
+        files,
+        /* no_prefill_assistant */ true);
+    // When tools are present the parser needs a second pass over a
+    // tool_choice-relaxed copy of the body for grammar inference.
+    const bool needs_parser_pass =
+        body.contains("tools") && body.at("tools").is_array() && !body.at("tools").empty();
+    if (needs_parser_pass) {
+        json                    parser_body = responses_relax_tool_required_for_parser(body);
+        std::vector<raw_buffer> parser_files;
+        json parser_parsed = oaicompat_chat_params_parse(
+            parser_body,
+            meta->chat_params,
+            parser_files,
+            /* no_prefill_assistant */ true);
+        responses_apply_parser_fields(body_parsed, parser_parsed);
+    }
+    return handle_completions_impl(
+        req,
+        SERVER_TASK_TYPE_COMPLETION,
+        body_parsed,
+        files,
+        TASK_RESPONSE_TYPE_OAI_RESP,
+        std::move(generation_sink));
 }
 
 void server_routes::init_routes() {
@@ -5139,75 +5371,15 @@ void server_routes::init_routes() {
     };
 
     this->responses_routes.create = [this](const server_http_req & req) {
-        auto res = create_response();
-        std::vector<raw_buffer> files;
-        json response_body = json::parse(req.body);
-        json public_response_body = response_body;
-        if (response_body.contains("__llama_responses_request")) {
-            if (!response_body.at("__llama_responses_request").is_object()) {
-                throw std::invalid_argument("__llama_responses_request must be an object");
-            }
-            public_response_body = response_body.at("__llama_responses_request");
-            response_body.erase("__llama_responses_request");
+        return handle_responses_impl(req, nullptr);
+    };
+
+    this->responses_routes.generate = [this](
+            const server_http_req & req, server_generation_sink_ptr generation_sink) {
+        if (!generation_sink) {
+            throw std::invalid_argument("neutral Responses generation requires a sink");
         }
-        // Resolve `{type:"item_reference", id}` placeholders against the
-        // server-side LRU cache before handing off to the chatcmpl
-        // converter. Misses are a structured 400; the converter still
-        // carries a defensive throw arm in case a caller bypasses us.
-        if (response_body.contains("input")) {
-            std::string missing_id;
-            if (!responses_resolve_item_references(
-                    ctx_server.responses_items, response_body["input"], missing_id)) {
-                throw std::invalid_argument(
-                    "item_reference_not_found: id=" + (missing_id.empty() ? "<unset>" : missing_id));
-            }
-        }
-        const std::string web_search_wrapper = header_value(req, "X-Llama-Responses-Web-Search-Wrapper");
-        const std::string file_search_wrapper = header_value(req, "X-Llama-Responses-File-Search-Wrapper");
-        json body = server_chat_convert_responses_to_chatcmpl(
-                response_body,
-                web_search_wrapper,
-                file_search_wrapper);
-        body["__responses_request"] = public_response_body;
-        if (!web_search_wrapper.empty()) {
-            body["__responses_web_search_wrapper"] = web_search_wrapper;
-        }
-        if (!file_search_wrapper.empty()) {
-            body["__responses_file_search_wrapper"] = file_search_wrapper;
-        }
-        SRV_DBG("%s\n", "Request converted: OpenAI Responses -> OpenAI Chat Completions");
-        json debug_body = body;
-        for (const char * key : {"__responses_web_search_wrapper", "__responses_file_search_wrapper"}) {
-            if (debug_body.contains(key)) {
-                debug_body[key] = "<redacted>";
-            }
-        }
-        SRV_DBG("converted request: %s\n", debug_body.dump().c_str());
-        json body_parsed = oaicompat_chat_params_parse(
-            body,
-            meta->chat_params,
-            files,
-            /* no_prefill_assistant */ true);
-        // When tools are present the parser needs a second pass over a
-        // tool_choice-relaxed copy of the body for grammar inference.
-        const bool needs_parser_pass =
-            body.contains("tools") && body.at("tools").is_array() && !body.at("tools").empty();
-        if (needs_parser_pass) {
-            json parser_body = responses_relax_tool_required_for_parser(body);
-            std::vector<raw_buffer> parser_files;
-            json parser_parsed = oaicompat_chat_params_parse(
-                parser_body,
-                meta->chat_params,
-                parser_files,
-                /* no_prefill_assistant */ true);
-            responses_apply_parser_fields(body_parsed, parser_parsed);
-        }
-        return handle_completions_impl(
-            req,
-            SERVER_TASK_TYPE_COMPLETION,
-            body_parsed,
-            files,
-            TASK_RESPONSE_TYPE_OAI_RESP);
+        return handle_responses_impl(req, std::move(generation_sink));
     };
 
     this->responses_routes.input_tokens = [this](const server_http_req & req) {
