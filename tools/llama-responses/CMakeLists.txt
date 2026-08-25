@@ -34,6 +34,8 @@ add_library(${TARGET} STATIC
     response-service.h
     response-types.cpp
     response-types.h
+    server-generation-adapter.cpp
+    server-generation-adapter.h
     server-integration.cpp
     server-integration.h
 )
@@ -62,6 +64,21 @@ if (LLAMA_BUILD_TESTS)
     target_link_libraries(test-llama-responses-foundation PRIVATE llama-responses)
     target_compile_features(test-llama-responses-foundation PRIVATE cxx_std_17)
     add_test(NAME test-llama-responses-foundation COMMAND test-llama-responses-foundation)
+
+    add_executable(test-llama-responses-generation-adapter
+        tests/test-server-generation-adapter.cpp
+    )
+    target_link_libraries(test-llama-responses-generation-adapter PRIVATE llama-responses)
+    target_compile_features(test-llama-responses-generation-adapter PRIVATE cxx_std_17)
+    add_test(NAME test-llama-responses-generation-adapter COMMAND test-llama-responses-generation-adapter)
+
+    add_executable(test-llama-responses-route-integration
+        tests/test-route-integration.cpp
+    )
+    target_link_libraries(test-llama-responses-route-integration PRIVATE llama-responses)
+    target_compile_features(test-llama-responses-route-integration PRIVATE cxx_std_17)
+    add_test(NAME test-llama-responses-route-integration COMMAND test-llama-responses-route-integration)
+    set_tests_properties(test-llama-responses-route-integration PROPERTIES ENVIRONMENT "LLAMA_RESPONSES_DB=:memory:")
 
     add_executable(test-llama-responses-sqlite-store
         tests/test-sqlite-store.cpp

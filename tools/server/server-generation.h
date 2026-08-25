@@ -26,6 +26,16 @@ struct server_generation_message_deltas {
     std::unordered_map<std::string, common_json> tool_metadata;
 };
 
+// Canonical parser state emitted immediately before a terminal update. The
+// append-only deltas above are suitable for live transport, but the final
+// parser pass may remove a partial stop-word suffix. Protocol projections use
+// this snapshot to make their terminal resource authoritative without trying
+// to reverse an already-delivered streaming delta.
+struct server_generation_message_snapshot {
+    common_chat_msg                              message;
+    std::unordered_map<std::string, common_json> tool_metadata;
+};
+
 struct server_generation_usage {
     std::uint64_t input_tokens        = 0;
     std::uint64_t cached_input_tokens = 0;
@@ -60,6 +70,8 @@ struct server_generation_cancelled {
 using server_generation_update = std::variant<server_generation_started,
                                               server_generation_progress,
                                               server_generation_message_deltas,
+                                              server_generation_message_snapshot,
+                                              server_generation_usage,
                                               server_generation_completed,
                                               server_generation_incomplete,
                                               server_generation_failed,

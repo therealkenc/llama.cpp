@@ -1,5 +1,6 @@
 #include "server-generation.h"
 
+#include "chat.h"
 #include "server-common.h"
 #include "server-task.h"
 
@@ -9,6 +10,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -87,6 +89,18 @@ std::vector<server_generation_update> server_generation_updates_from_result(cons
                 final->generation_params.responses_tool_metadata,
             });
         }
+        common_chat_msg snapshot = final->oaicompat_msg;
+        if (snapshot.empty()) {
+            // Match server_task_result_cmpl_final::to_json_oaicompat_resp(): a
+            // parser which cannot recognize the model output must not erase
+            // the raw generated text from the native Responses projection.
+            snapshot.role    = "assistant";
+            snapshot.content = final->content;
+        }
+        updates.emplace_back(server_generation_message_snapshot{
+            std::move(snapshot),
+            final->generation_params.responses_tool_metadata,
+        });
         const server_generation_usage usage = generation_usage(*final);
         if (final->stop == STOP_TYPE_LIMIT) {
             updates.emplace_back(server_generation_incomplete{

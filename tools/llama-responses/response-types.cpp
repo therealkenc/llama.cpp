@@ -89,6 +89,10 @@ const char * response_event_type_name(response_event_type type) noexcept {
             return "response.reasoning_summary_text.delta";
         case response_event_type::reasoning_summary_text_done:
             return "response.reasoning_summary_text.done";
+        case response_event_type::reasoning_text_delta:
+            return "response.reasoning_text.delta";
+        case response_event_type::reasoning_text_done:
+            return "response.reasoning_text.done";
         case response_event_type::error:
             return "error";
     }

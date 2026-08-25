@@ -40,6 +40,7 @@ struct generation_reasoning_delta {
 enum class generation_tool_kind {
     function,
     custom,
+    local_shell,
 };
 
 struct generation_tool_call_started {
@@ -49,11 +50,28 @@ struct generation_tool_call_started {
     // The parser's call identity is optional. The Responses state machine
     // normalizes it into a call_* id independently from the output item id.
     std::string          upstream_call_id;
+    // Namespace containers are flattened for the model chat template. The
+    // adapter restores the public namespace on the generated output item.
+    std::string          namespace_name;
 };
 
 struct generation_tool_call_delta {
     std::size_t index = 0;
     std::string delta;
+};
+
+struct generation_tool_call_reconciliation {
+    std::size_t index = 0;
+    std::string value;
+};
+
+// Authoritative final parser state. Streaming deltas remain append-only, but
+// this update corrects the terminal response snapshot if the final parser pass
+// removed a partial stop word or normalized a wrapped custom-tool value.
+struct generation_message_reconciliation {
+    std::string                                      reasoning;
+    std::string                                      text;
+    std::vector<generation_tool_call_reconciliation> tools;
 };
 
 struct generation_usage_update {
@@ -85,6 +103,7 @@ using generation_update = std::variant<generation_started,
                                        generation_reasoning_delta,
                                        generation_tool_call_started,
                                        generation_tool_call_delta,
+                                       generation_message_reconciliation,
                                        generation_usage_update,
                                        generation_completed,
                                        generation_incomplete,
@@ -131,6 +150,7 @@ enum class generation_item_kind {
     message,
     function_call,
     custom_tool_call,
+    local_shell_call,
 };
 
 // Identity creation is injected so production can use its preferred random
@@ -160,12 +180,13 @@ class counter_generation_id_source final : public generation_id_source {
 
     std::mutex    mutex;
     std::string   namespace_value;
-    std::uint64_t response_counter  = 0;
-    std::uint64_t reasoning_counter = 0;
-    std::uint64_t message_counter   = 0;
-    std::uint64_t function_counter  = 0;
-    std::uint64_t custom_counter    = 0;
-    std::uint64_t call_counter      = 0;
+    std::uint64_t response_counter    = 0;
+    std::uint64_t reasoning_counter   = 0;
+    std::uint64_t message_counter     = 0;
+    std::uint64_t function_counter    = 0;
+    std::uint64_t custom_counter      = 0;
+    std::uint64_t local_shell_counter = 0;
+    std::uint64_t call_counter        = 0;
 };
 
 struct generation_response_context {

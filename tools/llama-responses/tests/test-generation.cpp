@@ -107,8 +107,8 @@ void test_scripted_interleaving() {
         generation_text_delta{ "world" },
         // Deliberately start parser index 9 before index 2. Wire output order
         // follows appearance, while subsequent deltas correlate by parser id.
-        generation_tool_call_started{ 9, generation_tool_kind::function, "lookup", "tool_a" },
-        generation_tool_call_started{ 2, generation_tool_kind::custom, "apply_patch", "tool_b" },
+        generation_tool_call_started{ 9, generation_tool_kind::function, "lookup", "tool_a", "" },
+        generation_tool_call_started{ 2, generation_tool_kind::custom, "apply_patch", "tool_b", "" },
         generation_tool_call_delta{ 9, R"({"query":)" },
         generation_tool_call_delta{ 2, "*** Begin" },
         generation_tool_call_delta{ 9, R"("llama"})" },

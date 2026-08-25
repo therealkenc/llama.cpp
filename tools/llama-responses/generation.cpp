@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -77,6 +78,51 @@ common_json text_part(const std::string & text) {
     };
 }
 
+common_json parse_tool_arguments(const std::string & arguments) {
+    if (arguments.empty()) {
+        return common_json::object();
+    }
+    try {
+        return common_json::parse(arguments);
+    } catch (const std::exception &) {
+        return common_json::object();
+    }
+}
+
+// Keep this projection aligned with
+// tools/server/server-task.cpp::build_local_shell_action while the
+// transitional Chat-shaped input/output parser remains in use.
+common_json local_shell_action(const std::string & raw_arguments) {
+    const common_json arguments = parse_tool_arguments(raw_arguments);
+    if (arguments.contains("action") && arguments.at("action").is_object()) {
+        return arguments.at("action");
+    }
+
+    common_json action = {
+        { "type",    "exec"               },
+        { "command", common_json::array() },
+    };
+    if (arguments.contains("command")) {
+        const common_json & command = arguments.at("command");
+        if (command.is_array()) {
+            action["command"] = command;
+        } else if (command.is_string()) {
+            action["command"] = common_json::array({ "bash", "-lc", command.get<std::string>() });
+        }
+    } else if (arguments.contains("cmd") && arguments.at("cmd").is_string()) {
+        action["command"] = common_json::array({ "bash", "-lc", arguments.at("cmd").get<std::string>() });
+    } else if (!raw_arguments.empty()) {
+        action["command"] = common_json::array({ "bash", "-lc", raw_arguments });
+    }
+
+    for (const char * key : { "timeout_ms", "working_directory", "env", "user" }) {
+        if (arguments.contains(key)) {
+            action[key] = arguments.at(key);
+        }
+    }
+    return action;
+}
+
 response_event_type terminal_event_type(response_status status) {
     switch (status) {
         case response_status::completed:
@@ -137,6 +183,8 @@ item_id counter_generation_id_source::next_item_id(generation_item_kind kind) {
             return item_id(next_value("fc_", function_counter));
         case generation_item_kind::custom_tool_call:
             return item_id(next_value("ctc_", custom_counter));
+        case generation_item_kind::local_shell_call:
+            return item_id(next_value("lsc_", local_shell_counter));
     }
     throw std::invalid_argument("unknown generation item kind");
 }
@@ -233,6 +281,7 @@ class native_response_state_machine::impl {
         item_id              item;
         call_id              call;
         std::string          name;
+        std::string          namespace_name;
         std::string          value;
         bool                 done = false;
     };
@@ -240,6 +289,8 @@ class native_response_state_machine::impl {
     generation_id_source &            ids;
     response_state                    response;
     std::vector<response_event>       emitted;
+    std::optional<std::size_t>        reasoning_item;
+    std::optional<std::size_t>        message_item;
     std::optional<std::size_t>        open_reasoning;
     std::optional<std::size_t>        open_message;
     std::string                       reasoning_text;
@@ -318,6 +369,7 @@ class native_response_state_machine::impl {
             { "encrypted_content", ""                   },
         };
         open_reasoning                 = append_item(std::move(item));
+        reasoning_item                 = open_reasoning;
         const std::size_t output_index = *open_reasoning;
         const auto &      stored       = output_item(output_index);
         emit(response_event_type::output_item_added,
@@ -337,10 +389,10 @@ class native_response_state_machine::impl {
     }
 
     void update_reasoning_item() {
-        if (!open_reasoning) {
+        if (!reasoning_item) {
             return;
         }
-        response_output_item & item = output_item(*open_reasoning);
+        response_output_item & item = output_item(*reasoning_item);
         item.value["summary"]       = common_json::array({ reasoning_part(reasoning_text) });
         item.value["content"]       = common_json::array({ reasoning_content(reasoning_text) });
     }
@@ -361,6 +413,14 @@ class native_response_state_machine::impl {
                  { "text",          reasoning_text },
         },
              item.id, output_index);
+        emit(response_event_type::reasoning_text_done,
+             {
+                 { "output_index",  output_index   },
+                 { "content_index", 0              },
+                 { "item_id",       item.id.str()  },
+                 { "text",          reasoning_text },
+        },
+             item.id, output_index, 0);
         emit(response_event_type::reasoning_summary_part_done,
              {
                  { "output_index",  output_index                   },
@@ -395,6 +455,7 @@ class native_response_state_machine::impl {
             { "content", common_json::array() },
         };
         open_message                   = append_item(std::move(item));
+        message_item                   = open_message;
         const std::size_t output_index = *open_message;
         const auto &      stored       = output_item(output_index);
         emit(response_event_type::output_item_added,
@@ -414,10 +475,10 @@ class native_response_state_machine::impl {
     }
 
     void update_message_item() {
-        if (!open_message) {
+        if (!message_item) {
             return;
         }
-        response_output_item & item = output_item(*open_message);
+        response_output_item & item = output_item(*message_item);
         item.value["content"]       = common_json::array({ text_part(message_text) });
     }
 
@@ -484,6 +545,14 @@ class native_response_state_machine::impl {
                  { "delta",         update.delta  },
         },
              item.id, output_index);
+        emit(response_event_type::reasoning_text_delta,
+             {
+                 { "output_index",  output_index  },
+                 { "content_index", 0             },
+                 { "item_id",       item.id.str() },
+                 { "delta",         update.delta  },
+        },
+             item.id, output_index, 0);
     }
 
     void apply_one(const generation_text_delta & update) {
@@ -522,11 +591,22 @@ class native_response_state_machine::impl {
         close_message_item("completed", true);
 
         tool_state tool;
-        tool.kind = update.kind;
-        tool.name = update.name;
-        tool.item =
-            ids.next_item_id(update.kind == generation_tool_kind::function ? generation_item_kind::function_call :
-                                                                             generation_item_kind::custom_tool_call);
+        tool.kind                      = update.kind;
+        tool.name                      = update.name;
+        tool.namespace_name            = update.namespace_name;
+        generation_item_kind item_kind = generation_item_kind::function_call;
+        switch (update.kind) {
+            case generation_tool_kind::function:
+                item_kind = generation_item_kind::function_call;
+                break;
+            case generation_tool_kind::custom:
+                item_kind = generation_item_kind::custom_tool_call;
+                break;
+            case generation_tool_kind::local_shell:
+                item_kind = generation_item_kind::local_shell_call;
+                break;
+        }
+        tool.item = ids.next_item_id(item_kind);
         tool.call = ids.next_call_id(update.upstream_call_id);
         if (tool.call.empty()) {
             throw std::invalid_argument("generation id source returned an empty call id");
@@ -540,15 +620,32 @@ class native_response_state_machine::impl {
         response_output_item item;
         item.id    = tool.item;
         item.call  = tool.call;
-        item.type  = update.kind == generation_tool_kind::function ? "function_call" : "custom_tool_call";
+        switch (update.kind) {
+            case generation_tool_kind::function:
+                item.type = "function_call";
+                break;
+            case generation_tool_kind::custom:
+                item.type = "custom_tool_call";
+                break;
+            case generation_tool_kind::local_shell:
+                item.type = "local_shell_call";
+                break;
+        }
         item.value = {
             { "id",      item.id.str()   },
             { "call_id", tool.call.str() },
             { "type",    item.type       },
             { "status",  "in_progress"   },
-            { "name",    update.name     },
         };
-        item.value[update.kind == generation_tool_kind::function ? "arguments" : "input"] = "";
+        if (update.kind == generation_tool_kind::local_shell) {
+            item.value["action"] = local_shell_action("");
+        } else {
+            item.value["name"]                                                                = update.name;
+            item.value[update.kind == generation_tool_kind::function ? "arguments" : "input"] = "";
+            if (!update.namespace_name.empty()) {
+                item.value["namespace"] = update.namespace_name;
+            }
+        }
         tool.response_item_index       = append_item(std::move(item));
         tool.output_index              = tool.response_item_index;
         const auto         inserted    = tools.emplace(update.index, std::move(tool));
@@ -587,6 +684,10 @@ class native_response_state_machine::impl {
                  tool.item, tool.output_index);
             return;
         }
+        if (tool.kind == generation_tool_kind::local_shell) {
+            item.value["action"] = local_shell_action(tool.value);
+            return;
+        }
         item.value["input"] = tool.value;
         emit(response_event_type::custom_tool_call_input_delta,
              {
@@ -595,6 +696,50 @@ class native_response_state_machine::impl {
                  { "delta",        update.delta      },
         },
              tool.item, tool.output_index);
+    }
+
+    void apply_one(const generation_message_reconciliation & update) {
+        if (!reasoning_item && !update.reasoning.empty()) {
+            if (!response.output.empty()) {
+                throw std::logic_error("final reasoning appeared after another output item was opened");
+            }
+            open_reasoning_item();
+        }
+        reasoning_text = update.reasoning;
+        update_reasoning_item();
+
+        if (!message_item && !update.text.empty()) {
+            if (!tools.empty()) {
+                throw std::logic_error("final message appeared after tool output began");
+            }
+            open_message_item();
+        }
+        message_text = update.text;
+        update_message_item();
+
+        for (const generation_tool_call_reconciliation & tool_update : update.tools) {
+            const auto found = tools.find(tool_update.index);
+            if (found == tools.end()) {
+                throw std::invalid_argument("final tool value has no matching start update");
+            }
+            tool_state & tool = found->second;
+            if (tool.done) {
+                throw std::logic_error("final tool value arrived after the item was closed");
+            }
+            tool.value                  = tool_update.value;
+            response_output_item & item = output_item(tool.response_item_index);
+            switch (tool.kind) {
+                case generation_tool_kind::function:
+                    item.value["arguments"] = tool.value;
+                    break;
+                case generation_tool_kind::custom:
+                    item.value["input"] = tool.value;
+                    break;
+                case generation_tool_kind::local_shell:
+                    item.value["action"] = local_shell_action(tool.value);
+                    break;
+            }
+        }
     }
 
     void apply_one(const generation_usage_update & update) { response.usage = update.usage; }
@@ -626,7 +771,7 @@ class native_response_state_machine::impl {
                      { "arguments",    tool.value        },
             },
                  tool.item, tool.output_index);
-        } else {
+        } else if (tool.kind == generation_tool_kind::custom) {
             item.value["input"] = tool.value;
             emit(response_event_type::custom_tool_call_input_done,
                  {
@@ -635,6 +780,8 @@ class native_response_state_machine::impl {
                      { "input",        tool.value        },
             },
                  tool.item, tool.output_index);
+        } else {
+            item.value["action"] = local_shell_action(tool.value);
         }
         emit(response_event_type::output_item_done,
              {

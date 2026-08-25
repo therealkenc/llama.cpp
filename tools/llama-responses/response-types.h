@@ -86,6 +86,8 @@ enum class response_event_type {
     reasoning_summary_part_done,
     reasoning_summary_text_delta,
     reasoning_summary_text_done,
+    reasoning_text_delta,
+    reasoning_text_done,
     error,
 };
 

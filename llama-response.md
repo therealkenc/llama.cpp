@@ -351,7 +351,7 @@ is immediately useful for native completion logprobs under MTP and removes a
 future blocker for nonzero Responses logprobs; it cannot replace that boundary
 normalization or the Responses error contract.
 
-## Implementation checkpoint: 2026-08-24
+## Implementation checkpoint: 2026-08-25
 
 The current pass has a statically linked `tools/llama-responses/` module, an
 explicit route-bundle factory, typed IDs and response snapshots, provider
@@ -366,10 +366,12 @@ Every stored response also owns its fully materialized input snapshot. A
 continuation therefore needs one parent read rather than a live ancestor walk:
 deleting an interior ancestor, or deleting the parent after generation starts
 but before the child is committed, cannot strand the child's future lineage.
-For `stream: true, store: true`, complete SSE frames are held until a terminal
-snapshot commits; a storage failure replaces the would-be terminal with an
-SDK-decodable `response_store_error` event before either HTTP or resumable
-stream storage sees it.
+For native `stream: true, store: true`, each complete SSE batch is released only
+after its corresponding typed in-progress checkpoint commits, and a success
+terminal is never exposed before the terminal CAS succeeds. A storage failure
+emits an SDK-decodable `response_store_error` event and requests generation
+cancellation. The legacy telemetry fallback retains its terminal-capture
+behavior.
 
 The create path accepts string and typed-item inputs, string or typed-item-array
 instructions, structured `text.format`, function/custom tool round trips, and
@@ -383,14 +385,23 @@ resolved `item_reference` values.
 
 Phase 3 now has a typed, cancellable generation contract, deterministic scripted
 port, and native Responses state machine which owns IDs, output assembly,
-lifecycle, sequence numbers, sync snapshots, and SSE projections in focused
-tests. The real task/response-reader drain also exposes an optional neutral sink
-for parsed deltas, tool metadata, usage, errors, cancellation, and terminal
-state while retaining slots, MTMD, pings, reader cancellation RAII, and
-resumable streams. The sidecar does not yet implement that sink or call the
-internal `generate(request, sink)` hook. The legacy create route therefore
-remains the production default and generic `server-task` code still owns the
-bytes returned by real generation.
+lifecycle, sequence numbers, sync snapshots, and SSE projections. A concrete
+sidecar adapter consumes the real task/response-reader's neutral parsed deltas,
+tool metadata, usage, errors, cancellation, and canonical final-message
+snapshot. It projects text, reasoning, function, custom, namespace, and local
+shell calls directly into native items/events, including terminal parser
+reconciliation and the legacy raw-text fallback when parsing produces no
+message.
+
+Ordinary foreground creation now calls the injected internal
+`generate(request, sink)` hook. The native state machine owns the actual sync
+body and SSE bytes, and typed in-progress/terminal snapshots are written
+directly to SQLite with compare-and-swap. A guarded CAS refresh accepts the one
+legitimate concurrent mutation—ancestor deletion detaching context into an
+active child—only when every generation-owned field still matches the sink's
+last committed state. Legacy Responses rendering remains an explicit oracle
+and the fallback for the two llama telemetry extensions whose payloads are not
+yet in the neutral vocabulary: `return_progress` and `timings_per_token`.
 
 The request-policy layer now normalizes documented nullable defaults; validates
 metadata and identifier character limits; handles max-output and incomplete
@@ -612,8 +623,10 @@ call of a nested connector remain explicit future coverage.
 
 The complete installed catalog is large enough to be a deployment concern. It
 tokenized to 86,729 prompt tokens in the live run; accepting namespace syntax
-does not make those schemas free. The canonical server profile below allocates
-90,112 tokens so the real request fits without hiding installed tools.
+does not make those schemas free. The canonical live-test profile below uses
+Q8 key/value caches and allocates 180,224 tokens so multi-round protocol tests
+fit without hiding installed tools. This deliberately spends model quality to
+buy test-harness context; output quality is not the subject of these runs.
 
 ### What Ollama does
 
@@ -788,32 +801,38 @@ Completed work:
 - [x] Expose the real llama-server completion reader through an optional
   protocol-neutral generation sink carrying begin/progress, parsed message
   diffs plus tool metadata, usage, errors, cancellation, and terminal state.
-  Keep the legacy renderer as the production default and preserve slots, MTMD,
-  pings, reader cancellation RAII, and resumable stream plumbing.
+  Preserve slots, MTMD, pings, reader cancellation RAII, and resumable stream
+  plumbing, and emit an authoritative final parsed-message snapshot with the
+  same raw-content fallback as the legacy renderer.
 - [x] Accept Codex namespace tool containers, lower nested declarations to
   deterministic flat chat-template names, and preserve reversible call/replay
   metadata.
 - [x] Complete an authenticated installed-Codex + Qwen3.8-27B Responses turn.
+- [x] Implement the concrete `tools/llama-responses` generation adapter for
+  text, reasoning, stable per-index function/custom/local-shell calls, raw
+  arguments, semantic custom-tool input, usage, terminal states, and canonical
+  reconciliation.
+- [x] Route the ordinary foreground profile through the injected internal
+  `generate(request, sink)` hook so the native state machine owns real sync and
+  SSE output. Persist typed active and terminal snapshots directly with CAS.
+- [x] Make native generation the production default for the supported
+  foreground profile. Retain legacy rendering only as an oracle and explicit
+  fallback for `return_progress` and `timings_per_token`.
+- [x] Pass the focused neutral-sink, native-adapter, route, store, and resource
+  tests; all 144 current Python Responses/Codex SDK cases; authenticated live
+  sync/retrieve; and installed-Codex text plus local-shell round trips.
 
 Outstanding spine:
 
-- [ ] Implement the `tools/llama-responses` adapter for
-  `server_generation_sink`: translate parsed reader diffs into native text,
-  reasoning, stable per-index tool-start, tool-delta, usage, and terminal
-  updates, including raw-argument accumulation and semantic custom-tool deltas.
-- [ ] Route the supported foreground profile through the injected internal
-  `generate(request, sink)` hook so `native_response_state_machine` owns the
-  actual synchronous body and SSE bytes; persist typed snapshots directly
-  instead of recovering terminal state from legacy wire output.
-- [ ] Differential-test native projection against the legacy oracle for sync,
-  split-frame SSE, late errors, limits, cancellation, and genuinely generated
-  interleaved tool calls.
+- [ ] Complete differential/live coverage for late generation errors,
+  disconnect cancellation, and genuinely generated interleaved tool calls.
+  Deterministic tests already cover sync/SSE projection, parser correction,
+  limits, typed persistence failures, cancellation polling, namespace tools,
+  and interleaved function/custom/local-shell calls.
 - [ ] Move Responses event/envelope construction out of generic
   `server-task`/`server-context` code after the native path is proven.
 - [ ] Lower references and multimodal tool results from the typed domain rather
   than through the transitional Chat-shaped request adapter.
-- [ ] Make native generation the default for every advertised supported shape
-  and retain legacy only as a short-lived test oracle/fallback.
 
 Outstanding HTTP/resource work:
 
@@ -827,16 +846,18 @@ Outstanding HTTP/resource work:
   explicitly rather than ignored by the transitional adapter.
 - [ ] Add remaining typed resource and content variants beyond the foreground
   SDK subset already covered synchronously and asynchronously.
-- [ ] Connect native active snapshots to store compare-and-swap and persist a
-  canonical event history; production SQLite currently captures terminal
-  foreground state even though the backend supports revisions/transitions.
+- [x] Connect native active and terminal snapshots to store compare-and-swap,
+  including safe reconciliation with lineage detachment during generation.
+- [ ] Persist a canonical event history for resume, background scheduling, and
+  recovery; SQLite currently stores typed snapshots, not an event journal.
 - [ ] Add expiry/GC, byte accounting and inline-media budgets, and operational
   retention policy without changing the resource API.
 
 Gate:
 
-- [ ] Native generation is the default and no Responses event construction
-  remains in generic task code.
+- [x] Native generation is the default for the ordinary advertised foreground
+  profile.
+- [ ] No Responses event construction remains in generic task code.
 - [ ] The Phase 3 conformance matrix is green for all advertised HTTP
   capabilities.
 - [ ] Official SDK objects round-trip without local patches across the complete
@@ -1054,7 +1075,7 @@ $SERVER \
     --alias qwen3.8-27b-local \
     --port 8081 \
     --host 0.0.0.0 \
-    --ctx-size 90112 \
+    --ctx-size 180224 \
     --reasoning auto \
     --reasoning-effort low \
     --temperature 1.0 \
@@ -1065,6 +1086,8 @@ $SERVER \
     --repeat-penalty 1.0 \
     -np 1 \
     -ngl -1 \
+    -ctk q8_0 \
+    -ctv q8_0 \
     --spec-type draft-mtp \
     --spec-draft-n-max 2 \
     --kv-unified \
@@ -1119,12 +1142,12 @@ The command deliberately has no reasoning override or static
 `/v1/models?client_version=...` discovery, selects the catalog's low default,
 and reports visibly if Codex selects compiled fallback metadata.
 
-Verified live on 2026-08-24 with the `codex` resolved from `PATH` and the Qwen
-profile above. That process resolved `/home/ken/.local/bin/codex`, which
+Verified live on 2026-08-24 with the `codex` resolved from `PATH` and the then
+90,112-token BF16-KV Qwen profile. That process resolved
+`/home/ken/.local/bin/codex`, which
 reported `codex-cli 0.149.1`; separate desktop/editor helper binaries were also
-installed but were not the smoke process. The loaded slot reported 90,112
-context tokens; an unauthenticated catalog request returned 401; and the
-authenticated catalog
+installed but were not the smoke process. An unauthenticated catalog request
+returned 401; and the authenticated catalog
 returned the Qwen alias, loaded context, text/image modalities,
 `low`/`medium`/`xhigh`, low default, and the shared base instructions. The first
 cold pinned-model process warned that it selected unknown-model fallback while
@@ -1134,6 +1157,31 @@ also refreshing the catalog, yet completed exactly `LOCAL_RESPONSES_OK` through
 the refreshed catalog with no warning, reused 86,725 cached prompt tokens, and
 again completed exactly. This is an end-to-end compatibility observation, not
 a performance or output-determinism contract.
+
+Reverified on 2026-08-25 after making native generation the production
+foreground path. An authenticated synchronous create returned exactly
+`NATIVE SPINE OK`; retrieve returned the same typed reasoning/message snapshot
+and usage from SQLite; and the installed Codex CLI completed exactly
+`NATIVE_CODEX_OK`. A second black-box turn generated a local-shell call, Codex
+executed `/bin/bash -lc pwd` in the requested repository, replayed the tool
+result, and eventually completed exactly `NATIVE_TOOL_ROUNDTRIP_OK`.
+
+That tool turn also exposed a deployment-pressure warning worth retaining: the
+full Codex prompt/tool catalog begins around 86.7K tokens inside this 90,112
+token slot. Codex compacted twice and Qwen unnecessarily repeated `pwd` before
+the final answer. The protocol round trip passed, but this is not yet a green
+tool-use determinism or context-budget result. That observation motivated the
+current 180,224-token Q8-KV live-test profile: preserve the truthful tool
+catalog, trade cache precision instead of protocol coverage, and leave the
+production-quality model profile as a separate deployment choice.
+
+The replacement profile was load- and round-trip-verified on 2026-08-25.
+`/v1/models?client_version=1.148.0` advertised the loaded 180,224-token window,
+and the same forced `pwd` turn executed the command exactly once and completed
+exactly `Q8_CONTEXT_OK`. Codex reported 175,404 input tokens and emitted no
+compaction warning. This validates the profile for protocol testing; it does
+not claim that Q8 key/value caches are the preferred quality setting for model
+evaluation or production inference.
 
 ## Upstream merge discipline
 
@@ -1200,28 +1248,32 @@ Each spike should end in a small test or an ADR amendment in this document.
 
 ## Next implementation slice
 
-The neutral generation foundation, real-reader sink, terminal SQLite backend,
-and continuation-lineage oracle now exist. The next slice is the sidecar-owned
-production adapter, not another seam or storage spike.
+The sidecar-owned production adapter checkpoint is complete. Ordinary
+foreground generation no longer depends on legacy Responses rendering for its
+body, events, or persistence. The next spine boundary is input lowering.
 
 Recommended next checkpoint:
 
-1. Implement `server_generation_sink` in `tools/llama-responses` and translate
-   real parsed reader updates into the native state machine.
-2. Differential-test the adapter against the legacy oracle for sync/SSE,
-   function/custom interleaving, limits, errors, and cancellation.
-3. Route only the proven foreground capability subset through the internal
-   `generate(request, sink)` hook; keep legacy as explicit oracle/fallback.
-4. Register response identity before task submission, poll one atomic cancel
-   flag from the owning reader thread, and persist native active/terminal state
-   with compare-and-swap.
-5. Flip native generation to the default only after SDK and live-Qwen smoke
-   coverage proves that the advertised profile no longer depends on legacy
-   Responses rendering.
+1. Lower `previous_response_id`, resolved `item_reference`, function/custom
+   outputs, and multimodal tool-result content from the typed Responses domain
+   into a protocol-neutral generation request, rather than rebuilding a private
+   Chat-shaped JSON request in the route.
+2. Preserve text/image/file identity and ordering across create, stored replay,
+   deletion-detached lineage, and the model-facing prompt. Reject content the
+   active model/template cannot consume instead of silently flattening it.
+3. Add deterministic lowering fixtures for text, function/custom/local-shell
+   output, image-bearing tool results, mixed content, and references to stored
+   items; then run them through continuation and restart tests.
+4. Differential-test the remaining legacy lowering seam while it is still an
+   oracle, including malformed references and genuinely generated interleaved
+   tool calls.
+5. Only after typed lowering is proven, decide whether to remove generic
+   Responses envelope/event construction or retain it for a short oracle
+   window. That cleanup should not widen the upstream-owned server seam.
 
-Lower-risk conformance work can accompany that checkpoint without obscuring
-it: add an inline-media byte budget; continue the accepted/unsupported create
-field audit; and turn live Codex catalog negotiation into a deterministic
-fixture. Generic model-policy and router/prefix/sleep catalog coverage are the
-next natural Phase 3.5 work, but they are not a substitute for production
-Responses state-machine ownership.
+Adjacent conformance work can accompany the checkpoint without replacing it:
+add an inline-media byte budget, continue the accepted/unsupported create-field
+audit, and turn live Codex catalog/tool negotiation into deterministic
+fixtures. The prior 90K profile's prompt pressure also deserves a repeat check
+under the 180K Q8-KV test profile, but it is separate from protocol-correct
+typed lowering.

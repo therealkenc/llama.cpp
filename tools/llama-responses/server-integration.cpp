@@ -1,6 +1,7 @@
 #include "server-integration.h"
 
 #include "codex-models.h"
+#include "generation.h"
 #include "hosted-tools.h"
 #include "json.h"
 #include "log.h"
@@ -8,15 +9,18 @@
 #include "response-service.h"
 #include "response-store.h"
 #include "response-types.h"
+#include "server-generation-adapter.h"
 #include "server-http.h"
 #include "server-responses.h"
 #include "server-route-extensions.h"
 #include "sqlite-response-store.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <ctime>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -68,6 +72,18 @@ bool request_store_enabled(const common_json & request) {
         return true;
     }
     return request.at("store").is_boolean() && request.at("store").get<bool>();
+}
+
+bool native_generation_supported(const common_json & request) {
+    // These llama-server telemetry extensions carry payloads which the neutral
+    // generation vocabulary intentionally does not expose yet. Keep their
+    // existing renderer as an explicit oracle rather than silently dropping
+    // requested data from the native projection.
+    static constexpr std::array<const char *, 2> telemetry_extensions = { "return_progress", "timings_per_token" };
+    return std::all_of(telemetry_extensions.begin(), telemetry_extensions.end(), [&](const char * key) {
+        return !request.contains(key) || request.at(key).is_null() ||
+               (request.at(key).is_boolean() && !request.at(key).get<bool>());
+    });
 }
 
 std::string response_id_param(const server_http_req & request) {
@@ -908,8 +924,9 @@ class responses_routes_impl final : public std::enable_shared_from_this<response
 
     static server_responses_routes routes(const std::shared_ptr<responses_routes_impl> & self) {
         server_responses_routes result;
-        result.owner  = self;
-        result.create = [self](const server_http_req & request) {
+        result.owner    = self;
+        result.generate = self->legacy.generate;
+        result.create   = [self](const server_http_req & request) {
             return self->create(request);
         };
         result.input_tokens = [self](const server_http_req & request) {
@@ -1220,10 +1237,6 @@ class responses_routes_impl final : public std::enable_shared_from_this<response
     }
 
     server_http_res_ptr create(const server_http_req & request) {
-        if (!legacy.create) {
-            return api_error(501, "Responses create is not available", "not_supported");
-        }
-
         prepared_request prepared;
         try {
             prepared = prepare(request);
@@ -1237,6 +1250,64 @@ class responses_routes_impl final : public std::enable_shared_from_this<response
             return api_error(400, error.what(), "invalid_request");
         }
 
+        if (legacy.generate && native_generation_supported(prepared.original)) {
+            return create_native(prepared);
+        }
+        if (!legacy.create) {
+            return api_error(501, "Responses create is not available", "not_supported");
+        }
+        return create_legacy(std::move(prepared));
+    }
+
+    static generation_response_context native_context(const prepared_request & prepared) {
+        generation_response_context context;
+        context.model                    = prepared.original.value("model", std::string());
+        context.request                  = prepared.original;
+        context.input_items              = prepared.materialized_input_items;
+        context.continuation_input_items = prepared.continuation_input_items;
+        context.created_at               = static_cast<std::uint64_t>(std::time(nullptr));
+        if (prepared.original.contains("previous_response_id") &&
+            prepared.original.at("previous_response_id").is_string()) {
+            const std::string previous = prepared.original.at("previous_response_id").get<std::string>();
+            if (!previous.empty()) {
+                context.previous_response = response_id(previous);
+            }
+        }
+        return context;
+    }
+
+    server_http_res_ptr create_native(const prepared_request & prepared) {
+        const bool       stream  = prepared.original.value("stream", false);
+        response_store * storage = request_store_enabled(prepared.original) ? store.get() : nullptr;
+        auto sink = std::make_shared<native_server_generation_sink>(native_context(prepared), random_id_suffix(),
+                                                                    stream, storage);
+
+        server_http_res_ptr response;
+        try {
+            response = legacy.generate(*prepared.request, sink);
+        } catch (const std::invalid_argument & error) {
+            sink->discard_persisted_state();
+            return api_error(400, error.what(), "invalid_request");
+        } catch (const std::exception & error) {
+            sink->discard_persisted_state();
+            return api_error(500, error.what(), "server_error");
+        }
+        if (!response) {
+            sink->discard_persisted_state();
+            return api_error(500, "Responses generation returned no response", "server_error");
+        }
+        response->lifetime_owner = prepared.request;
+        if (sink->storage_failed() && !response->is_stream()) {
+            return api_error(500, sink->storage_error(), "response_store_error");
+        }
+        if (response->status < 200 || response->status >= 300) {
+            sink->discard_persisted_state();
+            return response;
+        }
+        return response;
+    }
+
+    server_http_res_ptr create_legacy(prepared_request prepared) {
         server_http_res_ptr response;
         try {
             response = legacy.create(*prepared.request);

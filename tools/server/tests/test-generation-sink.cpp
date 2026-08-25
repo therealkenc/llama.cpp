@@ -65,25 +65,36 @@ void test_final_mapping() {
     common_chat_msg_diff text;
     text.content_delta = "answer";
     final.oaicompat_msg_diffs.push_back(text);
+    final.oaicompat_msg.content = "answer";
 
     auto updates = server_generation_updates_from_result(final, true);
-    CHECK(updates.size() == 3);
+    CHECK(updates.size() == 4);
     CHECK(std::holds_alternative<server_generation_started>(updates.at(0)));
     CHECK(std::holds_alternative<server_generation_message_deltas>(updates.at(1)));
+    const auto & snapshot = std::get<server_generation_message_snapshot>(updates.at(2));
+    CHECK(snapshot.message.content == "answer");
 
-    const auto & incomplete = std::get<server_generation_incomplete>(updates.at(2));
+    const auto & incomplete = std::get<server_generation_incomplete>(updates.at(3));
     CHECK(incomplete.reason == "max_output_tokens");
     CHECK(incomplete.usage.input_tokens == 41);
     CHECK(incomplete.usage.cached_input_tokens == 11);
     CHECK(incomplete.usage.output_tokens == 7);
-    CHECK(server_generation_update_is_terminal(updates.at(2)));
+    CHECK(server_generation_update_is_terminal(updates.at(3)));
 
     final.stop = STOP_TYPE_EOS;
     updates    = server_generation_updates_from_result(final, false);
-    CHECK(updates.size() == 2);
-    const auto & completed = std::get<server_generation_completed>(updates.at(1));
+    CHECK(updates.size() == 3);
+    const auto & completed = std::get<server_generation_completed>(updates.at(2));
     CHECK(completed.completed_at != 0);
     CHECK(completed.usage.output_tokens == 7);
+
+    server_task_result_cmpl_final unparsed;
+    unparsed.content = "raw parser fallback";
+    updates          = server_generation_updates_from_result(unparsed, false);
+    CHECK(updates.size() == 2);
+    const auto & fallback = std::get<server_generation_message_snapshot>(updates.at(0));
+    CHECK(fallback.message.role == "assistant");
+    CHECK(fallback.message.content == "raw parser fallback");
 }
 
 void test_error_mapping() {
