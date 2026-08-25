@@ -41,8 +41,7 @@ void test_typed_instructions() {
     CHECK(system_message.at("content")[0].at("type").get<std::string>() == "text");
     CHECK(system_message.at("content")[0].at("text").get<std::string>() == "Inspect the supplied image.");
     CHECK(system_message.at("content")[1].at("type").get<std::string>() == "image_url");
-    CHECK(system_message.at("content")[1].at("image_url").at("url").get<std::string>() ==
-          "data:image/png;base64,AA==");
+    CHECK(system_message.at("content")[1].at("image_url").at("url").get<std::string>() == "data:image/png;base64,AA==");
 
     const auto & user_message = result.at("messages")[1];
     CHECK(user_message.at("role").get<std::string>() == "user");
@@ -78,11 +77,24 @@ void test_structured_output_lowering() {
     CHECK(schema.at("schema").at("type").get<std::string>() == "object");
 }
 
-} // namespace
+void test_reasoning_effort_lowering() {
+    const common_json request = common_json::parse(R"({
+        "input": "Think briefly.",
+        "model": "qwen3.8-27b-local",
+        "reasoning": {"effort": "low"}
+    })");
+
+    const common_json result = server_chat_convert_responses_to_chatcmpl(request);
+    CHECK(result.at("reasoning_effort").get<std::string>() == "low");
+    CHECK(!result.contains("reasoning"));
+}
+
+}  // namespace
 
 int main() try {
     test_typed_instructions();
     test_structured_output_lowering();
+    test_reasoning_effort_lowering();
     if (failures != 0) {
         std::cerr << failures << " server-chat Responses checks failed\n";
         return 1;

@@ -4,6 +4,7 @@
 #include "server-mcp.h"
 #include "server-models.h"
 #include "server-responses.h"
+#include "server-route-extensions.h"
 #include "server-common.h"
 #include "server-cors-proxy.h"
 #include "server-stream.h"
@@ -36,9 +37,9 @@
 static std::function<void(int)> shutdown_handler;
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
 
-static server_responses_routes_factory & registered_responses_routes_factory() {
-    static server_responses_routes_factory factory;
-    return factory;
+static server_route_extensions & registered_route_extensions() {
+    static server_route_extensions extensions;
+    return extensions;
 }
 
 static inline void signal_handler(int signal) {
@@ -53,7 +54,11 @@ static inline void signal_handler(int signal) {
 }
 
 void llama_server_set_responses_routes_factory(server_responses_routes_factory responses_factory) {
-    registered_responses_routes_factory() = std::move(responses_factory);
+    registered_route_extensions().responses = std::move(responses_factory);
+}
+
+void llama_server_set_route_extensions(server_route_extensions extensions) {
+    registered_route_extensions() = std::move(extensions);
 }
 
 void llama_server_terminate() {
@@ -118,10 +123,16 @@ static server_http_context::handler_t responses_optional_handler(
 }
 
 int llama_server(int argc, char ** argv) {
-    return llama_server(argc, argv, registered_responses_routes_factory());
+    return llama_server(argc, argv, registered_route_extensions());
 }
 
 int llama_server(int argc, char ** argv, const server_responses_routes_factory & responses_factory) {
+    server_route_extensions extensions;
+    extensions.responses = responses_factory;
+    return llama_server(argc, argv, extensions);
+}
+
+int llama_server(int argc, char ** argv, const server_route_extensions & extensions) {
     std::setlocale(LC_NUMERIC, "C");
 
 #ifndef _WIN32
@@ -145,11 +156,11 @@ int llama_server(int argc, char ** argv, const server_responses_routes_factory &
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    return llama_server(params, argc, argv, responses_factory);
+    return llama_server(params, argc, argv, extensions);
 }
 
 int llama_server(common_params & params, int argc, char ** argv) {
-    return llama_server(params, argc, argv, registered_responses_routes_factory());
+    return llama_server(params, argc, argv, registered_route_extensions());
 }
 
 int llama_server(
@@ -157,6 +168,16 @@ int llama_server(
         int argc,
         char ** argv,
         const server_responses_routes_factory & responses_factory) {
+    server_route_extensions extensions;
+    extensions.responses = responses_factory;
+    return llama_server(params, argc, argv, extensions);
+}
+
+int llama_server(
+        common_params & params,
+        int argc,
+        char ** argv,
+        const server_route_extensions & extensions) {
     bool is_run_by_cli = (argv == nullptr);
 
     common_models_handler models_handler;
@@ -231,10 +252,10 @@ int llama_server(
     // Router frontends always proxy Responses requests to the selected child.
     // Custom route factories are installed only in model-serving processes; a
     // custom module linked into the executable is registered again by each child.
-    if (!is_router_server && responses_factory) {
+    if (!is_router_server && extensions.responses) {
         try {
             server_responses_routes legacy_routes = routes.get_responses_routes();
-            routes.set_responses_routes(responses_factory(std::move(legacy_routes)));
+            routes.set_responses_routes(extensions.responses(std::move(legacy_routes)));
         } catch (const std::exception & e) {
             SRV_ERR("failed to initialize Responses routes: %s\n", e.what());
             return 1;
@@ -295,13 +316,28 @@ int llama_server(
         ctx_http.del ("/models",               ex_wrapper(models_routes->del_router_models));
     }
 
+    // Keep this after router substitution and decorate only the /v1 registration
+    // copy. /models must retain the fully configured upstream handler unchanged.
+    server_http_context::handler_t get_v1_models = routes.get_models;
+    if (extensions.v1_models) {
+        try {
+            get_v1_models = extensions.v1_models(std::move(get_v1_models));
+            if (!get_v1_models) {
+                throw std::invalid_argument("v1/models route decorator returned an empty handler");
+            }
+        } catch (const std::exception & e) {
+            SRV_ERR("failed to initialize v1/models route decorator: %s\n", e.what());
+            return 1;
+        }
+    }
+
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));
     ctx_http.get ("/props",                    ex_wrapper(routes.get_props));
     ctx_http.post("/props",                    ex_wrapper(routes.post_props));
     ctx_http.get ("/models",                   ex_wrapper(routes.get_models));
-    ctx_http.get ("/v1/models",                ex_wrapper(routes.get_models));
+    ctx_http.get ("/v1/models",                ex_wrapper(get_v1_models));
     ctx_http.post("/completion",               ex_wrapper(routes.post_completions)); // legacy
     ctx_http.post("/completions",              ex_wrapper(routes.post_completions));
     ctx_http.post("/v1/completions",           ex_wrapper(routes.post_completions_oai));

@@ -11,6 +11,11 @@
 
 using namespace llama_responses;
 
+// These declarations intentionally have external linkage: the focused test
+// translation units are aggregated into this executable's single main().
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+int test_codex_models();
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 int test_protocol();
 
 namespace {
@@ -209,6 +214,7 @@ int main() try {
     test_types();
     test_store();
     test_hosted_tools();
+    failures += test_codex_models();
     failures += test_protocol();
 
     if (failures != 0) {

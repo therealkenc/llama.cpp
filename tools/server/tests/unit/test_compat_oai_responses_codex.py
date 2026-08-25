@@ -9,6 +9,7 @@ should reuse the invariants below when that seam is available.
 
 from __future__ import annotations
 
+import hashlib
 from collections import defaultdict
 from typing import Any
 
@@ -22,6 +23,7 @@ from utils import ServerPreset
 
 server = ServerPreset.tinyllama2()
 STREAM_EVENT_ADAPTER = TypeAdapter(ResponseStreamEvent)
+TEST_API_KEY = "sk-llama-responses-test"
 
 
 @pytest.fixture(autouse=True)
@@ -32,15 +34,66 @@ def create_server():
     # Keep this focused suite isolated from both those services and the live
     # Qwen profile on 8081.
     server.server_port = 18088
+    server.api_key = TEST_API_KEY
+
+
+def authenticated_request(method: str, path: str, **kwargs: Any) -> Any:
+    headers = dict(kwargs.pop("headers", {}))
+    headers["Authorization"] = f"Bearer {TEST_API_KEY}"
+    return server.make_request(method, path, headers=headers, **kwargs)
 
 
 def openai_client() -> OpenAI:
     global server
     server.start()
     return OpenAI(
-        api_key="dummy",
+        api_key=TEST_API_KEY,
         base_url=f"http://{server.server_host}:{server.server_port}/v1",
     )
+
+
+def test_codex_model_catalog_route_chain():
+    global server
+    server.start()
+
+    unauthenticated = server.make_request(
+        "GET", "/v1/models?client_version=0.148.0"
+    )
+    assert unauthenticated.status_code == 401
+
+    plain_v1 = authenticated_request("GET", "/v1/models")
+    unrelated_v1 = authenticated_request("GET", "/v1/models?unrelated=value")
+    public_models = authenticated_request(
+        "GET", "/models?client_version=0.148.0"
+    )
+
+    for response in (plain_v1, unrelated_v1, public_models):
+        assert response.status_code == 200
+        assert response.body["object"] == "list"
+        assert response.body["data"][0]["id"] == server.model_alias
+        assert "slug" not in response.body["models"][0]
+
+    for version in ("0.148.0", "99.0.0", "opaque-preview"):
+        response = authenticated_request(
+            "GET", f"/v1/models?client_version={version}"
+        )
+        assert response.status_code == 200
+        assert set(response.body) == {"models"}
+        assert len(response.body["models"]) == 1
+        model = response.body["models"][0]
+        assert model["slug"] == server.model_alias
+        assert model["shell_type"] == "unified_exec"
+        assert model["apply_patch_tool_type"] == "freeform"
+        assert model["supported_reasoning_levels"] == []
+        assert "default_reasoning_level" not in model
+        assert model["context_window"] == server.n_ctx // server.n_slots
+        assert model["max_context_window"] == model["context_window"]
+        assert model["input_modalities"] == ["text"]
+        instructions = model["base_instructions"].encode()
+        assert len(instructions) == 20_903
+        assert hashlib.sha256(instructions).hexdigest() == (
+            "ac8ae107a0d72fe3476b430afb161ea4e67da2e446d778aefc44828160559807"
+        )
 
 
 def response_snapshot(
@@ -434,7 +487,7 @@ def test_codex_replayed_function_and_custom_tool_outputs_round_trip_through_sdk(
 def test_responses_validation_errors_have_openai_shape(body, message_fragment):
     global server
     server.start()
-    response = server.make_request("POST", "/v1/responses", data=body)
+    response = authenticated_request("POST", "/v1/responses", data=body)
 
     assert response.status_code == 400
     assert set(response.body) == {"error"}
@@ -536,11 +589,11 @@ def test_stored_response_input_items_page_via_sdk():
     page = client.responses.input_items.list(created.id, order="asc", limit=10)
     assert [item.id for item in page.data] == ["msg_stored_input"]
 
-    bad_order = server.make_request(
+    bad_order = authenticated_request(
         "GET", f"/v1/responses/{created.id}/input_items?order=sideways"
     )
     assert bad_order.status_code == 400
-    bad_limit = server.make_request(
+    bad_limit = authenticated_request(
         "GET", f"/v1/responses/{created.id}/input_items?limit=1junk"
     )
     assert bad_limit.status_code == 400

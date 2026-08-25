@@ -362,124 +362,183 @@ currently exposes the items supplied for the current response rather than a
 materialized copy of its whole continuation lineage; this needs an OpenAI
 oracle fixture before changing it.
 
-## Codex CLI 0.148 third-party model compatibility
+## Codex CLI model-catalog compatibility
 
-This is a dated Codex client contract, not part of the OpenAI Responses API.
-Codex 0.148 uses model metadata to decide which instructions, tools, context
-limits, modalities, and request options to use. Merely accepting Responses
+This is a Codex client contract, not part of the public OpenAI Models or
+Responses APIs. Codex uses model metadata to choose instructions, tools,
+context limits, modalities, and request options. Merely accepting Responses
 requests is enough for a basic turn, but it is not enough for deterministic
 Codex behavior.
 
 The public Codex configuration supports custom providers with a `base_url` and
-`wire_api = "responses"`. In addition, this client version implements a private
-model-catalog discovery contract which is documented by its tagged source, not
-by the OpenAI Responses specification. See
-[custom model providers](https://learn.chatgpt.com/docs/config-file/config-advanced#custom-model-providers),
-the [0.148 model endpoint implementation](https://github.com/openai/codex/blob/rust-v0.148.0/codex-rs/model-provider/src/models_endpoint.rs),
-and the [0.148 fallback constructor](https://github.com/openai/codex/blob/rust-v0.148.0/codex-rs/models-manager/src/model_info.rs#L138-L215).
+`wire_api = "responses"`. Codex also implements a private model-catalog
+discovery contract which is documented by its source rather than by the OpenAI
+Responses specification. The first implementation is pinned against Codex
+0.148, commit `3ba0f711`, including the
+[request construction](https://github.com/openai/codex/blob/3ba0f711642a888aec92a611a3f3b2211157ff89/codex-rs/codex-api/src/endpoint/models.rs#L31),
+[catalog shape](https://github.com/openai/codex/blob/3ba0f711642a888aec92a611a3f3b2211157ff89/codex-rs/protocol/src/openai_models.rs#L683),
+and [fallback constructor](https://github.com/openai/codex/blob/3ba0f711642a888aec92a611a3f3b2211157ff89/codex-rs/models-manager/src/model_info.rs#L138-L215).
 
-### What the metadata warning means
-
-For a provider whose base URL is `http://127.0.0.1:8081/v1`, Codex 0.148 sends:
+When its remote-refresh policy permits a network fetch, Codex 0.148 sends the
+following request for a provider whose base URL is
+`http://127.0.0.1:8081/v1`:
 
 ```text
 GET /v1/models?client_version=0.148.0
 ```
 
-For capability discovery it expects a private object shaped as
-`{"models":[ModelInfo,...]}`. It does not consume the standard OpenAI
-`{"object":"list","data":[...]}` entries for this purpose. `llama-server`
-currently returns both an Ollama-shaped top-level `models[]` and an OpenAI-style
-`data[]`. Codex tries to decode the former as `ModelInfo` and fails first because
-the entry has no `slug`; the useful context and modality fields under
-`data[].meta` do not rescue that decode.
+It expects `{"models":[ModelInfo,...]}`, not the public OpenAI
+`{"object":"list","data":[...]}` shape. The tagged schema is a fixture for the
+fields we deliberately emit, not a routing version lock: the endpoint is a
+forward/backward-compatible JSON bag, and unknown fields are ignored by Codex.
 
-Two related diagnostics are therefore visible:
+### When Codex calls the route
 
-- stderr reports that `/models` refresh failed, including the first missing or
-  invalid private-catalog field;
-- stderr warns that the requested model is unknown, and `codex exec --json`
-  emits a non-terminal error item saying fallback metadata is being used.
+The endpoint and the client's decision to call it are separate compatibility
+seams. Codex 0.148 refreshes remote model metadata only when the retained auth
+manager currently uses the first-party Codex backend or the custom provider
+defines `auth.command`. An `env_key` does not independently satisfy that gate,
+although an existing ChatGPT login can satisfy it for the same custom provider.
+With neither qualifying auth source, Codex deliberately skips the network fetch
+and uses cached/bundled candidates plus unknown-model fallback metadata; no
+defect in `/v1/models` can make that client state call the route. A configured
+`model_catalog_json` selects a static manager and bypasses remote discovery for
+a different reason.
 
-The turn continues. This is a warning about client-side model capability
-selection, not a failed Responses request and not a fallback from Responses to
-Chat Completions. Codex remains on `wire_api = "responses"`.
+For a local provider, command-backed bearer authentication opts into the
+refresh and sends `Authorization: Bearer <token>` on model and Responses
+requests. The canonical profile exports one `LLAMA_API_KEY` from `~/.env` to
+both the authenticated llama-server and Codex's token command. This policy is
+verified against Codex 0.148's
+[refresh gate](https://github.com/openai/codex/blob/3ba0f711642a888aec92a611a3f3b2211157ff89/codex-rs/models-manager/src/manager.rs#L437)
+and with the installed CLI under isolated/no-OpenAI-auth state: no command auth
+produced the unknown-model warning without a model request, while command auth
+consumed this catalog and removed the warning. A separate capture with the
+machine's ChatGPT login retained confirmed that first-party auth also opens the
+gate. Command auth is used below because it is deterministic across operator
+login and cache state.
 
-Adding only `slug` is not a fix. A minimally decodable nonempty 0.148 entry also
-needs the following fields (and a useful entry needs accurate optional
-capabilities as well):
+### Implemented route chain
 
-```json
-{
-  "models": [{
-    "slug": "qwen3.8-27b-local",
-    "display_name": "qwen3.8-27b-local",
-    "base_instructions": "<real Codex instruction prompt>",
-    "supported_reasoning_levels": [],
-    "shell_type": "default",
-    "visibility": "none",
-    "supported_in_api": true,
-    "priority": 99,
-    "support_verbosity": false,
-    "truncation_policy": {"mode": "bytes", "limit": 10000},
-    "experimental_supported_tools": []
-  }]
-}
+`tools/llama-responses` now installs a neutral decorator through
+`server_route_extensions`. The decorator is structurally first only for the
+registered `/v1/models` route and receives the fully configured llama-server
+handler as `next`:
+
+- `/models`, with or without query parameters, always uses llama-server's
+  original handler;
+- `/v1/models` without a nonempty `client_version` also delegates unchanged;
+- any nonempty `client_version` is recognized, regardless of its value;
+- recognized requests call `next` exactly once, then project the returned live,
+  sleeping/cached, or router catalog into the private Codex shape;
+- non-200, streaming, malformed, or unprojectable downstream responses are
+  returned unchanged, including their status and headers.
+
+This is a chain-of-responsibility seam. Additional harness-specific query
+contracts can be inserted ahead of or behind it without adding query-policy
+branches to generic llama-server code. Tests intentionally include a future
+`client_version=99.0.0` to prevent an accidental exact-version gate.
+
+The current projection uses the following policies:
+
+| Codex field | Source or policy |
+| --- | --- |
+| `slug` | llama-server's model `id`, including the configured `--alias`. |
+| `context_window`, `max_context_window` | Actual loaded `data[].meta.n_ctx`; omitted when an unloaded router entry cannot report it. The two values are equal so a Codex config override cannot exceed the runtime. |
+| `input_modalities` | Router `architecture.input_modalities`, or `text` plus `image` for the known single-model Qwen+mmproj alias; otherwise explicit `text`. The generic single-model `multimodal` bit cannot distinguish image from audio, so the projection fails closed. |
+| shell and patch tools | `shell_type = "unified_exec"` and `apply_patch_tool_type = "freeform"`; both shapes are already accepted by the Responses bridge. |
+| hosted search | Not advertised; the C++ provider interfaces exist but the implementations are still stubs. |
+| instructions | The exact 20,903-byte Codex 0.148 fallback base prompt, embedded from the inspectable [prompt snapshot](tools/llama-responses/prompts/codex-0.148.0.md). `base_instructions` replaces the fallback rather than extending it, so matching the known baseline avoids an accidental prompt regression. Model-tuned prompts remain future, eval-driven policy. |
+
+### Qwen reasoning policy
+
+The [Qwen3.8-27B model card](https://huggingface.co/Qwen/Qwen3.8-27B)
+documents the native `reasoning_effort` values `low`, `medium`, and `xhigh`,
+with `xhigh` as the model default. The local GGUF's embedded template agrees.
+The Codex projection advertises those three values as `{effort, description}`
+objects and sets `default_reasoning_level = "low"` for the exact
+`qwen3.8-27b-local` alias.
+
+The names travel through existing seams without another mapping layer:
+
+```text
+Codex supported_reasoning_levels selection
+    -> Responses reasoning.effort
+    -> llama-server reasoning_effort
+    -> Qwen chat-template reasoning_effort
 ```
 
-An empty `base_instructions` value merely suppresses the good compiled fallback
-prompt. A server-owned catalog must contain deliberate instructions or a
-`model_messages.instructions_template`, plus truthful context, modality,
-reasoning, and tool declarations.
+Thinking on/off is a separate dimension. llama-server accepts the API spelling
+`reasoning_effort = "none"` by setting `enable_thinking = false`; `off` is not a
+Codex reasoning-effort value, and `none` is not one of Qwen's native three, so
+neither is advertised in the picker. Start this deployment with
+`--reasoning auto --reasoning-effort low`: omitted requests default to low,
+Codex sends the catalog default, explicit `medium`/`xhigh` requests override it,
+and an explicit `none` request can still disable thinking.
 
-### What Codex falls back from, and what it falls back to
+The MVP declares `supports_reasoning_summary_parameter = false` and
+`default_reasoning_summary = "none"`. The bridge can emit reasoning events, but
+it does not yet implement OpenAI's selectable summary policy faithfully.
 
-Codex first looks for the requested slug in the resolved model catalog. If
-remote decoding fails or the slug is absent, 0.148 constructs an in-client
-`ModelInfo` for that unknown slug. For `qwen3.8-27b-local`, its relevant defaults
-are:
+The model card describes a native 262,144-token context and text/image/video
+inputs. The endpoint nevertheless advertises the loaded server's `n_ctx`, not
+the theoretical maximum, and only modalities represented by Codex's enum and
+the active llama-server deployment.
 
-| Area | Compiled fallback | Consequence |
+### What the fallback warning means
+
+If remote catalog decoding fails or the requested slug is absent, Codex creates
+client-side metadata for the unknown slug. stderr reports a model-refresh
+decode error and an unknown-model warning; `codex exec --json` also emits a
+non-terminal error item saying fallback metadata is in use. The turn continues
+on `wire_api = "responses"`. This is not a fallback to Chat Completions and does
+not mean `/v1/responses` failed.
+
+For Codex 0.148, the important compiled fallback differences are:
+
+| Area | Client fallback | Consequence |
 | --- | --- | --- |
-| Instructions | Codex's generic coding-agent base prompt | Good enough to operate, but selected by client version rather than server/model capability. |
-| Context | 272,000 declared maximum, 95% effective budget (258,400), auto-compact at 244,800 | May materially overstate or understate the loaded server context; Codex ignores `data[].meta.n_ctx` in the current response. |
-| Shell | `shell_type = default`, which resolves to UnifiedExec with stock 0.148 features | `exec_command`/`write_stdin` work. |
-| Patch tool | `apply_patch_tool_type = null` | No dedicated `apply_patch` tool is advertised, so a black-box patch test does not cover that server shape. |
-| Reasoning | no supported/default effort; reasoning-summary parameter supported and defaults to `auto` | Without an override, Codex sends `reasoning.summary = "auto"` even when this server is launched with `--reasoning off`. |
-| Verbosity | unsupported | A requested model verbosity is not sent as a supported model feature. |
-| Modalities | text and image; original image detail unsupported | Fits the Qwen+mmproj profile in broad shape, but is wrong for a text-only deployment. |
-| Search/API mode | text web-search type, model search support false, Responses Lite false, direct tool mode | No model-native search capability is inferred; normal Responses requests are still used. |
-| Tool output | byte truncation at 10,000 bytes | Long tool output is retained only up to roughly 2,500 tokens, independent of server limits. |
-| Model-specific guidance | skill, plugin, and app usage-instruction flags false; no experimental tools | Those catalog-gated instruction blocks and tools are not enabled. |
+| Instructions | The same generic 20,903-byte Codex 0.148 prompt embedded by this endpoint | Equivalent at this pinned client snapshot; the endpoint owns a stable, inspectable baseline instead of inheriting future client drift. |
+| Context | 272,000 maximum, 95% effective budget, automatic compaction at 90% | Can be materially wrong for the loaded runtime. |
+| Shell | `default`, resolving to UnifiedExec with stock features | Terminal tools remain available. |
+| Patch | Dedicated `apply_patch` disabled | Codex exposes a different tool set. |
+| Reasoning | No supported/default effort; summaries supported and default `auto` | Qwen's effort choice and summary policy are wrong. |
+| Modalities | Defaults to text and image | Wrong for text-only deployments. |
+| Tool output | 10,000-byte truncation | Independent of actual context and the endpoint's new 10,000-token policy. |
 
-The fallback is therefore useful but not capability-neutral. A third-party
-provider can have a perfectly usable `/v1/responses` endpoint and still produce
-this warning, different tools, a wrong context policy, or unsuitable reasoning
-options if its `/models` endpoint does not implement Codex's versioned private
-catalog.
+The prompt snapshot is OpenAI Codex's Apache-2.0-licensed CLI fallback, not
+evidence that every hosted OpenAI model catalog entry uses identical
+instructions. Its source commit, checksum, license, and NOTICE are recorded in
+the adjacent [prompt README](tools/llama-responses/prompts/README.md).
 
-### Three supported operating choices
+The fallback is useful but not capability-neutral. With command auth enabling
+refresh and the decorator active, the canonical Qwen alias resolves from the
+remote catalog without this warning. A future Codex client that adds a required
+field may fall back until we advance the schema fixture; accepting its
+`client_version` is intentional, because compatible JSON additions require no
+server change.
 
-1. During an exploratory smoke test, accept the warning and override known
-   mismatches explicitly. For the canonical `--reasoning off` profile, set
-   `model_reasoning_effort = "none"` and `model_reasoning_summary = "none"`.
-2. For deterministic tests, set
-   `model_catalog_json = "/absolute/path/to/codex-qwen-models.json"`. In 0.148,
-   a valid nonempty static catalog is authoritative and bypasses remote
-   `/models` discovery. It should carry the real instructions and advertise
-   the actual context, modalities, patch-tool type, truncation, and reasoning
-   policy.
-3. In a later sidecar iteration, add one optional model-metadata decorator seam.
-   Generic `/v1/models` remains owned by `llama-server`; the statically linked
-   Responses module may add a versioned Codex catalog projection for active,
-   sleeping/cached, and router model lists. This avoids scattering a private
-   Codex schema and prompt through upstream-owned server code.
+### What Ollama does
 
-The configuration key `model_reasoning_summary` is accepted by Codex 0.148.
-The similarly named `model_supports_reasoning_summaries` is not a recognized
-0.148 configuration key. The private catalog must be versioned as a client
-compatibility fixture; it must not become the source of truth for the OpenAI
-Responses contract.
+Ollama main at commit `f6c59d87` takes a different integration path. Its
+[`ollama launch codex` guide](https://github.com/ollama/ollama/blob/f6c59d87038ae77f52d4adfbdc37363f8edd1ef3/docs/integrations/codex.mdx#L18-L77)
+and
+[`ensureCodexConfig` implementation](https://github.com/ollama/ollama/blob/f6c59d87038ae77f52d4adfbdc37363f8edd1ef3/cmd/launch/codex.go#L174-L229)
+write a one-model `~/.codex/model.json`, point a dedicated Codex profile at it
+with `model_catalog_json`, and launch Codex with that static catalog. Ollama's
+[`/v1/models` handler](https://github.com/ollama/ollama/blob/f6c59d87038ae77f52d4adfbdc37363f8edd1ef3/server/routes.go#L1632-L1645)
+continues returning the public OpenAI list shape and does not implement the
+private `client_version` contract.
+
+The generated
+[`ModelInfo` entry](https://github.com/ollama/ollama/blob/f6c59d87038ae77f52d4adfbdc37363f8edd1ef3/cmd/launch/codex.go#L705-L753)
+derives context and modalities, but hard-codes empty `base_instructions` and
+reasoning levels. Ollama then lowers Responses `instructions` to the first
+system message, while a model's Modelfile `SYSTEM` is only prepended when the
+request has no system message. That is useful precedent for static client
+configuration, not for endpoint-transparent discovery or prompt fidelity. Our
+decorated HTTP route keeps the deployment policy in the server and works for
+any compatible harness willing to request it.
 
 ## Delivery phases
 
@@ -724,7 +783,8 @@ fixtures must assert the whole event stream, not just concatenated text.
 
 The live Codex/conformance profile runs on port 8081. This is intentionally
 separate from Docker-hosted services on port 8080 and from the high ports used
-by automated server tests.
+by automated server tests. It uses the
+[Qwen3.8-27B model](https://huggingface.co/Qwen/Qwen3.8-27B).
 
 ```bash
 MODELPATH="$HOME/Devel/scripts-ken/gguf/unsloth/Qwen3.8-27B-GGUF"
@@ -732,18 +792,22 @@ MODEL="Qwen3.8-27B-UD-Q6_K.gguf"
 MMPROJ="mmproj-BF16.gguf"
 SERVER="$HOME/Devel/llama.cpp/build/bin/llama-server"
 
+source "$HOME/.env"
+: "${LLAMA_API_KEY:?LLAMA_API_KEY must be set in ~/.env}"
+
 $SERVER \
     -m "$MODELPATH/$MODEL" \
     --mmproj "$MODELPATH/$MMPROJ" \
     --alias qwen3.8-27b-local \
     --port 8081 \
     --host 0.0.0.0 \
-    --reasoning off \
-    --temperature 0.7 \
-    --top-p 0.80 \
+    --reasoning auto \
+    --reasoning-effort low \
+    --temperature 1.0 \
+    --top-p 0.95 \
     --top-k 20 \
     --min-p 0.0 \
-    --presence-penalty 1.5 \
+    --presence-penalty 0.0 \
     --repeat-penalty 1.0 \
     -np 1 \
     -ngl -1 \
@@ -760,8 +824,9 @@ be isolated from this Codex session with per-process provider configuration,
 is the canonical smoke command:
 
 ```bash
+source "$HOME/.env"
+
 env -u OPENAI_API_KEY -u OPENAI_BASE_URL \
-    LLAMA_RESPONSES_API_KEY=dummy \
     codex --ask-for-approval never exec \
     --ephemeral \
     --ignore-user-config \
@@ -775,11 +840,10 @@ env -u OPENAI_API_KEY -u OPENAI_BASE_URL \
     -c 'model_provider="llama_local_smoke"' \
     -c 'model_providers.llama_local_smoke.name="Local llama-server smoke"' \
     -c 'model_providers.llama_local_smoke.base_url="http://127.0.0.1:8081/v1"' \
-    -c 'model_providers.llama_local_smoke.env_key="LLAMA_RESPONSES_API_KEY"' \
+    -c 'model_providers.llama_local_smoke.auth.command="/usr/bin/printenv"' \
+    -c 'model_providers.llama_local_smoke.auth.args=["LLAMA_API_KEY"]' \
     -c 'model_providers.llama_local_smoke.requires_openai_auth=false' \
     -c 'model_providers.llama_local_smoke.wire_api="responses"' \
-    -c 'model_reasoning_effort="none"' \
-    -c 'model_reasoning_summary="none"' \
     -c 'check_for_update_on_startup=false' \
     -c 'web_search="disabled"' \
     -c 'agents.enabled=false' \
@@ -788,11 +852,27 @@ env -u OPENAI_API_KEY -u OPENAI_BASE_URL \
     'Reply with exactly LOCAL_RESPONSES_OK and do nothing else.'
 ```
 
-`LLAMA_RESPONSES_API_KEY` is deliberately a dummy value: Codex's provider
-configuration names an environment key, while this local server profile does
-not require OpenAI authentication. When a static catalog is ready, add
-`-c 'model_catalog_json="/absolute/path/to/codex-qwen-models.json"'`; until
-then the unknown-model fallback warning described above is expected.
+The launcher sources `~/.env`, which exports `LLAMA_API_KEY`; llama-server
+consumes that supported environment variable directly and requires bearer
+authentication on its protected routes. The Codex process inherits the same
+variable, and its `auth.command` asks `/usr/bin/printenv` for the token without
+putting the secret in this document or the process arguments. Codex 0.148 also
+treats command-backed provider auth as permission to refresh remote model
+metadata; an `env_key` alone does not open that gate.
+
+The command deliberately has no reasoning override or static
+`model_catalog_json`: it exercises remote
+`/v1/models?client_version=...` discovery, selects the catalog's low default,
+and fails visibly if Codex falls back to compiled metadata.
+
+Verified live on 2026-08-24 with Codex CLI 0.148 and the Qwen profile above:
+the loaded slot reported 91,136 context tokens; an unauthenticated catalog
+request returned 401; the authenticated catalog returned the Qwen alias,
+text/image modalities, `low`/`medium`/`xhigh`, low default, and the exact prompt
+checksum. The smoke command exited 0 with no unknown-model warning and produced
+exactly `LOCAL_RESPONSES_OK` through `/v1/responses` (9,684 input tokens and 34
+generated tokens). This is an end-to-end compatibility observation, not a
+performance or output-determinism contract.
 
 ## Upstream merge discipline
 
@@ -870,9 +950,8 @@ adapter indefinitely:
    including deferred web/file shell-wrapper identity.
 4. Capture an OpenAI oracle fixture for continued-response `/input_items`
    semantics before changing the current-turn representation.
-5. Add a deterministic Codex 0.148 catalog fixture or the optional model-list
-   decorator seam so dedicated `apply_patch`, actual context limits, and
-   reasoning policy are tested deliberately.
+5. Exercise the implemented Codex catalog decorator with the real CLI, then
+   capture its request and tool-set negotiation as a deterministic fixture.
 6. Put a byte budget around stored inline media before advertising the
    in-memory store beyond development use.
 7. Continue Phase 3 field/error coverage, then begin real hosted providers as

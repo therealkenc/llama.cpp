@@ -1,5 +1,6 @@
 #include "server-integration.h"
 
+#include "codex-models.h"
 #include "hosted-tools.h"
 #include "json.h"
 #include "log.h"
@@ -9,6 +10,7 @@
 #include "response-types.h"
 #include "server-http.h"
 #include "server-responses.h"
+#include "server-route-extensions.h"
 
 #include <algorithm>
 #include <atomic>
@@ -490,6 +492,13 @@ server_responses_routes_factory make_server_responses_routes_factory() {
         auto implementation = std::make_shared<responses_routes_impl>(std::move(legacy));
         return responses_routes_impl::routes(implementation);
     };
+}
+
+server_route_extensions make_server_route_extensions() {
+    server_route_extensions extensions;
+    extensions.responses = make_server_responses_routes_factory();
+    extensions.v1_models = make_codex_models_route_decorator();
+    return extensions;
 }
 
 }  // namespace llama_responses
