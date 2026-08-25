@@ -1,4 +1,5 @@
-#pragma once
+#ifndef LLAMA_SERVER_HTTP_H
+#define LLAMA_SERVER_HTTP_H
 
 #include <atomic>
 #include <functional>
@@ -25,6 +26,14 @@ struct server_http_res {
     std::map<std::string, std::string> headers;
 
     std::function<bool(std::string &)> next = nullptr;
+
+    // Optional lifetime and stream-observation seams for in-process route
+    // decorators. The owner remains alive through on_complete(); the observer
+    // sees complete chunks whether they are sent to HTTP or drained into a
+    // resumable stream after disconnect.
+    std::shared_ptr<void> lifetime_owner;
+    std::function<void(const std::string &)> chunk_observer;
+
     bool is_stream() const {
         return next != nullptr;
     }
@@ -98,3 +107,5 @@ struct server_http_context {
     // for debugging
     std::string listening_address;
 };
+
+#endif  // LLAMA_SERVER_HTTP_H

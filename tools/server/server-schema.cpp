@@ -1,6 +1,26 @@
 #include "server-schema.h"
 
+#include "chat.h"
+#include "common.h"
+#include "ggml.h"
+#include "json.h"
 #include "json-schema-to-grammar.h"
+#include "llama.h"
+#include "sampling.h"
+#include "server-common.h"
+#include "server-task.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <exception>
+#include <functional>
+#include <limits>
+#include <memory>
+#include <stdexcept>
+#include <utility>
+#include <vector>
 
 namespace server_schema {
 
@@ -88,6 +108,13 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             }
             for (const auto & item : data.at("__responses_tool_metadata").items()) {
                 ctx.params.responses_tool_metadata[item.key()] = item.value();
+            }
+        }));
+
+    add((new field_json("__responses_request"))
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            if (data.at("__responses_request").is_object()) {
+                ctx.params.responses_request = data.at("__responses_request");
             }
         }));
 
@@ -461,28 +488,40 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             };
             if (logit_bias.is_array()) {
                 for (const auto & el : logit_bias) {
-                    if (!el.is_array() || el.size() != 2) continue;
+                    if (!el.is_array() || el.size() != 2) {
+                        continue;
+                    }
                     float bias;
-                    if (!parse_bias(el[1], bias)) continue;
+                    if (!parse_bias(el[1], bias)) {
+                        continue;
+                    }
                     if (el[0].is_number_integer()) {
                         llama_token tok = el[0].get<llama_token>();
-                        if (tok >= 0 && tok < n_vocab) ctx.params.sampling.logit_bias.push_back({tok, bias});
-                    } else if (el[0].is_string()) {
-                        for (auto tok : common_tokenize(ctx.vocab, el[0].get<std::string>(), false))
+                        if (tok >= 0 && tok < n_vocab) {
                             ctx.params.sampling.logit_bias.push_back({tok, bias});
+                        }
+                    } else if (el[0].is_string()) {
+                        for (auto tok : common_tokenize(ctx.vocab, el[0].get<std::string>(), false)) {
+                            ctx.params.sampling.logit_bias.push_back({tok, bias});
+                        }
                     }
                 }
             } else if (logit_bias.is_object()) {
                 for (const auto & el : logit_bias.items()) {
                     float bias;
-                    if (!parse_bias(el.value(), bias)) continue;
+                    if (!parse_bias(el.value(), bias)) {
+                        continue;
+                    }
                     char * end;
                     llama_token tok = strtol(el.key().c_str(), &end, 10);
                     if (*end == 0) {
-                        if (tok >= 0 && tok < n_vocab) ctx.params.sampling.logit_bias.push_back({tok, bias});
+                        if (tok >= 0 && tok < n_vocab) {
+                            ctx.params.sampling.logit_bias.push_back({tok, bias});
+                        }
                     } else {
-                        for (auto t : common_tokenize(ctx.vocab, el.key(), false))
+                        for (auto t : common_tokenize(ctx.vocab, el.key(), false)) {
                             ctx.params.sampling.logit_bias.push_back({t, bias});
+                        }
                     }
                 }
             }
@@ -507,7 +546,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             const auto & stop = data.at("stop");
             if (stop.is_array()) {
                 for (const auto & word : stop) {
-                    if (!word.empty()) ctx.params.antiprompt.push_back(word);
+                    if (!word.empty()) {
+                        ctx.params.antiprompt.push_back(word);
+                    }
                 }
             } else if (stop.is_string()) {
                 ctx.params.antiprompt.push_back(stop.get<std::string>());
@@ -590,7 +631,7 @@ task_params eval_llama_cmpl_schema(
 // eval() implementations
 //
 
-static void handle_with_catch(const char * name, std::function<void()> func) {
+static void handle_with_catch(const char * name, const std::function<void()> & func) {
     try {
         func();
     } catch (const std::exception & e) {

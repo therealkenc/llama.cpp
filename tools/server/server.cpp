@@ -1,29 +1,45 @@
+#include "server.h"
 #include "server-context.h"
 #include "server-http.h"
+#include "server-mcp.h"
 #include "server-models.h"
+#include "server-responses.h"
+#include "server-common.h"
 #include "server-cors-proxy.h"
 #include "server-stream.h"
 #include "server-tools.h"
 
 #include "arg.h"
-#include "build-info.h"
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
-#include "log.h"
 
 #include <atomic>
 #include <clocale>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
+#include <functional>
+#include <memory>
+#include <optional>
 #include <signal.h>
+#include <stdexcept>
+#include <string>
 #include <thread> // for std::thread::hardware_concurrency
+#include <utility>
+#include <vector>
 
-#if defined(_WIN32)
+#ifdef _WIN32
 #include <windows.h>
 #endif
 
 static std::function<void(int)> shutdown_handler;
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
+
+static server_responses_routes_factory & registered_responses_routes_factory() {
+    static server_responses_routes_factory factory;
+    return factory;
+}
 
 static inline void signal_handler(int signal) {
     if (is_terminating.test_and_set()) {
@@ -36,12 +52,10 @@ static inline void signal_handler(int signal) {
     shutdown_handler(signal);
 }
 
-// satisfies -Wmissing-declarations (used by llama command)
-int llama_server(int argc, char ** argv);
+void llama_server_set_responses_routes_factory(server_responses_routes_factory responses_factory) {
+    registered_responses_routes_factory() = std::move(responses_factory);
+}
 
-// to be used via CLI (argc / argv are used by router mode only)
-int llama_server(common_params & params, int argc, char ** argv);
-void llama_server_terminate();
 void llama_server_terminate() {
     if (shutdown_handler) {
         shutdown_handler(0);
@@ -85,7 +99,29 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
     };
 }
 
+static server_http_context::handler_t responses_optional_handler(
+        const server_http_context::handler_t & handler,
+        const char * operation) {
+    if (handler) {
+        return handler;
+    }
+
+    return [operation = std::string(operation)](const server_http_req &) -> server_http_res_ptr {
+        auto res = std::make_unique<server_http_res>();
+        json error = format_error_response(
+                "The Responses API " + operation + " operation is not supported by this server",
+                ERROR_TYPE_NOT_SUPPORTED);
+        res->status = json_value(error, "code", 501);
+        res->data = safe_json_to_str({{"error", error}});
+        return res;
+    };
+}
+
 int llama_server(int argc, char ** argv) {
+    return llama_server(argc, argv, registered_responses_routes_factory());
+}
+
+int llama_server(int argc, char ** argv, const server_responses_routes_factory & responses_factory) {
     std::setlocale(LC_NUMERIC, "C");
 
 #ifndef _WIN32
@@ -109,10 +145,18 @@ int llama_server(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    return llama_server(params, argc, argv);
+    return llama_server(params, argc, argv, responses_factory);
 }
 
 int llama_server(common_params & params, int argc, char ** argv) {
+    return llama_server(params, argc, argv, registered_responses_routes_factory());
+}
+
+int llama_server(
+        common_params & params,
+        int argc,
+        char ** argv,
+        const server_responses_routes_factory & responses_factory) {
     bool is_run_by_cli = (argv == nullptr);
 
     common_models_handler models_handler;
@@ -184,6 +228,19 @@ int llama_server(common_params & params, int argc, char ** argv) {
     server_routes routes(params, ctx_server);
     server_tools tools;
 
+    // Router frontends always proxy Responses requests to the selected child.
+    // Custom route factories are installed only in model-serving processes; a
+    // custom module linked into the executable is registered again by each child.
+    if (!is_router_server && responses_factory) {
+        try {
+            server_responses_routes legacy_routes = routes.get_responses_routes();
+            routes.set_responses_routes(responses_factory(std::move(legacy_routes)));
+        } catch (const std::exception & e) {
+            SRV_ERR("failed to initialize Responses routes: %s\n", e.what());
+            return 1;
+        }
+    }
+
     std::optional<server_models_routes> models_routes{};
     if (is_router_server) {
         // setup server instances manager
@@ -202,7 +259,6 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.post_completions_oai        = models_routes->proxy_post;
         routes.post_chat_completions       = models_routes->proxy_post;
         routes.post_control                = models_routes->proxy_post;
-        routes.post_responses_oai          = models_routes->proxy_post;
         routes.post_transcriptions_oai     = models_routes->proxy_post;
         routes.post_anthropic_messages     = models_routes->proxy_post;
         routes.post_anthropic_count_tokens = models_routes->proxy_post;
@@ -214,11 +270,19 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.post_detokenize             = models_routes->proxy_post;
         routes.post_apply_template         = models_routes->proxy_post;
         routes.post_chat_completions_tok   = models_routes->proxy_post;
-        routes.post_responses_tok_oai      = models_routes->proxy_post;
         routes.get_lora_adapters           = models_routes->proxy_get;
         routes.post_lora_adapters          = models_routes->proxy_post;
         routes.get_slots                   = models_routes->proxy_get;
         routes.post_slots                  = models_routes->proxy_post;
+
+        server_responses_routes proxy_responses;
+        proxy_responses.create       = models_routes->proxy_post;
+        proxy_responses.input_tokens = models_routes->proxy_post;
+        // Response resources need response-id -> child ownership, which router
+        // mode does not have yet. Leave them unset so the shared route adapter
+        // returns an explicit 501 instead of requiring a non-standard ?model=
+        // parameter or proxying state operations to an arbitrary child.
+        routes.set_responses_routes(std::move(proxy_responses));
 
         // custom routes for router
         routes.get_props                   = models_routes->get_router_props;
@@ -244,8 +308,19 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.post("/chat/completions",         ex_wrapper(routes.post_chat_completions));
     ctx_http.post("/v1/chat/completions",      ex_wrapper(routes.post_chat_completions));
     ctx_http.post("/v1/chat/completions/control", ex_wrapper(routes.post_control));
-    ctx_http.post("/v1/responses",             ex_wrapper(routes.post_responses_oai));
-    ctx_http.post("/responses",                ex_wrapper(routes.post_responses_oai));
+    const server_responses_routes & responses_routes = routes.get_responses_routes();
+    ctx_http.post("/v1/responses",             ex_wrapper(responses_routes.create));
+    ctx_http.post("/responses",                ex_wrapper(responses_routes.create));
+    ctx_http.get ("/v1/responses/:response_id",
+            ex_wrapper(responses_optional_handler(responses_routes.retrieve, "retrieve")));
+    ctx_http.del ("/v1/responses/:response_id",
+            ex_wrapper(responses_optional_handler(responses_routes.delete_response, "delete")));
+    ctx_http.post("/v1/responses/:response_id/cancel",
+            ex_wrapper(responses_optional_handler(responses_routes.cancel, "cancel")));
+    ctx_http.post("/v1/responses/compact",
+            ex_wrapper(responses_optional_handler(responses_routes.compact, "compact")));
+    ctx_http.get ("/v1/responses/:response_id/input_items",
+            ex_wrapper(responses_optional_handler(responses_routes.input_items, "input_items")));
     ctx_http.post("/v1/audio/transcriptions",  ex_wrapper(routes.post_transcriptions_oai));
     ctx_http.post("/audio/transcriptions",     ex_wrapper(routes.post_transcriptions_oai));
     ctx_http.post("/v1/messages",              ex_wrapper(routes.post_anthropic_messages)); // anthropic messages API
@@ -263,8 +338,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
     // token counting
     ctx_http.post("/chat/completions/input_tokens",    ex_wrapper(routes.post_chat_completions_tok));
     ctx_http.post("/v1/chat/completions/input_tokens", ex_wrapper(routes.post_chat_completions_tok));
-    ctx_http.post("/responses/input_tokens",           ex_wrapper(routes.post_responses_tok_oai));
-    ctx_http.post("/v1/responses/input_tokens",        ex_wrapper(routes.post_responses_tok_oai));
+    ctx_http.post("/responses/input_tokens",           ex_wrapper(responses_routes.input_tokens));
+    ctx_http.post("/v1/responses/input_tokens",        ex_wrapper(responses_routes.input_tokens));
     ctx_http.post("/v1/messages/count_tokens",         ex_wrapper(routes.post_anthropic_count_tokens)); // anthropic token counting
     // LoRA adapters hotswap
     ctx_http.get ("/lora-adapters",            ex_wrapper(routes.get_lora_adapters));
@@ -360,7 +435,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
         ctx_http.post("/tools",           ex_wrapper(res_403));
     }
 
-    if (warn_names.size() > 0) {
+    if (!warn_names.empty()) {
         SRV_WRN("%s", "-----------------\n");
         SRV_WRN("%s", "the following feature(s) are enabled:\n");
         for (const auto & name : warn_names) {
@@ -376,7 +451,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
     if (child.is_child() && child.get_mode() == SERVER_CHILD_MODE_DOWNLOAD) {
         return child.run_download(params);
-    } else if (!is_router_server && !is_run_by_cli) {
+    }
+    if (!is_router_server && !is_run_by_cli) {
         // single-model mode (NOT spawned by router)
         // if this is invoked by CLI, model downloading should be already handled
         try {
@@ -457,7 +533,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
         // setup communication child --> router if necessary
         if (child.is_child()) {
-            ctx_server.set_state_callback([&](server_state state, json payload) {
+            ctx_server.set_state_callback([&](server_state state, const json & payload) {
                 child.notify_to_router(server_state_to_str(state), payload);
             });
         }

@@ -1,6 +1,6 @@
 #include "common.h"
 #include "download.h"
-#include "log.h"
+#include "ggml.h"
 #include "llama.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
@@ -9,12 +9,26 @@
 
 #include "server-common.h"
 
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <exception>
+#include <fstream>
+#include <ios>
+#include <iterator>
+#include <limits>
+#include <map>
 #include <random>
 #include <sstream>
-#include <fstream>
-#include <limits>
+#include <stdexcept>
+#include <string>
+#include <string_view>
 #include <cstring>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 json format_error_response(const std::string & message, const enum error_type type) {
     std::string type_str;
@@ -111,7 +125,9 @@ std::string gen_chatcmplid() {
 }
 
 std::string gen_tool_call_id() {
-    return random_string();
+    // OpenAI uses a call-scoped identifier independently from the output-item
+    // identifier (for example call_* versus fc_* in the Responses API).
+    return "call_" + random_string();
 }
 
 const char * get_media_marker() {
@@ -199,13 +215,13 @@ std::vector<size_t> lora_get_enabled_ids(const std::vector<common_adapter_lora_i
 // base64 utils (TODO: use the base64::decode from base64.hpp)
 //
 
-static const std::string base64_chars =
+static constexpr std::string_view base64_chars =
              "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
              "abcdefghijklmnopqrstuvwxyz"
              "0123456789+/";
 
 static inline bool is_base64(uint8_t c) {
-    return (isalnum(c) || (c == '+') || (c == '/'));
+    return std::isalnum(c) || c == '+' || c == '/';
 }
 
 static inline raw_buffer base64_decode(const std::string & encoded_string) {
@@ -1103,15 +1119,16 @@ static void handle_media(
         std::vector<std::string> parts = string_split<std::string>(url, /*separator*/ ',');
         if (parts.size() != 2) {
             throw std::runtime_error("Invalid uri-encoded base64 value");
-        } else if (!string_starts_with(parts[0], "data:image/")) {
-            throw std::runtime_error("Invalid uri format: " + parts[0]);
-        } else if (!string_ends_with(parts[0], "base64")) {
-            throw std::runtime_error("uri must be base64 encoded");
-        } else {
-            auto base64_data = parts[1];
-            auto decoded_data = base64_decode(base64_data);
-            out_files.push_back(decoded_data);
         }
+        if (!string_starts_with(parts[0], "data:image/")) {
+            throw std::runtime_error("Invalid uri format: " + parts[0]);
+        }
+        if (!string_ends_with(parts[0], "base64")) {
+            throw std::runtime_error("uri must be base64 encoded");
+        }
+        const auto & base64_data  = parts[1];
+        auto         decoded_data = base64_decode(base64_data);
+        out_files.push_back(decoded_data);
 
     } else {
         // try as raw base64 string
@@ -1534,9 +1551,7 @@ std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int i
     }
 
     // sort tokens by logits (partial: only the leading `n_top` need ordering)
-    if (n_top > cur.size()) {
-        n_top = cur.size();
-    }
+    n_top = std::min(n_top, cur.size());
     if (n_top > 0) {
         std::partial_sort(cur.begin(), cur.begin() + n_top, cur.end(),
             [](const llama_token_data & a, const llama_token_data & b) {
@@ -1774,12 +1789,12 @@ llama_tokens format_prompt_infill(
 
     // for now pick FIM context to fit in a batch (ratio prefix:suffix = 3:1, TODO: configurable?)
     const int n_prefix_take = std::min<int>(tokens_prefix.size(),                3*(n_batch/4));
-    const int n_suffix_take = std::min<int>(tokens_suffix.size(), std::max<int>(0, (n_batch/4) - (2 + tokens_prompt.size())));
+    const int n_suffix_take = std::min<int>(tokens_suffix.size(), std::max<int>(0, n_batch/4 - (2 + tokens_prompt.size())));
 
     SRV_DBG("n_prefix_take = %d, n_suffix_take = %d, total = %d\n", n_prefix_take, n_suffix_take, (n_prefix_take + n_suffix_take));
 
     // fill the rest of the context with extra chunks
-    const int n_extra_take = std::min<int>(std::max<int>(0, n_ctx - (n_batch) - 2*n_predict), extra_tokens.size());
+    const int n_extra_take = std::min<int>(std::max<int>(0, n_ctx - n_batch - 2*n_predict), extra_tokens.size());
 
     tokens_prefix.erase(tokens_prefix.begin(), tokens_prefix.begin() + tokens_prefix.size() - n_prefix_take);
     tokens_suffix.resize(n_suffix_take);

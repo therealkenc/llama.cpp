@@ -1,9 +1,22 @@
+#include "chat.h"
+#include "common.h"
+#include "log.h"
 #include "server-chat.h"
 #include "server-common.h"
+#include "server-http.h"
 
+#include <algorithm>
 #include <cctype>
+#include <cstddef>
+#include <cstring>
+#include <exception>
+#include <map>
 #include <sstream>
+#include <stdexcept>
+#include <string>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 static constexpr char VIDEO_DATA_URL_PREFIX[]     = "data:video/";
 static constexpr char DATA_URL_BASE64_SEPARATOR[] = ";base64,";
@@ -721,10 +734,32 @@ json server_chat_convert_responses_to_chatcmpl(
     std::unordered_set<std::string> file_search_bridge_call_ids;
 
     if (response_body.contains("instructions")) {
-        chatcmpl_messages.push_back({
-            {"role",    "system"},
-            {"content", json_value(response_body, "instructions", std::string())},
-        });
+        const json & instructions = response_body.at("instructions");
+        if (instructions.is_string()) {
+            chatcmpl_messages.push_back({
+                {"role",    "system"},
+                {"content", instructions},
+            });
+        } else if (instructions.is_array()) {
+            json combined = instructions;
+            if (input_value.is_string()) {
+                combined.push_back({
+                    {"role",    "user"},
+                    {"content", input_value},
+                });
+            } else if (input_value.is_object()) {
+                combined.push_back(input_value);
+            } else if (input_value.is_array()) {
+                for (const json & item : input_value) {
+                    combined.push_back(item);
+                }
+            } else {
+                throw std::invalid_argument("'input' must be a string, object, or array of items");
+            }
+            input_value = std::move(combined);
+        } else if (!instructions.is_null()) {
+            throw std::invalid_argument("'instructions' must be a string, an array of items, or null");
+        }
         chatcmpl_body.erase("instructions");
     }
 
@@ -1162,6 +1197,27 @@ json server_chat_convert_responses_to_chatcmpl(
         }
     }
 
+    // Responses nests structured-output configuration under text.format,
+    // whereas the shared llama-server prompt machinery consumes the Chat-style
+    // response_format object. Lower it only at this inference seam; the original
+    // Responses shape is retained separately for the response envelope.
+    if (response_body.contains("text") && response_body.at("text").is_object()) {
+        const json & text = response_body.at("text");
+        if (text.contains("format") && text.at("format").is_object()) {
+            json format = text.at("format");
+            const std::string format_type = json_value(format, "type", std::string("text"));
+            if (format_type == "json_schema") {
+                format.erase("type");
+                chatcmpl_body["response_format"] = json {
+                    {"type", "json_schema"},
+                    {"json_schema", std::move(format)},
+                };
+            } else if (format_type == "json_object") {
+                chatcmpl_body["response_format"] = std::move(format);
+            }
+        }
+    }
+
     // Strip Responses-only keys that have no chat completions equivalent
     // (e.g. Codex CLI sends store, include, prompt_cache_key, web_search)
     for (const char * key : {
@@ -1348,7 +1404,8 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
                                 if (source_type == "base64") {
                                     std::string media_type = json_value(source, "media_type", std::string("image/jpeg"));
                                     std::string data = json_value(source, "data", std::string());
-                                    std::string url = "data:" + media_type + ";base64," + data;
+                                    std::string url = "data:";
+                                    url.append(media_type).append(";base64,").append(data);
                                     content_parts.push_back({
                                         {"type", "image_url"},
                                         {"image_url", {{"url", url}}}

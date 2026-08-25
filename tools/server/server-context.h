@@ -1,6 +1,8 @@
-#pragma once
+#ifndef LLAMA_SERVER_CONTEXT_H
+#define LLAMA_SERVER_CONTEXT_H
 
 #include "server-http.h"
+#include "server-responses.h"
 #include "server-task.h"
 #include "server-queue.h"
 
@@ -62,19 +64,37 @@ enum server_state {
 
 static std::string server_state_to_str(server_state state) {
     switch (state) {
-        case SERVER_STATE_DOWNLOADING: return "downloading";
-        case SERVER_STATE_LOADING:     return "loading";
-        case SERVER_STATE_READY:       return "ready";
-        case SERVER_STATE_SLEEPING:    return "sleeping";
-        default: GGML_ASSERT(false && "invalid server_state");
+        case SERVER_STATE_DOWNLOADING: {
+            return "downloading";
+        }
+        case SERVER_STATE_LOADING: {
+            return "loading";
+        }
+        case SERVER_STATE_READY: {
+            return "ready";
+        }
+        case SERVER_STATE_SLEEPING: {
+            return "sleeping";
+        }
+        default: {
+            GGML_ASSERT(false && "invalid server_state");
+        }
     }
 }
 
 static server_state server_state_from_str(const std::string & str) {
-    if (str == "downloading") return SERVER_STATE_DOWNLOADING;
-    if (str == "loading")     return SERVER_STATE_LOADING;
-    if (str == "ready")       return SERVER_STATE_READY;
-    if (str == "sleeping")    return SERVER_STATE_SLEEPING;
+    if (str == "downloading") {
+        return SERVER_STATE_DOWNLOADING;
+    }
+    if (str == "loading") {
+        return SERVER_STATE_LOADING;
+    }
+    if (str == "ready") {
+        return SERVER_STATE_READY;
+    }
+    if (str == "sleeping") {
+        return SERVER_STATE_SLEEPING;
+    }
     GGML_ASSERT(false && "invalid server_state string");
 }
 
@@ -108,7 +128,7 @@ struct server_context {
     server_context_meta get_meta() const;
 
     // note: must be set before load_model() is called
-    void set_state_callback(server_state_callback_t callback);
+    void set_state_callback(server_state_callback_t callback) const;
 };
 
 
@@ -119,6 +139,15 @@ struct server_routes {
     server_routes(const common_params & params, server_context & ctx_server);
 
     void init_routes();
+
+    // Must be called before the handlers are registered with server_http_context.
+    // The two legacy-required operations are validated and the bundle is replaced
+    // as one unit, including its implementation lifetime owner.
+    void set_responses_routes(server_responses_routes routes);
+
+    const server_responses_routes & get_responses_routes() const {
+        return responses_routes;
+    }
 
     // note: this is not thread-safe and can only when ctx_http.is_ready is false
     void update_meta(const server_context & ctx_server) {
@@ -139,8 +168,6 @@ struct server_routes {
     server_http_context::handler_t post_chat_completions;
     server_http_context::handler_t post_chat_completions_tok;
     server_http_context::handler_t post_control;
-    server_http_context::handler_t post_responses_oai;
-    server_http_context::handler_t post_responses_tok_oai;
     server_http_context::handler_t post_transcriptions_oai;
     server_http_context::handler_t post_anthropic_messages;
     server_http_context::handler_t post_anthropic_count_tokens;
@@ -158,6 +185,8 @@ struct server_routes {
     json get_model_info() const;
 
 private:
+    server_responses_routes responses_routes;
+
     std::unique_ptr<server_res_generator> handle_completions_impl(
             const server_http_req & req,
             server_task_type type,
@@ -166,7 +195,7 @@ private:
             task_response_type res_type);
     std::unique_ptr<server_res_generator> handle_slots_save(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_restore(const server_http_req & req, int id_slot);
-    std::unique_ptr<server_res_generator> handle_slots_erase(const server_http_req &, int id_slot);
+    std::unique_ptr<server_res_generator> handle_slots_erase(const server_http_req & /*req*/, int id_slot);
     std::unique_ptr<server_res_generator> handle_embeddings_impl(const server_http_req & req, task_response_type res_type);
     std::unique_ptr<server_res_generator> handle_count_tokens(const llama_vocab * vocab, mtmd_context * mctx, const server_http_req & req, task_response_type res_type);
 
@@ -190,3 +219,5 @@ private:
     // call right before sleep to update the cached responses
     void update_cached_responses(bool is_sleeping);
 };
+
+#endif // LLAMA_SERVER_CONTEXT_H

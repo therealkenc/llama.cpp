@@ -91,9 +91,7 @@ def test_responses_stream_with_openai_library():
 
 
 def test_responses_schema_fields():
-    """Verify the 24 Response object fields added by this PR are present
-    with correct types and default values. These fields are required by
-    the OpenAI Responses API spec but were missing before this change."""
+    """Verify Response fields use API defaults and echo request values."""
     global server
     server.start()
     res = server.make_request("POST", "/v1/responses", data={
@@ -104,11 +102,13 @@ def test_responses_schema_fields():
     })
     assert res.status_code == 200
     body = res.body
-    # Usage sub-fields added by this PR
+    # Terminal usage has the complete Responses token breakdown.
     usage = body["usage"]
     assert isinstance(usage["input_tokens_details"]["cached_tokens"], int)
     assert isinstance(usage["output_tokens_details"]["reasoning_tokens"], int)
-    # All 24 fields added by this PR must be present with correct defaults
+    # Response lifecycle and API defaults.
+    assert isinstance(body["created_at"], int)
+    assert isinstance(body["completed_at"], int)
     assert body["incomplete_details"] is None
     assert body["previous_response_id"] is None
     assert body["instructions"] is None
@@ -116,28 +116,31 @@ def test_responses_schema_fields():
     assert body["tools"] == []
     assert body["tool_choice"] == "auto"
     assert body["truncation"] == "disabled"
-    assert body["parallel_tool_calls"] == False
+    assert body["parallel_tool_calls"] is True
     assert body["text"] == {"format": {"type": "text"}}
     assert body["top_p"] == 1.0
-    assert body["temperature"] == 1.0
+    assert body["temperature"] == 0.8
     assert body["presence_penalty"] == 0.0
     assert body["frequency_penalty"] == 0.0
     assert body["top_logprobs"] == 0
     assert body["reasoning"] is None
-    assert body["max_output_tokens"] is None
-    assert body["store"] == False
+    assert body["max_output_tokens"] == 8
+    assert body["store"] is True
     assert body["service_tier"] == "default"
     assert body["metadata"] == {}
-    assert body["background"] == False
+    assert body["background"] is False
     assert body["safety_identifier"] is None
     assert body["prompt_cache_key"] is None
+    assert body["prompt_cache_retention"] is None
+    assert body["prompt"] is None
+    assert body["conversation"] is None
+    assert body["user"] is None
     assert body["max_tool_calls"] is None
 
 
 def test_responses_stream_schema_fields():
     """Verify streaming done-events have the sequence_number, output_index,
-    and content_index fields added by this PR. Also verify the completed
-    response includes the 24 new schema fields."""
+    and content_index fields and the terminal Response envelope is stable."""
     global server
     server.start()
     res = server.make_stream_request("POST", "/v1/responses", data={
@@ -151,10 +154,17 @@ def test_responses_stream_schema_fields():
     saw_output_text_done = False
     saw_content_part_done = False
     saw_output_item_done = False
+    initial_created_at = None
     completed_response = None
     for data in res:
         assert "sequence_number" in data, f"missing sequence_number in {data.get('type')}"
         seen_seq_nums.append(data["sequence_number"])
+        if data.get("type") == "response.created":
+            initial_created_at = data["response"]["created_at"]
+            assert data["response"]["usage"] is None
+        if data.get("type") == "response.in_progress":
+            assert data["response"]["created_at"] == initial_created_at
+            assert data["response"]["usage"] is None
         if data.get("type") == "response.output_text.done":
             saw_output_text_done = True
             assert "content_index" in data
@@ -177,10 +187,14 @@ def test_responses_stream_schema_fields():
     # sequence_number must be present on done events and monotonically increasing
     assert len(seen_seq_nums) >= 4, f"expected >= 4 sequenced events, got {len(seen_seq_nums)}"
     assert all(a < b for a, b in zip(seen_seq_nums, seen_seq_nums[1:])), "sequence_numbers not strictly increasing"
-    # completed response must have the new schema fields with correct values
+    # The completed response must retain request metadata and lifecycle state.
+    assert initial_created_at is not None
     assert completed_response is not None
+    assert completed_response["created_at"] == initial_created_at
     assert completed_response["metadata"] == {}
-    assert completed_response["store"] == False
+    assert completed_response["store"] is True
+    assert completed_response["temperature"] == 0.8
+    assert completed_response["max_output_tokens"] == 8
     assert completed_response["truncation"] == "disabled"
     assert completed_response["usage"]["output_tokens_details"]["reasoning_tokens"] == 0
 
@@ -439,13 +453,21 @@ def test_responses_stream_created_event_has_full_response():
     })
     created_resp = None
     in_progress_resp = None
+    terminal_resp = None
     for data in res:
         if data.get("type") == "response.created":
             created_resp = data["response"]
         if data.get("type") == "response.in_progress":
             in_progress_resp = data["response"]
+        if data.get("type") in {
+            "response.completed",
+            "response.incomplete",
+            "response.failed",
+        }:
+            terminal_resp = data["response"]
     assert created_resp is not None, "never received response.created"
     assert in_progress_resp is not None, "never received response.in_progress"
+    assert terminal_resp is not None, "never received a terminal response event"
     # Both must have the full response object, not just minimal fields
     for resp in [created_resp, in_progress_resp]:
         assert resp["status"] == "in_progress"
@@ -454,13 +476,15 @@ def test_responses_stream_created_event_has_full_response():
         assert resp["model"] is not None
         assert resp["completed_at"] is None
         assert resp["metadata"] == {}
-        assert resp["store"] == False
+        assert resp["store"] is True
         assert resp["truncation"] == "disabled"
         assert resp["tools"] == []
-        assert resp["usage"]["input_tokens"] == 0
-        assert resp["usage"]["output_tokens"] == 0
+        assert resp["usage"] is None
         assert resp["output"] == []
         assert resp["output_text"] == ""
+    assert in_progress_resp["created_at"] == created_resp["created_at"]
+    assert terminal_resp["created_at"] == created_resp["created_at"]
+    assert terminal_resp["usage"] is not None
 
 
 def test_responses_stream_all_events_have_sequence_number():
