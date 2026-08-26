@@ -8,6 +8,8 @@
 #include "server-generation.h"
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -211,6 +213,9 @@ std::string storage_error_frame(std::uint64_t sequence_number, const std::string
 
 class server_delta_translator {
   public:
+    explicit server_delta_translator(std::unordered_map<std::string, common_json> metadata) :
+        metadata(std::move(metadata)) {}
+
     std::vector<generation_update> consume(const server_generation_update & update) {
         if (std::holds_alternative<server_generation_started>(update)) {
             return { generation_started{} };
@@ -228,28 +233,33 @@ class server_delta_translator {
             return { generation_usage_update{ response_usage_from_server(*usage) } };
         }
         if (const auto * completed = std::get_if<server_generation_completed>(&update)) {
-            return { generation_completed{
-                response_usage_from_server(completed->usage),
-                completed->completed_at,
-            } };
+            return {
+                generation_completed{
+                                     response_usage_from_server(completed->usage),
+                                     completed->completed_at,
+                                     }
+            };
         }
         if (const auto * incomplete = std::get_if<server_generation_incomplete>(&update)) {
-            return { generation_incomplete{
-                response_usage_from_server(incomplete->usage),
-                incomplete->reason,
-            } };
+            return {
+                generation_incomplete{
+                                      response_usage_from_server(incomplete->usage),
+                                      incomplete->reason,
+                                      }
+            };
         }
         if (const auto * failed = std::get_if<server_generation_failed>(&update)) {
             std::optional<response_usage> usage;
             if (failed->usage) {
                 usage = response_usage_from_server(*failed->usage);
             }
-            return { generation_failed{
-                response_error_from_server(failed->error),
-                usage,
-            } };
+            return {
+                generation_failed{
+                                  response_error_from_server(failed->error),
+                                  usage, }
+            };
         }
-        const auto & cancelled = std::get<server_generation_cancelled>(update);
+        const auto &                  cancelled = std::get<server_generation_cancelled>(update);
         std::optional<response_usage> usage;
         if (cancelled.usage) {
             usage = response_usage_from_server(*cancelled.usage);
@@ -272,12 +282,6 @@ class server_delta_translator {
     std::map<std::size_t, tool_decode_state>     tools;
     std::unordered_map<std::string, common_json> metadata;
     std::optional<std::size_t>                   last_tool_index;
-
-    void merge_metadata(const std::unordered_map<std::string, common_json> & additions) {
-        for (const auto & entry : additions) {
-            metadata[entry.first] = entry.second;
-        }
-    }
 
     std::size_t resolve_index(const common_chat_msg_diff & diff) {
         if (diff.tool_call_index != std::string::npos) {
@@ -352,24 +356,36 @@ class server_delta_translator {
         }
     }
 
+    void flush_pending_tools(std::optional<std::size_t> except_index, std::vector<generation_update> & output) {
+        for (auto & entry : tools) {
+            if ((!except_index || entry.first != *except_index) && !entry.second.started &&
+                !entry.second.flattened_name.empty()) {
+                start_tool(entry.first, entry.second, output);
+            }
+        }
+    }
+
     std::vector<generation_update> consume_deltas(const server_generation_message_deltas & message) {
-        merge_metadata(message.tool_metadata);
         std::vector<generation_update> output;
         for (const common_chat_msg_diff & diff : message.deltas) {
+            const bool has_tool = diff.tool_call_index != std::string::npos || !diff.tool_call_delta.name.empty() ||
+                                  !diff.tool_call_delta.id.empty() || !diff.tool_call_delta.arguments.empty();
+            std::optional<std::size_t> index;
+            if (has_tool) {
+                index = resolve_index(diff);
+            }
+            flush_pending_tools(index, output);
             if (!diff.reasoning_content_delta.empty()) {
                 output.emplace_back(generation_reasoning_delta{ diff.reasoning_content_delta });
             }
             if (!diff.content_delta.empty()) {
                 output.emplace_back(generation_text_delta{ diff.content_delta });
             }
-            const bool has_tool = diff.tool_call_index != std::string::npos || !diff.tool_call_delta.name.empty() ||
-                                  !diff.tool_call_delta.id.empty() || !diff.tool_call_delta.arguments.empty();
             if (!has_tool) {
                 continue;
             }
 
-            const std::size_t   index = resolve_index(diff);
-            tool_decode_state & tool  = tools[index];
+            tool_decode_state & tool = tools[*index];
             if (!diff.tool_call_delta.id.empty()) {
                 tool.upstream_call_id = diff.tool_call_delta.id;
             }
@@ -378,26 +394,25 @@ class server_delta_translator {
                     throw std::logic_error("generated tool name changed after its native item was started");
                 }
                 tool.flattened_name = diff.tool_call_delta.name;
-                start_tool(index, tool, output);
             }
             if (diff.tool_call_delta.arguments.empty()) {
                 continue;
             }
+            start_tool(*index, tool, output);
             tool.raw_arguments += diff.tool_call_delta.arguments;
             if (!tool.started) {
                 continue;
             }
             if (tool.kind == generation_tool_kind::custom) {
-                emit_custom_delta(index, tool, false, output);
+                emit_custom_delta(*index, tool, false, output);
             } else {
-                output.emplace_back(generation_tool_call_delta{ index, diff.tool_call_delta.arguments });
+                output.emplace_back(generation_tool_call_delta{ *index, diff.tool_call_delta.arguments });
             }
         }
         return output;
     }
 
     std::vector<generation_update> consume_snapshot(const server_generation_message_snapshot & snapshot) {
-        merge_metadata(snapshot.tool_metadata);
         std::vector<generation_update> output;
 
         // Reconcile text before allocating any tool that appeared only in the
@@ -448,9 +463,14 @@ class server_delta_translator {
 
 class native_server_generation_sink::impl {
   public:
-    impl(generation_response_context context, std::string id_namespace, bool stream, response_store * store) :
+    impl(generation_response_context                  context,
+         std::string                                  id_namespace,
+         bool                                         stream,
+         response_store *                             store,
+         std::unordered_map<std::string, common_json> tool_metadata) :
         ids(std::move(id_namespace)),
         machine(std::move(context), ids),
+        translator(std::move(tool_metadata)),
         stream(stream),
         store(store) {}
 
@@ -471,10 +491,15 @@ class native_server_generation_sink::impl {
             cancellation_requested.store(true);
             discard_persisted_state_unlocked();
             checkpoint_failed = true;
+            terminal_condition.notify_all();
             if (!stream) {
                 throw std::runtime_error(checkpoint_error);
             }
             return storage_error_frame(next_stream_sequence++, checkpoint_error);
+        }
+
+        if (machine.terminal()) {
+            terminal_condition.notify_all();
         }
 
         if (!stream) {
@@ -510,6 +535,12 @@ class native_server_generation_sink::impl {
     bool terminal() const {
         std::lock_guard<std::mutex> lock(mutex);
         return machine.terminal();
+    }
+
+    bool wait_for_terminal(std::uint64_t timeout_ms) const {
+        std::unique_lock<std::mutex> lock(mutex);
+        return terminal_condition.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                                           [this] { return machine.terminal() || checkpoint_failed; });
     }
 
     bool storage_failed() const {
@@ -585,25 +616,29 @@ class native_server_generation_sink::impl {
         persisted_revision = 0;
     }
 
-    counter_generation_id_source  ids;
-    native_response_state_machine machine;
-    server_delta_translator       translator;
-    const bool                    stream;
-    response_store * const        store;
-    mutable std::mutex            mutex;
-    std::atomic_bool              cancellation_requested{ false };
-    std::uint64_t                 persisted_revision = 0;
-    std::optional<response_state> persisted_state;
-    std::uint64_t                 next_stream_sequence = 0;
-    bool                          checkpoint_failed    = false;
-    std::string                   checkpoint_error;
+    counter_generation_id_source    ids;
+    native_response_state_machine   machine;
+    server_delta_translator         translator;
+    const bool                      stream;
+    response_store * const          store;
+    mutable std::mutex              mutex;
+    mutable std::condition_variable terminal_condition;
+    std::atomic_bool                cancellation_requested{ false };
+    std::uint64_t                   persisted_revision = 0;
+    std::optional<response_state>   persisted_state;
+    std::uint64_t                   next_stream_sequence = 0;
+    bool                            checkpoint_failed    = false;
+    std::string                     checkpoint_error;
 };
 
-native_server_generation_sink::native_server_generation_sink(generation_response_context context,
-                                                             std::string                 id_namespace,
-                                                             bool                        stream,
-                                                             response_store *            store) :
-    implementation(std::make_unique<impl>(std::move(context), std::move(id_namespace), stream, store)) {}
+native_server_generation_sink::native_server_generation_sink(
+    generation_response_context                  context,
+    std::string                                  id_namespace,
+    bool                                         stream,
+    response_store *                             store,
+    std::unordered_map<std::string, common_json> tool_metadata) :
+    implementation(
+        std::make_unique<impl>(std::move(context), std::move(id_namespace), stream, store, std::move(tool_metadata))) {}
 
 native_server_generation_sink::~native_server_generation_sink() = default;
 
@@ -621,6 +656,10 @@ bool native_server_generation_sink::cancel_requested() const noexcept {
 
 void native_server_generation_sink::request_cancel() noexcept {
     implementation->cancellation_requested.store(true);
+}
+
+bool native_server_generation_sink::wait_for_terminal(std::uint64_t timeout_ms) const {
+    return implementation->wait_for_terminal(timeout_ms);
 }
 
 response_id native_server_generation_sink::id() const {

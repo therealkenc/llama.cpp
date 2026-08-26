@@ -10,10 +10,13 @@ should reuse the invariants below when that seam is available.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import sqlite3
+import time
 from collections import defaultdict
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -64,6 +67,52 @@ def assert_foreground_terminal(response: Any) -> None:
         assert response.completed_at is None
         assert response.incomplete_details is not None
         assert response.incomplete_details.reason == "max_output_tokens"
+
+
+def test_installed_codex_create_request_fixture_is_current_and_replayable():
+    repo_root = Path(__file__).resolve().parents[4]
+    fixture_path = (
+        repo_root
+        / "tools/llama-responses/tests/fixtures/codex-create-request-0.149.1.json"
+    )
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    request = fixture["request"]
+
+    assert fixture["capture"]["codex_reported_version"] == "0.149.1"
+    assert set(request) == {
+        "client_metadata",
+        "include",
+        "input",
+        "instructions",
+        "model",
+        "parallel_tool_calls",
+        "prompt_cache_key",
+        "reasoning",
+        "store",
+        "stream",
+        "tool_choice",
+        "tools",
+    }
+    assert request["include"] == ["reasoning.encrypted_content"]
+    assert [item["role"] for item in request["input"]] == [
+        "developer",
+        "user",
+        "user",
+    ]
+    assert [tool["type"] for tool in request["tools"]] == [
+        "function",
+        "function",
+        "function",
+        "function",
+        "custom",
+        "function",
+    ]
+
+    prompt_metadata = fixture["normalization"]["instructions"]
+    prompt_path = (fixture_path.parent / prompt_metadata["source"]).resolve()
+    prompt_bytes = prompt_path.read_bytes()
+    assert hashlib.sha256(prompt_bytes).hexdigest() == prompt_metadata["sha256"]
+    assert len(prompt_bytes) == prompt_metadata["utf8_bytes"]
 
 
 def test_codex_model_catalog_route_chain():
@@ -502,10 +551,15 @@ def test_codex_replayed_function_and_custom_tool_outputs_round_trip_through_sdk(
             "conversation",
         ),
         (
-            {"model": "tinyllama-2", "input": "hello", "background": True},
-            "Background responses are not available",
+            {
+                "model": "tinyllama-2",
+                "input": "hello",
+                "background": True,
+                "stream": True,
+            },
+            "Streaming background responses are not available",
             "unsupported_parameter",
-            "background",
+            "stream",
         ),
         (
             {"model": "tinyllama-2", "input": "hello", "instructions": {}},
@@ -893,6 +947,7 @@ def test_nullable_create_defaults_are_normalized_in_the_response():
             "top_logprobs": None,
             "tools": None,
             "tool_choice": None,
+            "parallel_tool_calls": None,
         },
     )
 
@@ -909,6 +964,7 @@ def test_nullable_create_defaults_are_normalized_in_the_response():
     assert response.body["top_logprobs"] == 0
     assert response.body["tools"] == []
     assert response.body["tool_choice"] == "auto"
+    assert response.body["parallel_tool_calls"] is True
 
 
 @pytest.mark.parametrize("text", [{}, {"format": None}, {"verbosity": None}])
@@ -1287,6 +1343,34 @@ def test_stored_response_retrieve_and_delete_via_sdk():
     assert retrieved.id == created.id
     assert retrieved.output == created.output
 
+    projected = client.responses.retrieve(
+        created.id, include=["message.output_text.logprobs"]
+    )
+    output_message = next(item for item in projected.output if item.type == "message")
+    assert output_message.content[0].logprobs == []
+
+    repeated = authenticated_request(
+        "GET",
+        f"/v1/responses/{created.id}"
+        "?include%5B%5D=message.output_text.logprobs"
+        "&include%5B%5D=web_search_call.action.sources",
+    )
+    assert repeated.status_code == 200
+
+    unknown = authenticated_request(
+        "GET", f"/v1/responses/{created.id}?include%5B%5D=unknown.projection"
+    )
+    assert unknown.status_code == 400
+    assert unknown.body["error"]["code"] == "invalid_value"
+    assert unknown.body["error"]["param"] == "include[0]"
+
+    encrypted = authenticated_request(
+        "GET",
+        f"/v1/responses/{created.id}?include%5B%5D=reasoning.encrypted_content",
+    )
+    assert encrypted.status_code == 400
+    assert encrypted.body["error"]["param"] == "include"
+
     assert client.responses.delete(created.id) is None
     with pytest.raises(NotFoundError) as exc_info:
         client.responses.retrieve(created.id)
@@ -1294,7 +1378,8 @@ def test_stored_response_retrieve_and_delete_via_sdk():
     assert exc_info.value.body["param"] == "response_id"
 
 
-def test_sync_store_true_fails_if_the_resource_cannot_be_persisted():
+@pytest.mark.parametrize("background", [False, True])
+def test_store_true_fails_if_the_resource_cannot_be_persisted(background):
     global server
     server.start()
     database_path = os.environ["LLAMA_RESPONSES_DB"]
@@ -1309,6 +1394,7 @@ def test_sync_store_true_fails_if_the_resource_cannot_be_persisted():
                 "input": "This response must be stored atomically.",
                 "max_output_tokens": 16,
                 "store": True,
+                "background": background,
             },
         )
     finally:
@@ -1760,7 +1846,6 @@ def test_unavailable_resource_operations_fail_explicitly():
     requests = [
         ("GET", f"/v1/responses/{created.id}?stream=true"),
         ("GET", f"/v1/responses/{created.id}?starting_after=7"),
-        ("POST", f"/v1/responses/{created.id}/cancel"),
         ("POST", "/v1/responses/compact"),
         ("GET", f"/v1/responses/{created.id}/input_items?include=reasoning"),
     ]
@@ -1770,7 +1855,35 @@ def test_unavailable_resource_operations_fail_explicitly():
         assert response.body["error"]["type"] == "invalid_request_error"
         assert response.body["error"]["code"] == "not_supported"
 
+    completed_cancel = authenticated_request(
+        "POST", f"/v1/responses/{created.id}/cancel"
+    )
+    assert completed_cancel.status_code == 400
+    assert completed_cancel.body["error"]["code"] == "response_not_cancellable"
+
     assert client.responses.delete(created.id) is None
+
+
+def test_background_response_survives_the_create_request_lifetime():
+    client = openai_client()
+    response = client.responses.create(
+        model="tinyllama-2",
+        input="Finish this background response.",
+        max_output_tokens=16,
+        background=True,
+        store=False,
+    )
+
+    assert response.background is True
+    assert response.store is False
+    deadline = time.monotonic() + 10
+    while response.status in {"queued", "in_progress"}:
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+        response = client.responses.retrieve(response.id)
+
+    assert_foreground_terminal(response)
+    assert client.responses.delete(response.id) is None
 
 
 def test_missing_response_resources_share_the_not_found_envelope():

@@ -1,6 +1,6 @@
 #include "common.h"
 #include "download.h"
-#include "ggml.h"
+#include "log.h"
 #include "llama.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
@@ -9,26 +9,12 @@
 
 #include "server-common.h"
 
-#include <algorithm>
-#include <cctype>
-#include <cmath>
-#include <cstdint>
-#include <cstdlib>
-#include <exception>
-#include <fstream>
-#include <ios>
-#include <iterator>
-#include <limits>
-#include <map>
 #include <random>
 #include <sstream>
-#include <stdexcept>
-#include <string>
-#include <string_view>
+#include <fstream>
+#include <limits>
 #include <cstring>
 #include <type_traits>
-#include <utility>
-#include <vector>
 
 json format_error_response(const std::string & message, const enum error_type type) {
     std::string type_str;
@@ -125,9 +111,7 @@ std::string gen_chatcmplid() {
 }
 
 std::string gen_tool_call_id() {
-    // OpenAI uses a call-scoped identifier independently from the output-item
-    // identifier (for example call_* versus fc_* in the Responses API).
-    return "call_" + random_string();
+    return random_string();
 }
 
 const char * get_media_marker() {
@@ -215,13 +199,13 @@ std::vector<size_t> lora_get_enabled_ids(const std::vector<common_adapter_lora_i
 // base64 utils (TODO: use the base64::decode from base64.hpp)
 //
 
-static constexpr std::string_view base64_chars =
+static const std::string base64_chars =
              "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
              "abcdefghijklmnopqrstuvwxyz"
              "0123456789+/";
 
 static inline bool is_base64(uint8_t c) {
-    return std::isalnum(c) || c == '+' || c == '/';
+    return (isalnum(c) || (c == '+') || (c == '/'));
 }
 
 static inline raw_buffer base64_decode(const std::string & encoded_string) {
@@ -805,8 +789,12 @@ server_tokens server_tokens::clone() const {
 
 bool json_is_array_of_numbers(const json & data) {
     if (data.is_array()) {
-        return std::all_of(data.begin(), data.end(),
-                           [](const auto & e) { return e.is_number_integer(); });
+        for (const auto & e : data) {
+            if (!e.is_number_integer()) {
+                return false;
+            }
+        }
+        return true;
     }
     return false;
 }
@@ -828,8 +816,12 @@ bool json_is_array_of_mixed_numbers_strings(const json & data) {
 
 bool json_is_array_and_contains_numbers(const json & data) {
     if (data.is_array()) {
-        return std::any_of(data.begin(), data.end(),
-                           [](const auto & e) { return e.is_number_integer(); });
+        for (const auto & e : data) {
+            if (e.is_number_integer()) {
+                return true;
+            }
+        }
+        return false;
     }
     return false;
 }
@@ -893,9 +885,7 @@ llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt,
 
 size_t validate_utf8(const std::string& text) {
     size_t len = text.size();
-    if (len == 0) {
-        return 0;
-    }
+    if (len == 0) return 0;
 
     // Check the last few bytes to see if a multi-byte character is cut off
     for (size_t i = 1; i <= 4 && i <= len; ++i) {
@@ -904,21 +894,15 @@ size_t validate_utf8(const std::string& text) {
         if ((c & 0xE0) == 0xC0) {
             // 2-byte character start: 110xxxxx
             // Needs at least 2 bytes
-            if (i < 2) {
-                return len - i;
-            }
+            if (i < 2) return len - i;
         } else if ((c & 0xF0) == 0xE0) {
             // 3-byte character start: 1110xxxx
             // Needs at least 3 bytes
-            if (i < 3) {
-                return len - i;
-            }
+            if (i < 3) return len - i;
         } else if ((c & 0xF8) == 0xF0) {
             // 4-byte character start: 11110xxx
             // Needs at least 4 bytes
-            if (i < 4) {
-                return len - i;
-            }
+            if (i < 4) return len - i;
         }
     }
 
@@ -930,7 +914,7 @@ server_tokens process_mtmd_prompt(mtmd_context * mctx, const std::string & promp
     // these will be freed upon going out of scope
     mtmd::bitmaps bitmaps;
     std::vector<mtmd_helper::video_ptr> videos;
-    for (const auto & file : files) {
+    for (auto & file : files) {
         auto out = mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size(), is_placeholder);
         if (!out.bitmap) {
             throw std::runtime_error("Failed to load image or audio file");
@@ -940,6 +924,9 @@ server_tokens process_mtmd_prompt(mtmd_context * mctx, const std::string & promp
             videos.emplace_back(out.video_ctx);
         }
     }
+    // process prompt
+    std::vector<server_tokens> inputs;
+    // multimodal
     mtmd_input_text inp_txt = {
         prompt.data(),
         prompt.size(),
@@ -977,18 +964,15 @@ static server_tokens tokenize_input_subprompt(const llama_vocab * vocab, mtmd_co
         // string or mixed
         llama_tokens tmp = tokenize_mixed(vocab, json_prompt, add_special, parse_special);
         return server_tokens(tmp, false);
-    }
-    if (json_is_array_of_numbers(json_prompt)) {
+    } else if (json_is_array_of_numbers(json_prompt)) {
         // array of tokens
         llama_tokens tmp = json_prompt.get<llama_tokens>();
         return server_tokens(tmp, false);
-    }
-    if (json_prompt.contains(JSON_STRING_PROMPT_KEY)) {
+    } else if (json_prompt.contains(JSON_STRING_PROMPT_KEY)) {
         // JSON object with prompt key.
         if (json_prompt.contains(JSON_MTMD_DATA_KEY)) {
-            if (!has_mtmd) {
+            if (!has_mtmd)
                 throw std::runtime_error("Multimodal data provided, but model does not support multimodal requests.");
-            }
 
             // JSON object with prompt and multimodal key.
             std::vector<raw_buffer> files;
@@ -996,13 +980,14 @@ static server_tokens tokenize_input_subprompt(const llama_vocab * vocab, mtmd_co
                 files.push_back(base64_decode(entry));
             }
             return process_mtmd_prompt(mctx, json_prompt.at(JSON_STRING_PROMPT_KEY), files);
+        } else {
+            // Not multimodal, but contains a subobject.
+            llama_tokens tmp = tokenize_mixed(vocab, json_prompt.at(JSON_STRING_PROMPT_KEY), add_special, parse_special);
+            return server_tokens(tmp, false);
         }
-        // Not multimodal, but contains a subobject.
-        llama_tokens tmp = tokenize_mixed(vocab, json_prompt.at(JSON_STRING_PROMPT_KEY), add_special, parse_special);
-        return server_tokens(tmp, false);
-    }
-    throw std::runtime_error("\"prompt\" elements must be a string, a list of tokens, a JSON object containing a prompt string, or a list of mixed strings & tokens.");
-
+   } else {
+       throw std::runtime_error("\"prompt\" elements must be a string, a list of tokens, a JSON object containing a prompt string, or a list of mixed strings & tokens.");
+   }
 }
 
 std::vector<server_tokens> tokenize_input_prompts(const llama_vocab * vocab, mtmd_context * mctx, const json & json_prompt, bool add_special, bool parse_special) {
@@ -1119,16 +1104,15 @@ static void handle_media(
         std::vector<std::string> parts = string_split<std::string>(url, /*separator*/ ',');
         if (parts.size() != 2) {
             throw std::runtime_error("Invalid uri-encoded base64 value");
-        }
-        if (!string_starts_with(parts[0], "data:image/")) {
+        } else if (!string_starts_with(parts[0], "data:image/")) {
             throw std::runtime_error("Invalid uri format: " + parts[0]);
-        }
-        if (!string_ends_with(parts[0], "base64")) {
+        } else if (!string_ends_with(parts[0], "base64")) {
             throw std::runtime_error("uri must be base64 encoded");
+        } else {
+            auto base64_data = parts[1];
+            auto decoded_data = base64_decode(base64_data);
+            out_files.push_back(decoded_data);
         }
-        const auto & base64_data  = parts[1];
-        auto         decoded_data = base64_decode(base64_data);
-        out_files.push_back(decoded_data);
 
     } else {
         // try as raw base64 string
@@ -1142,10 +1126,9 @@ static void handle_media(
 
 // used by /chat/completions endpoint
 json oaicompat_chat_params_parse(
-    const json & body, /* openai api json semantics */
+    json & body, /* openai api json semantics */
     const server_chat_params & opt,
-    std::vector<raw_buffer> & out_files,
-    bool no_prefill_assistant)
+    std::vector<raw_buffer> & out_files)
 {
     json llama_params;
 
@@ -1196,15 +1179,7 @@ json oaicompat_chat_params_parse(
     if (!body.contains("messages")) {
         throw std::invalid_argument("'messages' is required");
     }
-    // Deep copy of just the messages subtree -- we rewrite image_url /
-    // input_audio content parts in place to `media_marker` after
-    // extracting their bytes into out_files. Keeping that mutation
-    // local (instead of mutating the caller's body) means the parser
-    // is referentially transparent: callers that need to parse the
-    // same body twice (e.g. the Responses bridge, which does a second
-    // pass over a tool_choice-relaxed copy for grammar inference) can
-    // just call this twice with no state to manage.
-    json messages = body.at("messages");
+    json & messages = body.at("messages");
     if (!messages.is_array()) {
         throw std::invalid_argument("Expected 'messages' to be an array");
     }
@@ -1234,23 +1209,12 @@ json oaicompat_chat_params_parse(
             std::string type = json_value(p, "type", std::string());
             if (type == "image_url") {
                 if (!opt.allow_image) {
-                    p["type"] = "text";
-                    p["text"] = "[image input omitted: current model does not support image input]";
-                    p.erase("image_url");
-                    continue;
+                    throw std::runtime_error("image input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
                 }
 
                 json image_url = json_value(p, "image_url", json::object());
-                try {
-                    std::string url = json_value(image_url, "url", std::string());
-                    handle_media(out_files, url, opt.media_path, true);
-                } catch (const std::exception & e) {
-                    SRV_WRN("image input could not be loaded, sending text placeholder instead: %s\n", e.what());
-                    p["type"] = "text";
-                    p["text"] = "[image input omitted: " + std::string(e.what()) + "]";
-                    p.erase("image_url");
-                    continue;
-                }
+                std::string url = json_value(image_url, "url", std::string());
+                handle_media(out_files, url, opt.media_path, true);
 
                 p["type"] = "media_marker";
                 p["text"] = get_media_marker();
@@ -1305,7 +1269,7 @@ json oaicompat_chat_params_parse(
     inputs.continue_final_message = body.contains("continue_final_message") ?
         common_chat_continuation_parse(body.at("continue_final_message")) :
         COMMON_CHAT_CONTINUATION_NONE;
-    if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_NONE && opt.prefill_assistant && !no_prefill_assistant
+    if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_NONE && opt.prefill_assistant
         && !inputs.messages.empty() && inputs.messages.back().role == "assistant") {
         if (inputs.messages.size() >= 2 && inputs.messages[inputs.messages.size() - 2].role == "assistant") {
             throw std::invalid_argument("Cannot have 2 or more assistant messages at the end of the list.");
@@ -1414,12 +1378,6 @@ json oaicompat_chat_params_parse(
     }
 
     // Copy remaining properties to llama_params
-    // Preserve the mutated messages subtree in llama_params (so the
-    // catch-all body-passthrough loop below skips body's pristine
-    // copy). Downstream consumers that read llama_params["messages"]
-    // see the same marker-stamped shape they did before this refactor.
-    llama_params["messages"] = std::move(messages);
-
     // This allows user to use llama.cpp-specific params like "mirostat", ... via OAI endpoint.
     // See "launch_slot_with_task()" for a complete list of params supported by llama.cpp
     for (const auto & item : body.items()) {
@@ -1509,9 +1467,7 @@ json format_response_rerank(
     elements.resize(std::min(top_n, (int)elements.size()));
     json results = elements;
 
-    if (is_tei_format) {
-        return results;
-    }
+    if (is_tei_format) return results;
 
     json res = json{
         {"model", json_value(request, "model", model_name)},
@@ -1551,7 +1507,9 @@ std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int i
     }
 
     // sort tokens by logits (partial: only the leading `n_top` need ordering)
-    n_top = std::min(n_top, cur.size());
+    if (n_top > cur.size()) {
+        n_top = cur.size();
+    }
     if (n_top > 0) {
         std::partial_sort(cur.begin(), cur.begin() + n_top, cur.end(),
             [](const llama_token_data & a, const llama_token_data & b) {
@@ -1597,7 +1555,7 @@ static std::string tokens_to_str(const llama_vocab * ctx, Iter begin, Iter end) 
 }
 
 std::string tokens_to_str(llama_context * ctx, const llama_tokens & tokens) {
-    const auto *model = llama_get_model(ctx);
+    auto model = llama_get_model(ctx);
     return tokens_to_str(llama_model_get_vocab(model), tokens.begin(), tokens.end());
 }
 
@@ -1693,22 +1651,19 @@ bool is_valid_utf8(const std::string & str) {
             bytes++;
         } else if ((*bytes & 0xE0) == 0xC0) {
             // 2-byte sequence (110xxxxx 10xxxxxx)
-            if (end - bytes < 2 || (bytes[1] & 0xC0) != 0x80) {
+            if (end - bytes < 2 || (bytes[1] & 0xC0) != 0x80)
                 return false;
-            }
             bytes += 2;
         } else if ((*bytes & 0xF0) == 0xE0) {
             // 3-byte sequence (1110xxxx 10xxxxxx 10xxxxxx)
-            if (end - bytes < 3 || (bytes[1] & 0xC0) != 0x80 || (bytes[2] & 0xC0) != 0x80) {
+            if (end - bytes < 3 || (bytes[1] & 0xC0) != 0x80 || (bytes[2] & 0xC0) != 0x80)
                 return false;
-            }
             bytes += 3;
         } else if ((*bytes & 0xF8) == 0xF0) {
             // 4-byte sequence (11110xxx 10xxxxxx 10xxxxxx 10xxxxxx)
             if (end - bytes < 4 || (bytes[1] & 0xC0) != 0x80 ||
-                (bytes[2] & 0xC0) != 0x80 || (bytes[3] & 0xC0) != 0x80) {
+                (bytes[2] & 0xC0) != 0x80 || (bytes[3] & 0xC0) != 0x80)
                 return false;
-            }
             bytes += 4;
         } else {
             // Invalid UTF-8 lead byte
@@ -1789,12 +1744,12 @@ llama_tokens format_prompt_infill(
 
     // for now pick FIM context to fit in a batch (ratio prefix:suffix = 3:1, TODO: configurable?)
     const int n_prefix_take = std::min<int>(tokens_prefix.size(),                3*(n_batch/4));
-    const int n_suffix_take = std::min<int>(tokens_suffix.size(), std::max<int>(0, n_batch/4 - (2 + tokens_prompt.size())));
+    const int n_suffix_take = std::min<int>(tokens_suffix.size(), std::max<int>(0, (n_batch/4) - (2 + tokens_prompt.size())));
 
     SRV_DBG("n_prefix_take = %d, n_suffix_take = %d, total = %d\n", n_prefix_take, n_suffix_take, (n_prefix_take + n_suffix_take));
 
     // fill the rest of the context with extra chunks
-    const int n_extra_take = std::min<int>(std::max<int>(0, n_ctx - n_batch - 2*n_predict), extra_tokens.size());
+    const int n_extra_take = std::min<int>(std::max<int>(0, n_ctx - (n_batch) - 2*n_predict), extra_tokens.size());
 
     tokens_prefix.erase(tokens_prefix.begin(), tokens_prefix.begin() + tokens_prefix.size() - n_prefix_take);
     tokens_suffix.resize(n_suffix_take);

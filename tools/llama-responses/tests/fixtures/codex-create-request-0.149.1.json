@@ -1,0 +1,567 @@
+{
+  "capture": {
+    "codex_binary_kind": "standalone",
+    "codex_reported_version": "0.149.1",
+    "date": "2026-08-25",
+    "model_catalog_requests": [
+      "/v1/models?client_version=0.149.1"
+    ],
+    "transport": {
+      "content_encoding": null,
+      "decoded_body_bytes": 32279,
+      "dynamic_or_redacted_headers": [
+        "authorization",
+        "originator",
+        "session-id",
+        "thread-id",
+        "user-agent",
+        "x-client-request-id",
+        "x-codex-beta-features",
+        "x-codex-turn-metadata",
+        "x-codex-window-id"
+      ],
+      "header_names": [
+        "accept",
+        "authorization",
+        "content-length",
+        "content-type",
+        "host",
+        "originator",
+        "session-id",
+        "thread-id",
+        "user-agent",
+        "x-client-request-id",
+        "x-codex-beta-features",
+        "x-codex-turn-metadata",
+        "x-codex-window-id"
+      ],
+      "method": "POST",
+      "path": "/v1/responses",
+      "raw_body_bytes": 32279,
+      "stable_header_values": {
+        "accept": "text/event-stream",
+        "content-type": "application/json"
+      }
+    }
+  },
+  "fixture_schema": "llama.cpp.codex.responses_create_request.v1",
+  "normalization": {
+    "comparison_policy": [
+      "Materialize or replace the instructions placeholder from the referenced prompt before byte-level replay.",
+      "Normalize the listed dynamic JSON pointers before comparing a fresh capture.",
+      "Compare tools and all unlisted request fields exactly.",
+      "Input-text fingerprints are provenance only; generated developer and environment prose may change with Codex."
+    ],
+    "dynamic_fields": [
+      {
+        "characters": 36,
+        "pointer": "/request/client_metadata/root_turn_id",
+        "replacement": "$TURN_ID",
+        "sha256": "bc99bccb6d9e53d859c6071dac1aefda562f709cef553dd69cd328f6dbc447d9",
+        "utf8_bytes": 36
+      },
+      {
+        "characters": 36,
+        "pointer": "/request/client_metadata/session_id",
+        "replacement": "$SESSION_ID",
+        "sha256": "188eb3543e4d73216989c0f3ced8057952f62b396a93d90e8858d7b5afc933be",
+        "utf8_bytes": 36
+      },
+      {
+        "characters": 36,
+        "pointer": "/request/client_metadata/thread_id",
+        "replacement": "$SESSION_ID",
+        "sha256": "188eb3543e4d73216989c0f3ced8057952f62b396a93d90e8858d7b5afc933be",
+        "utf8_bytes": 36
+      },
+      {
+        "characters": 36,
+        "pointer": "/request/client_metadata/turn_id",
+        "replacement": "$TURN_ID",
+        "sha256": "bc99bccb6d9e53d859c6071dac1aefda562f709cef553dd69cd328f6dbc447d9",
+        "utf8_bytes": 36
+      },
+      {
+        "characters": 36,
+        "pointer": "/request/client_metadata/x-codex-installation-id",
+        "replacement": "$INSTALLATION_ID",
+        "sha256": "33563be802a2578747f2128d491c40ce8c8d5821302c94e6be90334707c2f067",
+        "utf8_bytes": 36
+      },
+      {
+        "characters": 564,
+        "json_shape": {
+          "properties": {
+            "agent_name": {
+              "type": "string"
+            },
+            "auto_review_enabled": {
+              "type": "boolean"
+            },
+            "installation_id": {
+              "type": "string"
+            },
+            "node_repl_auto_review_required": {
+              "type": "boolean"
+            },
+            "node_repl_disabled": {
+              "type": "boolean"
+            },
+            "request_kind": {
+              "type": "string"
+            },
+            "root_turn_id": {
+              "type": "string"
+            },
+            "sandbox": {
+              "type": "string"
+            },
+            "sandbox_mode": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "thread_id": {
+              "type": "string"
+            },
+            "thread_source": {
+              "type": "string"
+            },
+            "turn_id": {
+              "type": "string"
+            },
+            "turn_started_at_unix_ms": {
+              "type": "integer"
+            },
+            "window_id": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "pointer": "/request/client_metadata/x-codex-turn-metadata",
+        "replacement": "$CODEX_TURN_METADATA",
+        "sha256": "a2fe758742b5131cb74943418e7e189868da2570aea276d91721b7dea5e0eed3",
+        "utf8_bytes": 564
+      },
+      {
+        "characters": 38,
+        "pointer": "/request/client_metadata/x-codex-window-id",
+        "replacement": "$WINDOW_ID",
+        "sha256": "9b9be027314c62dbb3b86536130ec12303b5964192e6d81b9e523cec85aced97",
+        "utf8_bytes": 38
+      },
+      {
+        "characters": 36,
+        "pointer": "/request/prompt_cache_key",
+        "relation": "same captured value as client_metadata.session_id and client_metadata.thread_id",
+        "replacement": "$SESSION_ID",
+        "sha256": "188eb3543e4d73216989c0f3ced8057952f62b396a93d90e8858d7b5afc933be",
+        "utf8_bytes": 36
+      },
+      {
+        "characters": 40,
+        "pointer": "/request/input/0/id",
+        "replacement": "msg_fixture_0",
+        "sha256": "0aacb32fcf6797c29f101e797a77db9644f88223acd02930cc76dec08e34f8b2",
+        "utf8_bytes": 40
+      },
+      {
+        "characters": 40,
+        "pointer": "/request/input/1/id",
+        "replacement": "msg_fixture_1",
+        "sha256": "5301cc069e3db55256e4bb25777640f5715ac1aab9e476d900d5846f88fa866f",
+        "utf8_bytes": 40
+      },
+      {
+        "characters": 40,
+        "pointer": "/request/input/2/id",
+        "replacement": "msg_fixture_2",
+        "sha256": "ab5bf280a09a41809b1bf5ad142fba534ca13c23c1b401d79f5279527025ff87",
+        "utf8_bytes": 40
+      }
+    ],
+    "input_text_fields": [
+      {
+        "characters": 2874,
+        "pointer": "/request/input/0/content/0/text",
+        "replacement": "$INPUT_TEXT_0_0",
+        "role": "developer",
+        "sha256": "0195ab8b2776c0ae4f15dcd96d3fd649f6a8e4db9eb81b07591f1742d7ee71ae",
+        "utf8_bytes": 2878
+      },
+      {
+        "characters": 341,
+        "pointer": "/request/input/0/content/1/text",
+        "replacement": "$INPUT_TEXT_0_1",
+        "role": "developer",
+        "sha256": "29dad5ed6993c5e717376e0a1c84d54ab60ee593510916ac6cee4295e803315d",
+        "utf8_bytes": 341
+      },
+      {
+        "characters": 443,
+        "pointer": "/request/input/1/content/0/text",
+        "replacement": "$INPUT_TEXT_1_0",
+        "role": "user",
+        "sha256": "c4f1823b3a9bb618ba124c717965a392e5136ee5784c2de78576e2377dabfb22",
+        "utf8_bytes": 443
+      }
+    ],
+    "instructions": {
+      "characters": 20751,
+      "request_placeholder": "$CODEX_BASE_INSTRUCTIONS",
+      "sha256": "ac8ae107a0d72fe3476b430afb161ea4e67da2e446d778aefc44828160559807",
+      "source": "../../prompts/codex-base-instructions.md",
+      "utf8_bytes": 20903
+    },
+    "turn_metadata_json_shape": {
+      "properties": {
+        "agent_name": {
+          "type": "string"
+        },
+        "auto_review_enabled": {
+          "type": "boolean"
+        },
+        "installation_id": {
+          "type": "string"
+        },
+        "node_repl_auto_review_required": {
+          "type": "boolean"
+        },
+        "node_repl_disabled": {
+          "type": "boolean"
+        },
+        "request_kind": {
+          "type": "string"
+        },
+        "root_turn_id": {
+          "type": "string"
+        },
+        "sandbox": {
+          "type": "string"
+        },
+        "sandbox_mode": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "thread_source": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": "string"
+        },
+        "turn_started_at_unix_ms": {
+          "type": "integer"
+        },
+        "window_id": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "request": {
+    "client_metadata": {
+      "root_turn_id": "$TURN_ID",
+      "session_id": "$SESSION_ID",
+      "thread_id": "$SESSION_ID",
+      "turn_id": "$TURN_ID",
+      "x-codex-installation-id": "$INSTALLATION_ID",
+      "x-codex-turn-metadata": "$CODEX_TURN_METADATA",
+      "x-codex-window-id": "$WINDOW_ID"
+    },
+    "include": [
+      "reasoning.encrypted_content"
+    ],
+    "input": [
+      {
+        "content": [
+          {
+            "text": "$INPUT_TEXT_0_0",
+            "type": "input_text"
+          },
+          {
+            "text": "$INPUT_TEXT_0_1",
+            "type": "input_text"
+          }
+        ],
+        "id": "msg_fixture_0",
+        "role": "developer",
+        "type": "message"
+      },
+      {
+        "content": [
+          {
+            "text": "$INPUT_TEXT_1_0",
+            "type": "input_text"
+          }
+        ],
+        "id": "msg_fixture_1",
+        "role": "user",
+        "type": "message"
+      },
+      {
+        "content": [
+          {
+            "text": "Reply with exactly CAPTURE_OK and do not call tools.",
+            "type": "input_text"
+          }
+        ],
+        "id": "msg_fixture_2",
+        "role": "user",
+        "type": "message"
+      }
+    ],
+    "instructions": "$CODEX_BASE_INSTRUCTIONS",
+    "model": "capture-model",
+    "parallel_tool_calls": true,
+    "prompt_cache_key": "$SESSION_ID",
+    "reasoning": {
+      "effort": "low"
+    },
+    "store": false,
+    "stream": true,
+    "tool_choice": "auto",
+    "tools": [
+      {
+        "description": "Runs a command in a PTY, returning output or a session ID for ongoing interaction.",
+        "name": "exec_command",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "cmd": {
+              "description": "Shell command to execute.",
+              "type": "string"
+            },
+            "justification": {
+              "description": "User-facing approval question for `require_escalated`; omit otherwise.",
+              "type": "string"
+            },
+            "login": {
+              "description": "True runs the shell with -l/-i semantics; false disables them. Defaults to true.",
+              "type": "boolean"
+            },
+            "max_output_tokens": {
+              "description": "Output token budget. Defaults to 10000 tokens; larger requests may be capped by policy.",
+              "type": "number"
+            },
+            "prefix_rule": {
+              "description": "Reusable approval prefix for `cmd`, only with `sandbox_permissions: \"require_escalated\"`; for example [\"git\", \"pull\"].",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "sandbox_permissions": {
+              "description": "Per-command sandbox override. Defaults to `use_default`; use `require_escalated` for unsandboxed execution.",
+              "enum": [
+                "use_default",
+                "require_escalated"
+              ],
+              "type": "string"
+            },
+            "shell": {
+              "description": "Shell binary to launch. Defaults to the user's default shell.",
+              "type": "string"
+            },
+            "tty": {
+              "description": "True allocates a PTY for the command; false or omitted uses plain pipes.",
+              "type": "boolean"
+            },
+            "workdir": {
+              "description": "Working directory for the command. Defaults to the turn cwd.",
+              "type": "string"
+            },
+            "yield_time_ms": {
+              "description": "Wait before yielding output. Defaults to 10000 ms; effective range is 250-30000 ms.",
+              "type": "number"
+            }
+          },
+          "required": [
+            "cmd"
+          ],
+          "type": "object"
+        },
+        "strict": false,
+        "type": "function"
+      },
+      {
+        "description": "Writes characters to an existing unified exec session and returns recent output.",
+        "name": "write_stdin",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "chars": {
+              "description": "Bytes to write to stdin. Defaults to empty, which polls without writing.",
+              "type": "string"
+            },
+            "max_output_tokens": {
+              "description": "Output token budget. Defaults to 10000 tokens; larger requests may be capped by policy.",
+              "type": "number"
+            },
+            "session_id": {
+              "description": "Identifier of the running unified exec session.",
+              "type": "number"
+            },
+            "yield_time_ms": {
+              "description": "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms; empty polls wait 5000-300000 ms by default.",
+              "type": "number"
+            }
+          },
+          "required": [
+            "session_id"
+          ],
+          "type": "object"
+        },
+        "strict": false,
+        "type": "function"
+      },
+      {
+        "description": "Updates the task plan.\nProvide an optional explanation and a list of plan items, each with a step and status.\nAt most one step can be in_progress at a time.\n",
+        "name": "update_plan",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "explanation": {
+              "description": "Optional explanation for this plan update.",
+              "type": "string"
+            },
+            "plan": {
+              "description": "The list of steps",
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "status": {
+                    "description": "Step status.",
+                    "enum": [
+                      "pending",
+                      "in_progress",
+                      "completed"
+                    ],
+                    "type": "string"
+                  },
+                  "step": {
+                    "description": "Task step text.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "step",
+                  "status"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "plan"
+          ],
+          "type": "object"
+        },
+        "strict": false,
+        "type": "function"
+      },
+      {
+        "description": "Request user input for one to three short questions and wait for the response. This tool is only available in Plan mode.",
+        "name": "request_user_input",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "questions": {
+              "description": "Questions to show the user. Prefer 1 and do not exceed 3",
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "header": {
+                    "description": "Short header label shown in the UI (12 or fewer chars).",
+                    "type": "string"
+                  },
+                  "id": {
+                    "description": "Stable identifier for mapping answers (snake_case).",
+                    "type": "string"
+                  },
+                  "options": {
+                    "description": "Provide 2-3 mutually exclusive choices. Put the recommended option first and suffix its label with \"(Recommended)\". Do not include an \"Other\" option in this list; the client will add a free-form \"Other\" option automatically.",
+                    "items": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "description": {
+                          "description": "One short sentence explaining impact/tradeoff if selected.",
+                          "type": "string"
+                        },
+                        "label": {
+                          "description": "User-facing label (1-5 words).",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "label",
+                        "description"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "question": {
+                    "description": "Single-sentence prompt shown to the user.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "header",
+                  "question",
+                  "options"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "questions"
+          ],
+          "type": "object"
+        },
+        "strict": false,
+        "type": "function"
+      },
+      {
+        "description": "The `apply_patch` tool can be used to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.",
+        "format": {
+          "definition": "start: begin_patch hunk+ end_patch\nbegin_patch: \"*** Begin Patch\" LF\nend_patch: \"*** End Patch\" LF?\n\nhunk: add_hunk | delete_hunk | update_hunk\nadd_hunk: \"*** Add File: \" filename LF add_line+\ndelete_hunk: \"*** Delete File: \" filename LF\nupdate_hunk: \"*** Update File: \" filename LF change_move? change?\n\nfilename: /(.+)/\nadd_line: \"+\" /(.*)/ LF -> line\n\nchange_move: \"*** Move to: \" filename LF\nchange: (change_context | change_line)+ eof_line?\nchange_context: (\"@@\" | \"@@ \" /(.+)/) LF\nchange_line: (\"+\" | \"-\" | \" \") /(.*)/ LF\neof_line: \"*** End of File\" LF\n\n%import common.LF\n",
+          "syntax": "lark",
+          "type": "grammar"
+        },
+        "name": "apply_patch",
+        "type": "custom"
+      },
+      {
+        "description": "View a local image file from the filesystem when visual inspection is needed. Use this for images already available on disk.",
+        "name": "view_image",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "description": "Local filesystem path to an image file.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "type": "object"
+        },
+        "strict": false,
+        "type": "function"
+      }
+    ]
+  }
+}

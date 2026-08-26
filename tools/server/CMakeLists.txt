@@ -17,13 +17,12 @@ add_library(${TARGET} STATIC
     server-context.h
     server-generation.cpp
     server-generation.h
+    server-generation-internal.h
     server-responses.h
     server-stream.cpp
     server-stream.h
     server-tools.cpp
     server-tools.h
-    responses_item_cache.cpp
-    responses_item_cache.h
     server-mcp.cpp
     server-mcp.h
     server-schema.cpp

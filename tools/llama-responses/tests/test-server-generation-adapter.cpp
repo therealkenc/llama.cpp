@@ -40,18 +40,18 @@ generation_response_context fixture_context(const std::string & suffix) {
         { "input", "fixture"     },
         { "store", true          },
     };
-    context.input_items = common_json::array({
+    context.input_items              = common_json::array({
         {
-            { "id",      "msg_input_" + suffix },
-            { "type",    "message"             },
-            { "role",    "user"                },
-            { "content", common_json::array({
+         { "id", "msg_input_" + suffix },
+         { "type", "message" },
+         { "role", "user" },
+         { "content", common_json::array({
                              {
                                  { "type", "input_text" },
-                                 { "text", "fixture"    },
+                                 { "text", "fixture" },
                              },
                          }) },
-        },
+         },
     });
     context.continuation_input_items = context.input_items;
     return context;
@@ -96,12 +96,14 @@ void test_text_reasoning_reconciliation_and_persistence() {
     reasoning.reasoning_content_delta = "inspect";
     common_chat_msg_diff text;
     text.content_delta = "answer<STOP";
-    stream += sink.accept(server_generation_message_deltas{ { reasoning, text }, {} });
+    stream += sink.accept(server_generation_message_deltas{
+        { reasoning, text }
+    });
 
     common_chat_msg final_message;
     final_message.reasoning_content = "inspect";
     final_message.content           = "answer";
-    stream += sink.accept(server_generation_message_snapshot{ final_message, {} });
+    stream += sink.accept(server_generation_message_snapshot{ final_message });
     stream += sink.accept(server_generation_completed{ fixture_usage(), 101 });
 
     CHECK(sink.terminal());
@@ -143,47 +145,40 @@ common_chat_msg_diff tool_diff(std::size_t         index,
 }
 
 void test_interleaved_namespace_custom_and_local_shell_tools() {
-    native_server_generation_sink sink(fixture_context("tools"), "adapter_tools", true);
-
     const std::unordered_map<std::string, common_json> metadata = {
         {
-            "flat_patch",
-            {
-                { "type",      "custom"       },
-                { "name",      "apply_patch"  },
+         "flat_patch",  {
+                { "type", "custom" },
+                { "name", "apply_patch" },
                 { "namespace", "mcp__editing" },
-            },
-        },
+            }, },
         {
-            "flat_lookup",
-            {
-                { "type",      "function"      },
-                { "name",      "lookup"        },
+         "flat_lookup",            {
+                { "type", "function" },
+                { "name", "lookup" },
                 { "namespace", "mcp__calendar" },
-            },
-        },
+            }, },
         {
-            "local_shell",
-            {
+         "local_shell", {
                 { "type", "local_shell" },
                 { "name", "local_shell" },
-            },
-        },
+            }, },
     };
+    native_server_generation_sink sink(fixture_context("tools"), "adapter_tools", true, nullptr, metadata);
 
     std::string stream = sink.accept(server_generation_started{});
     stream += sink.accept(server_generation_message_deltas{
         {
-            tool_diff(1, "flat_patch", "patch_id", R"({"input":"*** Begin Patch\n@@ -1,1 +1,1 @@ context\n)"),
-            tool_diff(0, "flat_lookup", "lookup_id", R"({"date":)"),
-        },
-        metadata,
+         tool_diff(1, "flat_patch", "patch_id", R"({"input":"*** Begin Patch\n@@ -1,1 +1,1 @@ context\n)"),
+         tool_diff(0, "flat_lookup", "lookup_id", R"({"date":)"),
+         },
     });
     common_chat_msg_diff patch_tail  = tool_diff(1, "", "", R"(*** End Patch"})");
     common_chat_msg_diff lookup_tail = tool_diff(0, "", "", R"("today"})");
-    common_chat_msg_diff shell =
-        tool_diff(2, "local_shell", "shell_id", R"({"command":"pwd","timeout_ms":1000})");
-    stream += sink.accept(server_generation_message_deltas{ { lookup_tail, patch_tail, shell }, metadata });
+    common_chat_msg_diff shell = tool_diff(2, "local_shell", "shell_id", R"({"command":"pwd","timeout_ms":1000})");
+    stream += sink.accept(server_generation_message_deltas{
+        { lookup_tail, patch_tail, shell }
+    });
 
     common_chat_msg final_message;
     final_message.tool_calls = {
@@ -191,7 +186,7 @@ void test_interleaved_namespace_custom_and_local_shell_tools() {
         { "flat_patch",  R"({"input":"*** Begin Patch\n@@ -1,1 +1,1 @@ context\n*** End Patch"})", "patch_id"  },
         { "local_shell", R"({"command":"pwd","timeout_ms":1000})",                                 "shell_id"  },
     };
-    stream += sink.accept(server_generation_message_snapshot{ final_message, metadata });
+    stream += sink.accept(server_generation_message_snapshot{ final_message });
     stream += sink.accept(server_generation_completed{ fixture_usage(), 101 });
 
     const common_json snapshot = sink.snapshot();
@@ -218,6 +213,35 @@ void test_interleaved_namespace_custom_and_local_shell_tools() {
     CHECK(events_named(events, "response.custom_tool_call_input.delta").size() == 1);
     CHECK(events_named(events, "response.function_call_arguments.delta").size() == 2);
     CHECK(events.back().at("response") == snapshot);
+}
+
+void test_partial_tool_name_is_buffered_until_arguments() {
+    const std::unordered_map<std::string, common_json> metadata = {
+        {
+         "web_search", {
+                { "type", "function" },
+                { "name", "web_search" },
+            }, },
+    };
+    native_server_generation_sink sink(fixture_context("partial_name"), "adapter_partial_name", true, nullptr,
+                                       metadata);
+
+    std::string stream = sink.accept(server_generation_started{});
+    stream += sink.accept(server_generation_message_deltas{ { tool_diff(0, "web", "tool_id", "") } });
+    stream += sink.accept(server_generation_message_deltas{ { tool_diff(0, "web_search", "", "") } });
+    stream += sink.accept(server_generation_message_deltas{ { tool_diff(0, "", "", "{}") } });
+
+    common_chat_msg final_message;
+    final_message.tool_calls = {
+        { "web_search", "{}", "tool_id" }
+    };
+    stream += sink.accept(server_generation_message_snapshot{ final_message });
+    stream += sink.accept(server_generation_completed{ fixture_usage(), 101 });
+
+    const common_json snapshot = sink.snapshot();
+    CHECK(snapshot.at("output").size() == 1);
+    CHECK(snapshot.at("output").at(0).at("name") == "web_search");
+    CHECK(events_named(parse_sse(stream), "response.output_item.added").size() == 1);
 }
 
 class failing_store final : public response_store {
@@ -259,7 +283,7 @@ void test_lineage_detachment_revision_is_reconciled() {
 
     native_server_generation_sink parent(fixture_context("detach_parent"), "adapter_detach_parent", false, &store);
     parent.accept(server_generation_started{});
-    parent.accept(server_generation_message_snapshot{ common_chat_msg{}, {} });
+    parent.accept(server_generation_message_snapshot{ common_chat_msg{} });
     parent.accept(server_generation_completed{ fixture_usage(), 101 });
 
     generation_response_context child_context = fixture_context("detach_child");
@@ -275,7 +299,7 @@ void test_lineage_detachment_revision_is_reconciled() {
 
     common_chat_msg_diff text;
     text.content_delta       = "still streaming";
-    const std::string stream = child.accept(server_generation_message_deltas{ { text }, {} });
+    const std::string stream = child.accept(server_generation_message_deltas{ { text } });
     CHECK(stream.find("response_store_error") == std::string::npos);
     CHECK(!child.storage_failed());
 
@@ -290,6 +314,7 @@ void test_lineage_detachment_revision_is_reconciled() {
 int main() try {
     test_text_reasoning_reconciliation_and_persistence();
     test_interleaved_namespace_custom_and_local_shell_tools();
+    test_partial_tool_name_is_buffered_until_arguments();
     test_checkpoint_failure_and_cancellation_contract();
     test_lineage_detachment_revision_is_reconciled();
     if (failures != 0) {

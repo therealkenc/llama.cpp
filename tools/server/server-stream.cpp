@@ -1,32 +1,19 @@
-#include "ggml.h"
 #include "server-stream.h"
 #include "server-common.h"
 #include "server-http.h"
+#include "server-queue.h"
 
-#include <atomic>
 #include <chrono>
-#include <condition_variable>
-#include <cstddef>
-#include <cstdint>
-#include <exception>
-#include <functional>
-#include <map>
 #include <memory>
-#include <mutex>
-#include <shared_mutex>
-#include <string>
-#include <thread>
-#include <unordered_map>
 #include <utility>
-#include <vector>
-
-namespace {
+#include <shared_mutex>
 
 enum class stream_read_status {
     OK,
     OFFSET_LOST,
 };
 
+namespace {
 constexpr int64_t STREAM_SESSION_TTL_SECONDS         = 300;
 constexpr size_t  STREAM_SESSION_MAX_BYTES           = 4 * 1024 * 1024;
 constexpr int64_t STREAM_SESSION_GC_INTERVAL_SECONDS = 60;
@@ -37,6 +24,8 @@ int64_t now_seconds() {
         std::chrono::system_clock::now().time_since_epoch()
     ).count();
 }
+}
+
 // owns all live sessions keyed by conversation_id, one conv = at most one live session.
 // a periodic GC evicts expired ones
 class stream_session_manager {
@@ -72,21 +61,15 @@ private:
     std::condition_variable                             gc_wake_cv;
 };
 
-// A function-local instance can report construction failures to the caller;
-// a namespace-scope instance would terminate before main() could handle them.
-stream_session_manager & stream_sessions() {
-    static stream_session_manager sessions;
-    return sessions;
-}
-
-}  // namespace
+// process wide manager, lifecycle controlled by llama-server main() via start_gc/stop_gc
+static stream_session_manager g_stream_sessions;
 
 void server_stream_session_manager_start() {
-    stream_sessions().start_gc();
+    g_stream_sessions.start_gc();
 }
 
 void server_stream_session_manager_stop() {
-    stream_sessions().stop_gc();
+    g_stream_sessions.stop_gc();
 }
 
 struct stream_session {
@@ -241,8 +224,6 @@ bool stream_session::is_cancelled() const {
     return cancelled.load(std::memory_order_acquire);
 }
 
-namespace {
-
 stream_session_manager::stream_session_manager()
     : running(false) {
 }
@@ -286,7 +267,7 @@ std::vector<stream_session_ptr> stream_session_manager::list_all() const {
     std::vector<stream_session_ptr> out;
     std::shared_lock<std::shared_mutex> lock(map_mu);
     out.reserve(sessions.size());
-    for (const auto & kv : sessions) {
+    for (auto & kv : sessions) {
         out.push_back(kv.second);
     }
     return out;
@@ -315,9 +296,7 @@ void stream_session_manager::evict_and_cancel(const std::string & conversation_i
         if (it == sessions.end()) {
             std::string live;
             for (const auto & kv : sessions) {
-                if (!live.empty()) {
-                    live += ", ";
-                }
+                if (!live.empty()) live += ", ";
                 live += kv.first;
             }
             SRV_WRN("stop on unknown stream session, conv_id=%s matched nothing, %zu live: [%s]\n",
@@ -406,13 +385,9 @@ void stream_session_manager::gc_loop() {
     }
 }
 
-}  // namespace
-
 // stream_pipe
 
 // consumer end: read-only replay of the ring buffer, the destructor does not finalize the session
-namespace {
-
 struct stream_pipe_consumer : stream_pipe {
     stream_read_status read(size_t & offset,
         const std::function<bool(const char *, size_t)> & sink,
@@ -423,8 +398,6 @@ struct stream_pipe_consumer : stream_pipe {
 private:
     explicit stream_pipe_consumer(stream_session_ptr session);
 };
-
-}  // namespace
 
 stream_pipe::stream_pipe(stream_session_ptr session)
     : session_(std::move(session)) {
@@ -454,8 +427,6 @@ stream_pipe_producer * stream_pipe_producer::create(stream_session_ptr session) 
 
 // stream_pipe_consumer
 
-namespace {
-
 stream_pipe_consumer::stream_pipe_consumer(stream_session_ptr session)
     : stream_pipe(std::move(session)) {
 }
@@ -469,8 +440,6 @@ stream_read_status stream_pipe_consumer::read(size_t & offset,
 std::shared_ptr<stream_pipe_consumer> stream_pipe_consumer::create(stream_session_ptr session) {
     return std::shared_ptr<stream_pipe_consumer>(new stream_pipe_consumer(std::move(session)));
 }
-
-}  // namespace
 
 // helper, builds the standard error response and assigns it to a brand new http_res
 static server_http_res_ptr make_error_response(int status, const std::string & message, error_type type) {
@@ -490,7 +459,7 @@ server_http_context::handler_t server_stream_make_get_handler() {
         if (conv_id.empty()) {
             return make_error_response(400, "Missing conversation id in path", ERROR_TYPE_INVALID_REQUEST);
         }
-        auto session = stream_sessions().get(conv_id);
+        auto session = g_stream_sessions.get(conv_id);
         if (!session) {
             return make_error_response(404, "Stream not found or expired", ERROR_TYPE_NOT_FOUND);
         }
@@ -559,7 +528,7 @@ server_http_context::handler_t server_stream_make_lookup_handler() {
 
         std::vector<stream_session_ptr> sessions;
         if (!requested.empty()) {
-            auto all = stream_sessions().list_all();
+            auto all = g_stream_sessions.list_all();
             for (const auto & rid : requested) {
                 const std::string with_sep = rid + "::";
                 for (auto & s : all) {
@@ -598,7 +567,7 @@ server_http_context::handler_t server_stream_make_delete_handler() {
             return make_error_response(400, "Missing conversation id in path", ERROR_TYPE_INVALID_REQUEST);
         }
         SRV_TRC("DELETE /v1/stream conv_id=%s -> evict_and_cancel\n", conv_id.c_str());
-        stream_sessions().evict_and_cancel(conv_id);
+        g_stream_sessions.evict_and_cancel(conv_id);
         auto res = std::make_unique<server_http_res>();
         res->status = 204;
         res->content_type = "application/json";
@@ -611,19 +580,12 @@ std::string server_stream_conv_id_from_headers(const std::map<std::string, std::
     static constexpr char   target[]   = "x-conversation-id";
     static constexpr size_t target_len = sizeof(target) - 1;
     for (const auto & [hk, hv] : headers) {
-        if (hk.size() != target_len) {
-            continue;
-        }
+        if (hk.size() != target_len) continue;
         bool match = true;
         for (size_t i = 0; i < target_len; ++i) {
             char c = hk[i];
-            if (c >= 'A' && c <= 'Z') {
-                c = char(c + 32);
-            }
-            if (c != target[i]) {
-                match = false;
-                break;
-            }
+            if (c >= 'A' && c <= 'Z') c = char(c + 32);
+            if (c != target[i]) { match = false; break; }
         }
         if (match) {
             return hv;
@@ -638,7 +600,7 @@ static stream_pipe_producer * server_stream_create_spipe(const std::map<std::str
     if (conversation_id.empty()) {
         return nullptr;
     }
-    auto session = stream_sessions().create_or_replace(conversation_id);
+    auto session = g_stream_sessions.create_or_replace(conversation_id);
     return stream_pipe_producer::create(session);
 }
 
@@ -661,8 +623,9 @@ bool server_res_spipe::should_stop() {
     if (spipe) {
         // note: if DELETE /v1/stream is called for this conv, is_cancelled() will be true
         return spipe->is_cancelled();
+    } else {
+        return !conn_alive();
     }
-    return !conn_alive();
 }
 
 void server_res_spipe::on_complete() {
@@ -673,29 +636,30 @@ void server_res_spipe::on_complete() {
     // started, typically a params validation throw. evict the session installed by set_req()
     // so the failed request leaves nothing behind for discovery or replay
     if (!next_orig) {
-        stream_sessions().evict(server_stream_conv_id_from_headers(req->headers));
+        g_stream_sessions.evict(server_stream_conv_id_from_headers(req->headers));
         return;
     }
     std::string chunk;
     while (!spipe->is_cancelled()) {
         chunk.clear();
-        const bool has_next = next_chunk(chunk);
+        bool has_next = next_orig(chunk);
+        if (!chunk.empty()) {
+            spipe->write(chunk.data(), chunk.size());
+        }
         if (!has_next) {
             break;
         }
     }
 }
 
-void server_res_spipe::on_filtered_chunk(const std::string & chunk) {
-    if (spipe && !chunk.empty()) {
-        spipe->write(chunk.data(), chunk.size());
-    }
-}
-
 void server_res_spipe::set_next(std::function<bool(std::string &)> next_fn) {
     next_orig = std::move(next_fn);
     next = [this](std::string & out) {
-        const bool has_next = next_orig(out);
+        bool has_next = next_orig(out);
+        if (spipe) {
+            // if spipe is set, tee-style pipe input to both HTTP and spipe
+            spipe->write(out.data(), out.size());
+        }
         if (!has_next) {
             next_finished = true;
         }

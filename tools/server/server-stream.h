@@ -70,8 +70,6 @@ private:
     // set once next_orig reports no more data, so on_complete() doesn't re-drain a finished stream
     bool next_finished = false;
 
-    void on_filtered_chunk(const std::string & chunk) override;
-
 public:
     void set_req(const server_http_req * req);
     bool conn_alive();

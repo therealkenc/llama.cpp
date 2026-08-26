@@ -6,9 +6,9 @@
 
 #include <functional>
 
-// Optional, statically linked decorators around stable llama-server route
-// seams. Each decorator receives the fully configured next handler and must
-// delegate requests outside its compatibility contract unchanged.
+// Optional, statically linked extensions around stable llama-server seams.
+// HTTP decorators receive the fully configured next handler and delegate
+// requests outside their compatibility contract unchanged.
 using server_http_handler_decorator =
     std::function<server_http_context::handler_t(server_http_context::handler_t next_handler)>;
 

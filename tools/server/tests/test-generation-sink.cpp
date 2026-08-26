@@ -1,11 +1,17 @@
 #include "chat.h"
+#include "json.h"
 #include "server-common.h"
+#include "server-generation-internal.h"
 #include "server-generation.h"
+#include "server-queue.h"
 #include "server-task.h"
 
+#include <chrono>
 #include <exception>
 #include <iostream>
+#include <memory>
 #include <string>
+#include <thread>
 #include <variant>
 #include <vector>
 
@@ -40,10 +46,6 @@ void test_partial_mapping() {
     tool.tool_call_delta.name = "apply_patch";
     tool.tool_call_delta.id   = "call_model";
     partial.oaicompat_msg_diffs.push_back(tool);
-    partial.responses_tool_metadata.emplace("apply_patch", common_json{
-                                                               { "type", "custom" },
-    });
-
     updates = server_generation_updates_from_result(partial, false);
     CHECK(updates.size() == 2);
     CHECK(std::holds_alternative<server_generation_progress>(updates.at(0)));
@@ -52,7 +54,6 @@ void test_partial_mapping() {
     CHECK(deltas.deltas.size() == 2);
     CHECK(deltas.deltas.at(0).reasoning_content_delta == "think");
     CHECK(deltas.deltas.at(1).tool_call_index == 1);
-    CHECK(deltas.tool_metadata.at("apply_patch").at("type") == "custom");
 }
 
 void test_final_mapping() {
@@ -137,6 +138,51 @@ void test_sink_contract_keeps_projection_opaque() {
     CHECK(sink.snapshot().at("updates") == 2);
 }
 
+void test_abandoned_projection_terminalizes_once_after_last_copy() {
+    auto sink = std::make_shared<recording_sink>();
+    {
+        server_generation_projection projection(sink);
+        {
+            // This copy models std::function copying the streaming callback;
+            // the test specifically verifies shared projection lifetime.
+            // NOLINTNEXTLINE(performance-unnecessary-copy-initialization)
+            server_generation_projection copied = projection;
+            CHECK(copied.enabled());
+        }
+        // std::function copies its streaming callback. A temporary callback
+        // copy must not cancel a still-live projection.
+        CHECK(sink->received.empty());
+    }
+
+    CHECK(sink->received.size() == 2U);
+    CHECK(std::holds_alternative<server_generation_started>(sink->received.at(0)));
+    CHECK(std::holds_alternative<server_generation_cancelled>(sink->received.at(1)));
+}
+
+void test_queue_shutdown_releases_sleep_waiters() {
+    server_queue queue;
+    queue.on_update_slots([] {});
+
+    std::thread loop([&queue] { queue.start_loop(0); });
+    const auto  deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!queue.is_sleeping() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!queue.is_sleeping()) {
+        queue.terminate();
+        loop.join();
+        CHECK(false && "server queue did not enter its sleeping state");
+        return;
+    }
+
+    queue.terminate();
+    loop.join();
+    CHECK(!queue.is_sleeping());
+    // A response worker may reach this gate while the main loop is unwinding.
+    // It must return rather than waiting forever on a state no thread owns.
+    queue.wait_until_no_sleep();
+}
+
 }  // namespace
 
 int main() try {
@@ -144,6 +190,8 @@ int main() try {
     test_final_mapping();
     test_error_mapping();
     test_sink_contract_keeps_projection_opaque();
+    test_abandoned_projection_terminalizes_once_after_last_copy();
+    test_queue_shutdown_releases_sleep_waiters();
     if (failures != 0) {
         std::cerr << failures << " neutral generation sink checks failed\n";
         return 1;

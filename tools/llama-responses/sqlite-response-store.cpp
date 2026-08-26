@@ -463,6 +463,57 @@ class sqlite_response_store::impl {
         return static_cast<std::size_t>(statement.column_uint64(0));
     }
 
+    std::size_t fail_interrupted_responses() {
+        std::lock_guard<std::mutex> lock(mutex);
+        sqlite_transaction          transaction(database);
+        std::vector<response_id>    active_ids;
+        sqlite_statement active_query(database,
+                                      "SELECT id FROM responses WHERE status IN ('queued', 'in_progress') ORDER BY id");
+        while (active_query.step_row()) {
+            active_ids.emplace_back(active_query.column_text(0));
+        }
+
+        std::size_t failed_count = 0;
+        for (const response_id & id : active_ids) {
+            auto state = load(id);
+            if (!state || response_status_is_terminal(state->status)) {
+                continue;
+            }
+            if (state->revision == std::numeric_limits<std::uint64_t>::max()) {
+                throw std::runtime_error("unable to terminalize an interrupted response at maximum revision");
+            }
+
+            const std::uint64_t expected_revision = state->revision;
+            state->revision++;
+            state->status       = response_status::failed;
+            state->completed_at = std::nullopt;
+            state->error        = response_error{
+                "server_restarted",
+                "Response execution was interrupted because llama-server restarted.",
+                "",
+            };
+            state->incomplete_details = nullptr;
+            const std::string payload = serialize_payload(*state).dump();
+
+            sqlite_statement update(database,
+                                    "UPDATE responses SET revision=?, status=?, completed_at=NULL, "
+                                    "state_json=?, payload_bytes=? WHERE id=? AND revision=?");
+            update.bind_int64(1, state->revision);
+            update.bind_text(2, response_status_name(state->status));
+            update.bind_text(3, payload);
+            update.bind_int64(4, payload.size());
+            update.bind_text(5, state->id.str());
+            update.bind_int64(6, expected_revision);
+            update.step_done();
+            if (sqlite3_changes(database) != 1) {
+                throw std::runtime_error("interrupted response changed while terminalizing it");
+            }
+            failed_count++;
+        }
+        transaction.commit();
+        return failed_count;
+    }
+
   private:
     std::uint64_t schema_version() const {
         sqlite_statement version_query(database, "PRAGMA user_version");
@@ -648,6 +699,10 @@ bool sqlite_response_store::erase(const response_id & id) {
 
 std::size_t sqlite_response_store::size() const {
     return pimpl->size();
+}
+
+std::size_t sqlite_response_store::fail_interrupted_responses() {
+    return pimpl->fail_interrupted_responses();
 }
 
 }  // namespace llama_responses

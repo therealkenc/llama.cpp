@@ -23,6 +23,8 @@ add_library(${TARGET} STATIC
     generation.h
     hosted-tools.cpp
     hosted-tools.h
+    input-lowering.cpp
+    input-lowering.h
     protocol-codec.cpp
     protocol-codec.h
     response-store.cpp
@@ -71,6 +73,13 @@ if (LLAMA_BUILD_TESTS)
     target_link_libraries(test-llama-responses-generation-adapter PRIVATE llama-responses)
     target_compile_features(test-llama-responses-generation-adapter PRIVATE cxx_std_17)
     add_test(NAME test-llama-responses-generation-adapter COMMAND test-llama-responses-generation-adapter)
+
+    add_executable(test-llama-responses-input-lowering
+        tests/test-input-lowering.cpp
+    )
+    target_link_libraries(test-llama-responses-input-lowering PRIVATE llama-responses)
+    target_compile_features(test-llama-responses-input-lowering PRIVATE cxx_std_17)
+    add_test(NAME test-llama-responses-input-lowering COMMAND test-llama-responses-input-lowering)
 
     add_executable(test-llama-responses-route-integration
         tests/test-route-integration.cpp

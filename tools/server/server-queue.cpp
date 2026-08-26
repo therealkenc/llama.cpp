@@ -1,11 +1,22 @@
-#include "server-task.h"
 #include "server-queue.h"
 
+#include "ggml.h"
 #include "log.h"
+#include "server-common.h"
+#include "server-task.h"
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <functional>
+#include <mutex>
 #include <thread>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
 #define QUE_INF(fmt, ...) LOG_INF("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define QUE_WRN(fmt, ...) LOG_WRN("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -116,17 +127,16 @@ void server_queue::wait_until_no_sleep() {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     if (!sleeping) {
         return;
-    } else {
-        if (!req_stop_sleeping) {
-            QUE_DBG("%s", "requesting to stop sleeping\n");
-            req_stop_sleeping = true;
-            condition_tasks.notify_one(); // only main thread is waiting on this
-        }
-        QUE_DBG("%s", "waiting until no sleep\n");
-        condition_tasks.wait(lock, [&]{
-            return !sleeping;
-        });
     }
+    if (!req_stop_sleeping) {
+        QUE_DBG("%s", "requesting to stop sleeping\n");
+        req_stop_sleeping = true;
+        condition_tasks.notify_one(); // only main thread is waiting on this
+    }
+    QUE_DBG("%s", "waiting until no sleep\n");
+    condition_tasks.wait(lock, [&]{
+        return !sleeping;
+    });
 }
 
 void server_queue::terminate() {
@@ -153,6 +163,9 @@ bool server_queue::process_new_tasks(bool is_yielding) {
         if (!callback_new_task(std::move(task), is_yielding)) {
             // set it aside, do not put it back in the queue, else we offer it again in a loop
             GGML_ASSERT(is_yielding && "a task can only be declined while yielding");
+            // A declining callback is contractually required to leave the
+            // rvalue-reference task untouched so the queue can offer it again.
+            // NOLINTNEXTLINE(bugprone-use-after-move)
             QUE_DBG("task declined, id = %d\n", task.id);
             lock.lock();
             queue_tasks_unhandled.push_back(std::move(task));
@@ -337,6 +350,8 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                     return (!running || req_stop_sleeping);
                 });
                 if (!running) { // may changed during sleep
+                    sleeping = false;
+                    condition_tasks.notify_all(); // unblock wait_until_no_sleep() during shutdown
                     break; // terminate
                 }
                 QUE_INF("%s", "exiting sleeping state\n");
@@ -349,16 +364,15 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 time_last_task = ggml_time_ms();
                 condition_tasks.notify_all(); // notify wait_until_no_sleep()
                 break; // process new tasks
-            } else {
-                // wait for new tasks or timeout for checking sleeping condition
-                bool res = condition_tasks.wait_for(lock, max_wait_time, [&]{
-                    return (!queue_tasks.empty() || !running);
-                });
-                if (res) {
-                    break; // new task arrived or terminate
-                }
-                // otherwise, loop again to check sleeping condition
             }
+            // wait for new tasks or timeout for checking sleeping condition
+            bool res = condition_tasks.wait_for(lock, max_wait_time, [&]{
+                return (!queue_tasks.empty() || !running);
+            });
+            if (res) {
+                break; // new task arrived or terminate
+            }
+            // otherwise, loop again to check sleeping condition
         }
     }
 
@@ -608,7 +622,8 @@ void server_response_reader::stop() {
         cancel_tasks.reserve(id_tasks.size());
         for (const auto & id_task : id_tasks) {
             SRV_WRN("cancel task, id_task = %d\n", id_task);
-            server_task task(SERVER_TASK_TYPE_CANCEL);
+            server_task task{};
+            task.type      = SERVER_TASK_TYPE_CANCEL;
             task.id_target = id_task;
             queue_results.remove_waiting_task_id(id_task);
             cancel_tasks.push_back(std::move(task));

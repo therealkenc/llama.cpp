@@ -3,6 +3,7 @@
 
 #include "response-store.h"
 
+#include <cstddef>
 #include <memory>
 #include <string>
 
@@ -31,6 +32,11 @@ class sqlite_response_store final : public response_store {
     std::optional<stored_response_item> find_item(const item_id & id) const override;
     bool                                erase(const response_id & id) override;
     std::size_t                         size() const override;
+
+    // This store deliberately does not resurrect inference after a server
+    // restart. Mark snapshots whose process-local worker disappeared as
+    // terminal so polling clients never observe an immortal active response.
+    std::size_t fail_interrupted_responses();
 
   private:
     class impl;

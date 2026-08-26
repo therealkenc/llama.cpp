@@ -4,6 +4,7 @@
 #include "chat.h"
 #include "json.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -14,6 +15,31 @@
 
 struct server_task_result;
 
+// Model-facing input accepted by llama-server after an API implementation has
+// normalized its public request. The shared chat-template vocabulary is not a
+// Chat Completions HTTP DTO: messages, tools, media, and inference parameters
+// remain typed until the server resolves media and renders the model prompt.
+enum class server_generation_media_kind {
+    image,
+    audio,
+    video,
+};
+
+struct server_generation_media_source {
+    std::size_t                  message_index      = 0;
+    std::size_t                  content_part_index = 0;
+    server_generation_media_kind kind               = server_generation_media_kind::image;
+    std::string                  source;
+};
+
+struct server_generation_input {
+    common_chat_templates_inputs                 chat;
+    common_json                                  inference_parameters = common_json::object();
+    std::vector<server_generation_media_source>  media;
+    std::unordered_map<std::string, common_json> tool_metadata;
+    std::optional<bool>                          parallel_tool_calls;
+};
+
 // Protocol-neutral updates exposed by llama-server's existing completion
 // reader. A consumer may project them into Responses, another API, telemetry,
 // or a test transcript without taking ownership of slots or token generation.
@@ -22,8 +48,7 @@ struct server_generation_started {};
 struct server_generation_progress {};
 
 struct server_generation_message_deltas {
-    std::vector<common_chat_msg_diff>            deltas;
-    std::unordered_map<std::string, common_json> tool_metadata;
+    std::vector<common_chat_msg_diff> deltas;
 };
 
 // Canonical parser state emitted immediately before a terminal update. The
@@ -32,8 +57,7 @@ struct server_generation_message_deltas {
 // this snapshot to make their terminal resource authoritative without trying
 // to reverse an already-delivered streaming delta.
 struct server_generation_message_snapshot {
-    common_chat_msg                              message;
-    std::unordered_map<std::string, common_json> tool_metadata;
+    common_chat_msg message;
 };
 
 struct server_generation_usage {

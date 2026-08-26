@@ -3,6 +3,7 @@
 #include "codex-models.h"
 #include "generation.h"
 #include "hosted-tools.h"
+#include "input-lowering.h"
 #include "json.h"
 #include "log.h"
 #include "protocol-codec.h"
@@ -10,26 +11,31 @@
 #include "response-store.h"
 #include "response-types.h"
 #include "server-generation-adapter.h"
+#include "server-generation.h"
 #include "server-http.h"
 #include "server-responses.h"
 #include "server-route-extensions.h"
 #include "sqlite-response-store.h"
 
 #include <algorithm>
-#include <array>
-#include <cctype>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <ctime>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace llama_responses {
 namespace {
@@ -74,20 +80,70 @@ bool request_store_enabled(const common_json & request) {
     return request.at("store").is_boolean() && request.at("store").get<bool>();
 }
 
-bool native_generation_supported(const common_json & request) {
-    // These llama-server telemetry extensions carry payloads which the neutral
-    // generation vocabulary intentionally does not expose yet. Keep their
-    // existing renderer as an explicit oracle rather than silently dropping
-    // requested data from the native projection.
-    static constexpr std::array<const char *, 2> telemetry_extensions = { "return_progress", "timings_per_token" };
-    return std::all_of(telemetry_extensions.begin(), telemetry_extensions.end(), [&](const char * key) {
-        return !request.contains(key) || request.at(key).is_null() ||
-               (request.at(key).is_boolean() && !request.at(key).get<bool>());
-    });
-}
-
 std::string response_id_param(const server_http_req & request) {
     return request.get_param("response_id");
+}
+
+int query_hex_digit(char value) noexcept {
+    if (value >= '0' && value <= '9') {
+        return value - '0';
+    }
+    if (value >= 'a' && value <= 'f') {
+        return value - 'a' + 10;
+    }
+    if (value >= 'A' && value <= 'F') {
+        return value - 'A' + 10;
+    }
+    return -1;
+}
+
+std::string decode_query_component(const std::string & encoded) {
+    std::string decoded;
+    decoded.reserve(encoded.size());
+    for (std::size_t index = 0; index < encoded.size(); ++index) {
+        if (encoded[index] == '+') {
+            decoded.push_back(' ');
+            continue;
+        }
+        if (encoded[index] == '%' && index + 2U < encoded.size()) {
+            const int high = query_hex_digit(encoded[index + 1U]);
+            const int low  = query_hex_digit(encoded[index + 2U]);
+            if (high >= 0 && low >= 0) {
+                decoded.push_back(static_cast<char>((high << 4) | low));
+                index += 2U;
+                continue;
+            }
+        }
+        decoded.push_back(encoded[index]);
+    }
+    return decoded;
+}
+
+std::vector<std::string> query_array_values(const server_http_req & request, const std::string & name) {
+    std::vector<std::string> values;
+    std::size_t              offset = 0;
+    while (!request.query_string.empty() && offset <= request.query_string.size()) {
+        const std::size_t separator = request.query_string.find('&', offset);
+        const std::string field     = request.query_string.substr(
+            offset, separator == std::string::npos ? std::string::npos : separator - offset);
+        const std::size_t equals = field.find('=');
+        const std::string key    = decode_query_component(field.substr(0, equals));
+        if (key == name || key == name + "[]") {
+            values.push_back(equals == std::string::npos ? std::string() :
+                                                           decode_query_component(field.substr(equals + 1U)));
+        }
+        if (separator == std::string::npos) {
+            break;
+        }
+        offset = separator + 1U;
+    }
+    if (values.empty()) {
+        const std::string flattened = request.get_param(name);
+        if (!flattened.empty()) {
+            values.push_back(flattened);
+        }
+    }
+    return values;
 }
 
 common_json parse_json_body(const server_http_req & request) {
@@ -96,16 +152,6 @@ common_json parse_json_body(const server_http_req & request) {
         throw std::invalid_argument("Responses request body must be a JSON object");
     }
     return body;
-}
-
-std::string strip_ascii_space(std::string value) {
-    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
-        value.erase(value.begin());
-    }
-    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) {
-        value.pop_back();
-    }
-    return value;
 }
 
 std::size_t utf8_character_count(const std::string & value) {
@@ -211,6 +257,7 @@ void normalize_nullable_defaults(common_json & request) {
     set_default("store", true);
     set_default("background", false);
     set_default("stream", false);
+    set_default("parallel_tool_calls", true);
     set_default("metadata", common_json::object());
     set_default("text", common_json{
                             { "format", { { "type", "text" } } }
@@ -797,6 +844,10 @@ void validate_create_policy(common_json & request) {
     if (request.contains("stream") && !request.at("stream").is_boolean()) {
         throw invalid_request_field("stream", "invalid_type", "Invalid type for 'stream': expected a boolean.");
     }
+    if (request.contains("parallel_tool_calls") && !request.at("parallel_tool_calls").is_boolean()) {
+        throw invalid_request_field("parallel_tool_calls", "invalid_type",
+                                    "Invalid type for 'parallel_tool_calls': expected a boolean or null.");
+    }
     validate_metadata(request);
     validate_client_metadata(request);
     const declared_tools tools = validate_tools(request);
@@ -901,6 +952,18 @@ void validate_create_policy(common_json & request) {
     reject_non_null_field(request, "prompt_cache_retention", "Prompt-cache retention policy is not available");
     reject_non_null_field(request, "personality", "Model personality selection is not available");
     reject_non_null_field(request, "web_search", "Server-hosted web search is not available");
+    for (const char * field : { "return_progress", "timings_per_token" }) {
+        if (!request.contains(field) || request.at(field).is_null()) {
+            continue;
+        }
+        if (!request.at(field).is_boolean()) {
+            throw invalid_request_field(field, "invalid_type",
+                                        std::string("Invalid type for '") + field + "': expected a boolean or null.");
+        }
+        if (request.at(field).get<bool>()) {
+            throw unsupported_request_field(field, "llama-server telemetry extensions are not exposed by Responses");
+        }
+    }
 }
 
 void validate_unique_input_item_ids(const common_json & items) {
@@ -915,18 +978,270 @@ void validate_unique_input_item_ids(const common_json & items) {
     }
 }
 
-class responses_routes_impl final : public std::enable_shared_from_this<responses_routes_impl> {
+class active_response_registry {
   public:
-    explicit responses_routes_impl(server_responses_routes legacy) :
-        legacy(std::move(legacy)),
-        store(std::make_unique<sqlite_response_store>(default_sqlite_response_store_path())),
-        resources(*store) {}
+    void add(const std::shared_ptr<native_server_generation_sink> & sink) {
+        std::lock_guard<std::mutex> lock(mutex);
+        erase_expired_unlocked();
+        active[sink->id().str()] = sink;
+    }
+
+    std::shared_ptr<native_server_generation_sink> find(const response_id & id) {
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto                  found = active.find(id.str());
+        if (found == active.end()) {
+            return nullptr;
+        }
+        auto sink = found->second.lock();
+        if (!sink) {
+            active.erase(found);
+        }
+        return sink;
+    }
+
+    void remove(const std::shared_ptr<native_server_generation_sink> & sink) {
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto                  found = active.find(sink->id().str());
+        if (found == active.end()) {
+            return;
+        }
+        const auto registered = found->second.lock();
+        if (!registered || registered == sink) {
+            active.erase(found);
+        }
+    }
+
+    void request_cancel_all() {
+        std::vector<std::shared_ptr<native_server_generation_sink>> sinks;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            erase_expired_unlocked();
+            sinks.reserve(active.size());
+            for (const auto & entry : active) {
+                if (auto sink = entry.second.lock()) {
+                    sinks.push_back(std::move(sink));
+                }
+            }
+        }
+        for (const auto & sink : sinks) {
+            if (!sink->terminal()) {
+                sink->request_cancel();
+            }
+        }
+    }
+
+  private:
+    void erase_expired_unlocked() {
+        for (auto item = active.begin(); item != active.end();) {
+            if (item->second.expired()) {
+                item = active.erase(item);
+            } else {
+                ++item;
+            }
+        }
+    }
+
+    std::mutex                                                                    mutex;
+    std::unordered_map<std::string, std::weak_ptr<native_server_generation_sink>> active;
+};
+
+class background_response_job final {
+  public:
+    background_response_job(server_generation_service                      service,
+                            const server_http_req &                        source_request,
+                            server_generation_input                        generation,
+                            std::shared_ptr<native_server_generation_sink> sink,
+                            active_response_registry &                     active_responses) :
+        service(std::move(service)),
+        sink(std::move(sink)),
+        should_stop([this] { return stop_requested.load() || this->sink->cancel_requested(); }),
+        request{
+            source_request.params, source_request.headers, source_request.path, source_request.query_string,
+            source_request.body,   source_request.files,   should_stop,
+        },
+        generation(std::move(generation)),
+        active_responses(active_responses) {
+        // The public background request returns an ordinary Response resource.
+        // Internally, use the existing synchronous generation projection on an
+        // owned worker; no HTTP request or socket lifetime crosses this seam.
+        this->generation.inference_parameters["stream"] = false;
+    }
+
+    ~background_response_job() {
+        request_stop();
+        join();
+    }
+
+    background_response_job(const background_response_job &)             = delete;
+    background_response_job & operator=(const background_response_job &) = delete;
+
+    void start() {
+        worker = std::thread([this] { run(); });
+    }
+
+    void request_stop() noexcept {
+        stop_requested.store(true);
+        sink->request_cancel();
+    }
+
+    bool finished() const noexcept { return done.load(std::memory_order_acquire); }
+
+    void join() noexcept {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+
+  private:
+    void terminalize_after_failure(const std::string & message) noexcept {
+        if (sink->terminal()) {
+            return;
+        }
+        try {
+            if (stop_requested.load() || sink->cancel_requested()) {
+                sink->accept(server_generation_cancelled{});
+            } else {
+                sink->accept(server_generation_failed{
+                    { "server_error", message, "" },
+                    std::nullopt,
+                });
+            }
+        } catch (const std::exception & error) {
+            LOG_ERR("background Responses job %s could not record its terminal state: %s\n", sink->id().str().c_str(),
+                    error.what());
+        }
+    }
+
+    void run() noexcept {
+        try {
+            server_http_res_ptr response = service.generate(request, generation, sink);
+            if (!response) {
+                terminalize_after_failure("Background generation returned no response");
+            } else {
+                if (response->is_stream()) {
+                    terminalize_after_failure("Background generation unexpectedly returned a streaming response");
+                } else if (response->status < 200 || response->status >= 300) {
+                    terminalize_after_failure("Background generation failed before producing a terminal response");
+                }
+                response->on_complete();
+            }
+        } catch (const std::exception & error) {
+            terminalize_after_failure(error.what());
+        } catch (...) {
+            terminalize_after_failure("Background generation failed with an unknown error");
+        }
+
+        if (!sink->terminal()) {
+            terminalize_after_failure("Background generation ended without a terminal response");
+        }
+        active_responses.remove(sink);
+        done.store(true, std::memory_order_release);
+    }
+
+    server_generation_service                      service;
+    std::shared_ptr<native_server_generation_sink> sink;
+    std::atomic_bool                               stop_requested{ false };
+    std::function<bool()>                          should_stop;
+    server_http_req                                request;
+    server_generation_input                        generation;
+    active_response_registry &                     active_responses;
+    std::thread                                    worker;
+    std::atomic_bool                               done{ false };
+};
+
+class background_response_jobs final {
+  public:
+    background_response_jobs(server_generation_service service, active_response_registry & active_responses) :
+        service(std::move(service)),
+        active_responses(active_responses) {}
+
+    ~background_response_jobs() { shutdown(); }
+
+    void start(const server_http_req &                                request,
+               server_generation_input                                generation,
+               const std::shared_ptr<native_server_generation_sink> & sink) {
+        reap();
+        auto job =
+            std::make_shared<background_response_job>(service, request, std::move(generation), sink, active_responses);
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (stopping) {
+                throw std::runtime_error("Responses background executor is stopping");
+            }
+            jobs.emplace(sink->id().str(), job);
+            try {
+                job->start();
+            } catch (...) {
+                jobs.erase(sink->id().str());
+                throw;
+            }
+        }
+    }
+
+    void reap() noexcept {
+        std::vector<std::shared_ptr<background_response_job>> finished;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            for (auto item = jobs.begin(); item != jobs.end();) {
+                if (item->second->finished()) {
+                    finished.push_back(std::move(item->second));
+                    item = jobs.erase(item);
+                } else {
+                    ++item;
+                }
+            }
+        }
+        for (const auto & job : finished) {
+            job->join();
+        }
+    }
+
+    void shutdown() noexcept {
+        std::vector<std::shared_ptr<background_response_job>> pending;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+            pending.reserve(jobs.size());
+            for (auto & entry : jobs) {
+                pending.push_back(std::move(entry.second));
+            }
+            jobs.clear();
+        }
+        for (const auto & job : pending) {
+            job->request_stop();
+        }
+        for (const auto & job : pending) {
+            job->join();
+        }
+    }
+
+  private:
+    server_generation_service                                                 service;
+    active_response_registry &                                                active_responses;
+    std::mutex                                                                mutex;
+    std::unordered_map<std::string, std::shared_ptr<background_response_job>> jobs;
+    bool                                                                      stopping = false;
+};
+
+class responses_routes_impl final {
+  public:
+    explicit responses_routes_impl(server_generation_service service) :
+        service(std::move(service)),
+        store(open_response_store()),
+        resources(*store),
+        background_jobs(this->service, active_responses) {
+        if (!this->service.generate || !this->service.count_input_tokens) {
+            throw std::invalid_argument("llama-responses requires typed generation and token-counting services");
+        }
+    }
 
     static server_responses_routes routes(const std::shared_ptr<responses_routes_impl> & self) {
         server_responses_routes result;
         result.owner    = self;
-        result.generate = self->legacy.generate;
-        result.create   = [self](const server_http_req & request) {
+        result.shutdown = [self] {
+            self->shutdown();
+        };
+        result.create = [self](const server_http_req & request) {
             return self->create(request);
         };
         result.input_tokens = [self](const server_http_req & request) {
@@ -938,8 +1253,8 @@ class responses_routes_impl final : public std::enable_shared_from_this<response
         result.delete_response = [self](const server_http_req & request) {
             return self->erase(request);
         };
-        result.cancel = [](const server_http_req & request) {
-            return responses_routes_impl::cancel(request);
+        result.cancel = [self](const server_http_req & request) {
+            return self->cancel(request);
         };
         result.compact = [](const server_http_req & request) {
             return responses_routes_impl::compact(request);
@@ -951,20 +1266,36 @@ class responses_routes_impl final : public std::enable_shared_from_this<response
     }
 
   private:
+    static std::unique_ptr<response_store> open_response_store() {
+        auto              result      = std::make_unique<sqlite_response_store>(default_sqlite_response_store_path());
+        const std::size_t interrupted = result->fail_interrupted_responses();
+        if (interrupted != 0U) {
+            LOG_WRN("marked %zu interrupted Responses request(s) failed after restart\n", interrupted);
+        }
+        return result;
+    }
+
     struct prepared_request {
-        std::shared_ptr<server_http_req> request;
-        common_json                      original                 = common_json::object();
-        common_json                      continuation_input_items = common_json::array();
-        common_json                      materialized_input_items = common_json::array();
+        server_generation_input generation;
+        common_json             original                 = common_json::object();
+        common_json             continuation_input_items = common_json::array();
+        common_json             materialized_input_items = common_json::array();
     };
 
-    server_responses_routes         legacy;
+    server_generation_service       service;
     std::unique_ptr<response_store> store;
     response_resource_service       resources;
+    active_response_registry        active_responses;
+    background_response_jobs        background_jobs;
     // The registry establishes the native C++ strategy boundary now. Its
     // default providers are deliberately unavailable until Phase 4 adapters
     // are configured.
     hosted_tool_registry            hosted_tools;
+
+    void shutdown() noexcept {
+        active_responses.request_cancel_all();
+        background_jobs.shutdown();
+    }
 
     static item_id make_input_id(std::size_t /*index*/, const common_json & item) {
         std::string prefix = "item_";
@@ -1025,9 +1356,9 @@ class responses_routes_impl final : public std::enable_shared_from_this<response
             throw invalid_request_field("background", "invalid_type",
                                         "Invalid type for 'background': expected a boolean.");
         }
-        if (original.value("background", false)) {
-            throw unsupported_request_field("background",
-                                            "Background responses are not available in the foreground server profile");
+        if (original.value("background", false) && original.value("stream", false)) {
+            throw unsupported_request_field(
+                "stream", "Streaming background responses are not available; poll the response resource instead");
         }
         if (original.contains("conversation") && !original.at("conversation").is_null()) {
             throw unsupported_request_field(
@@ -1073,170 +1404,32 @@ class responses_routes_impl final : public std::enable_shared_from_this<response
         }
         validate_unique_input_item_ids(expanded);
 
-        common_json forwarded = original;
-        forwarded["input"]    = expanded;
-        // `top_logprobs: 0` is a valid Responses default, but the legacy
-        // Chat-shaped inference adapter interprets any present value as a
-        // request for Chat logprobs. The public value remains in `original`.
-        forwarded.erase("top_logprobs");
-        forwarded.erase("stream_options");
-        forwarded.erase("client_metadata");
-        if (forwarded.contains("tools") && forwarded.at("tools").is_array()) {
-            for (common_json & tool : forwarded["tools"]) {
-                if (tool.is_object()) {
-                    // Codex telemetry/tool-loading policy belongs to the
-                    // Responses boundary, not the Chat-shaped inference DTO.
-                    tool.erase("defer_loading");
-                }
-            }
-        }
-        if (forwarded.contains("max_output_tokens") && forwarded.at("max_output_tokens").is_number_integer() &&
-            !json_integer_is_negative(forwarded.at("max_output_tokens")) &&
-            forwarded.at("max_output_tokens").get<std::uint64_t>() >
+        common_json generation_request = original;
+        generation_request["input"]    = expanded;
+        if (generation_request.contains("max_output_tokens") &&
+            generation_request.at("max_output_tokens").is_number_integer() &&
+            !json_integer_is_negative(generation_request.at("max_output_tokens")) &&
+            generation_request.at("max_output_tokens").get<std::uint64_t>() >
                 static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
             // The shared inference runtime uses an int token budget. Values
             // above that are observationally unbounded for a local context;
             // retain the caller's 64-bit value in `original` for the envelope.
-            forwarded["max_output_tokens"] = std::numeric_limits<int>::max();
+            generation_request["max_output_tokens"] = std::numeric_limits<int>::max();
         }
         if (normalized.contains("instructions")) {
-            forwarded["instructions"] = normalized.at("instructions");
+            generation_request["instructions"] = normalized.at("instructions");
         }
-        // The legacy generation adapter lowers the expanded items to the model,
-        // while this hidden field keeps the public response envelope tied to the
-        // caller's unexpanded request.
-        forwarded["__llama_responses_request"] = original;
-
-        auto forwarded_request  = std::make_shared<server_http_req>(request);
-        forwarded_request->body = forwarded.dump();
+        server_generation_input generation = lower_responses_generation_input(generation_request);
         return {
-            std::move(forwarded_request),
+            std::move(generation),
             std::move(original),
             std::move(current_items),
             std::move(expanded),
         };
     }
 
-    bool capture_response(const common_json & wire_response,
-                          const common_json & original,
-                          const common_json & continuation_input_items,
-                          const common_json & materialized_input_items) {
-        if (!request_store_enabled(original)) {
-            return true;
-        }
-        try {
-            response_state state            = capture_response_state(wire_response, original, materialized_input_items);
-            state.continuation_input_items  = continuation_input_items;
-            const store_write_result result = store->create(std::move(state));
-            if (result != store_write_result::stored) {
-                LOG_WRN("llama-responses: response storage failed: %s\n", store_write_result_name(result));
-                return false;
-            }
-        } catch (const std::exception & error) {
-            LOG_WRN("llama-responses: response storage failed: %s\n", error.what());
-            return false;
-        }
-        return true;
-    }
-
-    std::optional<std::uint64_t> capture_sse(const std::string & payload,
-                                             const common_json & original,
-                                             const common_json & continuation_input_items,
-                                             const common_json & materialized_input_items) {
-        std::size_t start = 0;
-        while (start < payload.size()) {
-            const std::size_t end  = payload.find('\n', start);
-            std::string       line = payload.substr(start, end == std::string::npos ? std::string::npos : end - start);
-            if (!line.empty() && line.back() == '\r') {
-                line.pop_back();
-            }
-            if (line.rfind("data:", 0) == 0) {
-                const std::string data = strip_ascii_space(line.substr(5));
-                if (!data.empty() && data != "[DONE]") {
-                    try {
-                        const common_json event = common_json::parse(data);
-                        const std::string type  = event.value("type", std::string());
-                        if ((type == "response.completed" || type == "response.incomplete" ||
-                             type == "response.failed" || type == "response.cancelled") &&
-                            event.contains("response")) {
-                            if (!capture_response(event.at("response"), original, continuation_input_items,
-                                                  materialized_input_items)) {
-                                return event.value("sequence_number", std::uint64_t{ 0 });
-                            }
-                        }
-                    } catch (const std::exception & error) {
-                        // A stored stream cannot acknowledge a terminal frame
-                        // whose resource snapshot was not decoded and committed.
-                        LOG_WRN("llama-responses: malformed SSE data prevented response storage: %s\n", error.what());
-                        return std::uint64_t{ 0 };
-                    }
-                }
-            }
-            if (end == std::string::npos) {
-                break;
-            }
-            start = end + 1;
-        }
-        return std::nullopt;
-    }
-
-    static std::string storage_error_sse(std::uint64_t sequence_number) {
-        const common_json event = {
-            { "type",            "error"                                         },
-            { "sequence_number", sequence_number                                 },
-            { "code",            "response_store_error"                          },
-            { "message",         "The generated response could not be persisted" },
-            { "param",           nullptr                                         },
-        };
-        return "event: error\ndata: " + event.dump() + "\n\n";
-    }
-
-    void filter_sse_chunk(std::string &       pending,
-                          std::string &       output,
-                          bool &              storage_failed,
-                          const common_json & original,
-                          const common_json & continuation_input_items,
-                          const common_json & materialized_input_items) {
-        if (storage_failed) {
-            output.clear();
-            return;
-        }
-
-        pending += output;
-        output.clear();
-        while (true) {
-            const std::size_t lf_boundary   = pending.find("\n\n");
-            const std::size_t crlf_boundary = pending.find("\r\n\r\n");
-            std::size_t       boundary      = std::string::npos;
-            std::size_t       delimiter     = 0;
-            if (lf_boundary != std::string::npos &&
-                (crlf_boundary == std::string::npos || lf_boundary < crlf_boundary)) {
-                boundary  = lf_boundary;
-                delimiter = 2;
-            } else if (crlf_boundary != std::string::npos) {
-                boundary  = crlf_boundary;
-                delimiter = 4;
-            }
-            if (boundary == std::string::npos) {
-                return;
-            }
-
-            const std::size_t frame_size = boundary + delimiter;
-            const std::string frame      = pending.substr(0, frame_size);
-            pending.erase(0, frame_size);
-            const auto failed_sequence =
-                capture_sse(frame, original, continuation_input_items, materialized_input_items);
-            if (failed_sequence) {
-                output += storage_error_sse(*failed_sequence);
-                pending.clear();
-                storage_failed = true;
-                return;
-            }
-            output += frame;
-        }
-    }
-
     server_http_res_ptr create(const server_http_req & request) {
+        background_jobs.reap();
         prepared_request prepared;
         try {
             prepared = prepare(request);
@@ -1250,13 +1443,10 @@ class responses_routes_impl final : public std::enable_shared_from_this<response
             return api_error(400, error.what(), "invalid_request");
         }
 
-        if (legacy.generate && native_generation_supported(prepared.original)) {
-            return create_native(prepared);
+        if (prepared.original.value("background", false)) {
+            return create_background(request, std::move(prepared));
         }
-        if (!legacy.create) {
-            return api_error(501, "Responses create is not available", "not_supported");
-        }
-        return create_legacy(std::move(prepared));
+        return create_native(request, prepared);
     }
 
     static generation_response_context native_context(const prepared_request & prepared) {
@@ -1276,85 +1466,78 @@ class responses_routes_impl final : public std::enable_shared_from_this<response
         return context;
     }
 
-    server_http_res_ptr create_native(const prepared_request & prepared) {
+    server_http_res_ptr create_native(const server_http_req & request, const prepared_request & prepared) {
         const bool       stream  = prepared.original.value("stream", false);
         response_store * storage = request_store_enabled(prepared.original) ? store.get() : nullptr;
         auto sink = std::make_shared<native_server_generation_sink>(native_context(prepared), random_id_suffix(),
-                                                                    stream, storage);
+                                                                    stream, storage, prepared.generation.tool_metadata);
+        active_responses.add(sink);
 
         server_http_res_ptr response;
         try {
-            response = legacy.generate(*prepared.request, sink);
+            response = service.generate(request, prepared.generation, sink);
         } catch (const std::invalid_argument & error) {
+            active_responses.remove(sink);
             sink->discard_persisted_state();
             return api_error(400, error.what(), "invalid_request");
         } catch (const std::exception & error) {
+            active_responses.remove(sink);
             sink->discard_persisted_state();
+            if (sink->storage_failed()) {
+                return api_error(500, sink->storage_error(), "response_store_error");
+            }
             return api_error(500, error.what(), "server_error");
         }
         if (!response) {
+            active_responses.remove(sink);
             sink->discard_persisted_state();
             return api_error(500, "Responses generation returned no response", "server_error");
         }
-        response->lifetime_owner = prepared.request;
         if (sink->storage_failed() && !response->is_stream()) {
+            active_responses.remove(sink);
             return api_error(500, sink->storage_error(), "response_store_error");
         }
         if (response->status < 200 || response->status >= 300) {
+            active_responses.remove(sink);
             sink->discard_persisted_state();
             return response;
         }
+        if (sink->terminal()) {
+            active_responses.remove(sink);
+        }
         return response;
     }
 
-    server_http_res_ptr create_legacy(prepared_request prepared) {
-        server_http_res_ptr response;
+    server_http_res_ptr create_background(const server_http_req & request, prepared_request prepared) {
+        // OpenAI retains background resources even when `store` is false so
+        // they can be polled. SQLite is our process-independent resource
+        // backing; expiry policy remains deliberately deferred.
+        auto sink = std::make_shared<native_server_generation_sink>(native_context(prepared), random_id_suffix(), false,
+                                                                    store.get(), prepared.generation.tool_metadata);
         try {
-            response = legacy.create(*prepared.request);
-        } catch (const std::invalid_argument & error) {
-            return api_error(400, error.what(), "invalid_request");
+            // Allocate, render, and durably checkpoint the response before the
+            // HTTP handler returns. `in_progress` is an allowed initial
+            // background state; exact queued scheduling is not observable
+            // enough to justify a second scheduler state machine here.
+            sink->accept(server_generation_started{});
+            active_responses.add(sink);
+            background_jobs.start(request, std::move(prepared.generation), sink);
+            return json_response(sink->snapshot());
         } catch (const std::exception & error) {
+            active_responses.remove(sink);
+            sink->discard_persisted_state();
+            if (sink->storage_failed()) {
+                return api_error(500, sink->storage_error(), "response_store_error");
+            }
             return api_error(500, error.what(), "server_error");
         }
-        if (!response) {
-            return api_error(500, "Responses generation returned no response", "server_error");
-        }
-        response->lifetime_owner = prepared.request;
-        if (!response->is_stream()) {
-            if (request_store_enabled(prepared.original) && response->status >= 200 && response->status < 300 &&
-                !response->data.empty()) {
-                try {
-                    if (!capture_response(common_json::parse(response->data), prepared.original,
-                                          prepared.continuation_input_items, prepared.materialized_input_items)) {
-                        return api_error(500, "The generated response could not be persisted", "response_store_error");
-                    }
-                } catch (const std::exception & error) {
-                    LOG_WRN("llama-responses: malformed generated response could not be stored: %s\n", error.what());
-                    return api_error(500, "The generated response could not be persisted", "response_store_error");
-                }
-            }
-            return response;
-        }
-
-        if (request_store_enabled(prepared.original)) {
-            response->chunk_filter = [self = shared_from_this(), original = std::move(prepared.original),
-                                      continuation_input_items = std::move(prepared.continuation_input_items),
-                                      materialized_input_items = std::move(prepared.materialized_input_items),
-                                      pending = std::string(), storage_failed = false](std::string & output) mutable {
-                self->filter_sse_chunk(pending, output, storage_failed, original, continuation_input_items,
-                                       materialized_input_items);
-            };
-        }
-        return response;
     }
 
     server_http_res_ptr input_tokens(const server_http_req & request) {
-        if (!legacy.input_tokens) {
-            return api_error(501, "Responses input_tokens is not available", "not_supported");
-        }
+        background_jobs.reap();
+        prepared_request prepared;
         try {
-            prepared_request prepared = prepare(request);
-            return legacy.input_tokens(*prepared.request);
+            prepared = prepare(request);
         } catch (const invalid_request_field & error) {
             return api_error(400, error.what(), error.code, error.field);
         } catch (const unsupported_request_field & error) {
@@ -1364,31 +1547,115 @@ class responses_routes_impl final : public std::enable_shared_from_this<response
         } catch (const std::exception & error) {
             return api_error(400, error.what(), "invalid_request");
         }
+        try {
+            return json_response({
+                { "object",       "response.input_tokens"                         },
+                { "input_tokens", service.count_input_tokens(prepared.generation) },
+            });
+        } catch (const std::invalid_argument & error) {
+            return api_error(400, error.what(), "invalid_request");
+        } catch (const std::exception & error) {
+            return api_error(500, error.what(), "server_error");
+        }
     }
 
     server_http_res_ptr retrieve(const server_http_req & request) {
+        background_jobs.reap();
         const std::string stream = request.get_param("stream");
         if (!stream.empty() && stream != "false" && stream != "true") {
             return api_error(400, "Invalid retrieve stream parameter", "invalid_parameter", std::string("stream"));
         }
-        if (stream == "true" || !request.get_param("starting_after").empty() || !request.get_param("include").empty() ||
+        if (stream == "true" || !request.get_param("starting_after").empty() ||
             request.get_param("include_obfuscation") == "true") {
             return api_error(
                 501, "Streaming or projected response retrieval is not available in the persistent foreground profile",
                 "not_supported");
+        }
+        static const std::set<std::string> supported_includes = {
+            "code_interpreter_call.outputs",  "computer_call_output.output.image_url",
+            "file_search_call.results",       "message.input_image.image_url",
+            "message.output_text.logprobs",   "reasoning.encrypted_content",
+            "web_search_call.action.sources", "web_search_call.results",
+        };
+        const std::vector<std::string> includes = query_array_values(request, "include");
+        for (std::size_t index = 0; index < includes.size(); ++index) {
+            if (supported_includes.find(includes[index]) == supported_includes.end()) {
+                return api_error(400,
+                                 "Invalid value for include[" + std::to_string(index) + "]: '" + includes[index] + "'.",
+                                 "invalid_value", "include[" + std::to_string(index) + "]");
+            }
+            if (includes[index] == "reasoning.encrypted_content") {
+                return api_error(400, "Encrypted content cannot be requested for persisted responses.", "",
+                                 std::string("include"));
+            }
         }
         const resource_result result = resources.retrieve(response_id(response_id_param(request)));
         return json_response(result.body, status_for(result.kind));
     }
 
     server_http_res_ptr erase(const server_http_req & request) {
-        const resource_result result = resources.erase(response_id(response_id_param(request)));
+        background_jobs.reap();
+        const response_id id(response_id_param(request));
+        if (auto sink = active_responses.find(id)) {
+            if (!sink->terminal()) {
+                return api_error(409, "Response '" + id.str() + "' is still active and cannot be deleted.",
+                                 "response_active", std::string("response_id"));
+            }
+            active_responses.remove(sink);
+        }
+        const resource_result result = resources.erase(id);
         return json_response(result.body, status_for(result.kind));
     }
 
-    static server_http_res_ptr cancel(const server_http_req & /*request*/) {
-        return api_error(501, "Response cancellation is not available in the foreground-only server profile",
-                         "not_supported");
+    server_http_res_ptr cancel(const server_http_req & request) {
+        background_jobs.reap();
+        const response_id id(response_id_param(request));
+        auto              sink = active_responses.find(id);
+        if (!sink) {
+            const resource_result stored = resources.retrieve(id);
+            if (stored.kind == resource_result_kind::not_found) {
+                return json_response(stored.body, 404);
+            }
+            const std::string status = stored.body.value("status", std::string());
+            if (status == "cancelled") {
+                return json_response(stored.body);
+            }
+            if (status == "completed" || status == "incomplete" || status == "failed") {
+                return api_error(400, "Response '" + id.str() + "' has already reached status '" + status + "'.",
+                                 "response_not_cancellable", std::string("response_id"));
+            }
+            return api_error(409, "Response '" + id.str() + "' is persisted but has no active worker.",
+                             "response_not_active", std::string("response_id"));
+        }
+
+        if (sink->terminal()) {
+            active_responses.remove(sink);
+            const response_state state = sink->state();
+            if (state.status == response_status::cancelled) {
+                return json_response(render_response(state));
+            }
+            return api_error(400,
+                             "Response '" + id.str() + "' has already reached status '" +
+                                 std::string(response_status_name(state.status)) + "'.",
+                             "response_not_cancellable", std::string("response_id"));
+        }
+
+        sink->request_cancel();
+        static constexpr std::uint64_t cancellation_timeout_ms = 5000;
+        if (!sink->wait_for_terminal(cancellation_timeout_ms)) {
+            return api_error(409, "Cancellation for response '" + id.str() + "' is still pending.",
+                             "response_cancel_pending", std::string("response_id"));
+        }
+        active_responses.remove(sink);
+        if (sink->storage_failed()) {
+            return api_error(500, sink->storage_error(), "response_store_error");
+        }
+        const response_state state = sink->state();
+        if (state.status != response_status::cancelled) {
+            return api_error(400, "Response '" + id.str() + "' reached a terminal state before cancellation.",
+                             "response_not_cancellable", std::string("response_id"));
+        }
+        return json_response(render_response(state));
     }
 
     static server_http_res_ptr compact(const server_http_req & /*request*/) {
@@ -1432,8 +1699,8 @@ class responses_routes_impl final : public std::enable_shared_from_this<response
 }  // namespace
 
 server_responses_routes_factory make_server_responses_routes_factory() {
-    return [](server_responses_routes legacy) {
-        auto implementation = std::make_shared<responses_routes_impl>(std::move(legacy));
+    return [](server_generation_service service) {
+        auto implementation = std::make_shared<responses_routes_impl>(std::move(service));
         return responses_routes_impl::routes(implementation);
     };
 }

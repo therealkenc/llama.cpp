@@ -1,10 +1,19 @@
+#include "chat.h"
+#include "common.h"
+#include "input-lowering.h"
 #include "json.h"
-#include "server-chat.h"
+#include "server-common.h"
+#include "server-generation-internal.h"
+#include "server-generation.h"
 
 #include <exception>
 #include <iostream>
 #include <set>
+#include <stdexcept>
 #include <string>
+#include <vector>
+
+using namespace llama_responses;
 
 namespace {
 
@@ -34,19 +43,18 @@ void test_typed_instructions() {
         "model": "test-model"
     })");
 
-    const common_json result = server_chat_convert_responses_to_chatcmpl(request);
-    CHECK(result.at("messages").size() == 2);
-
-    const auto & system_message = result.at("messages")[0];
-    CHECK(system_message.at("role").get<std::string>() == "system");
-    CHECK(system_message.at("content")[0].at("type").get<std::string>() == "text");
-    CHECK(system_message.at("content")[0].at("text").get<std::string>() == "Inspect the supplied image.");
-    CHECK(system_message.at("content")[1].at("type").get<std::string>() == "image_url");
-    CHECK(system_message.at("content")[1].at("image_url").at("url").get<std::string>() == "data:image/png;base64,AA==");
-
-    const auto & user_message = result.at("messages")[1];
-    CHECK(user_message.at("role").get<std::string>() == "user");
-    CHECK(user_message.at("content")[0].at("text").get<std::string>() == "Describe it briefly.");
+    const server_generation_input typed = lower_responses_generation_input(request);
+    CHECK(typed.chat.messages.size() == 2U);
+    CHECK(typed.chat.messages.at(0).role == "system");
+    CHECK(typed.chat.messages.at(0).content_parts.at(0).text == "Inspect the supplied image.");
+    CHECK(typed.chat.messages.at(0).content_parts.at(1).type == "media_marker");
+    CHECK(typed.chat.messages.at(1).role == "user");
+    CHECK(typed.chat.messages.at(1).content.empty());
+    CHECK(typed.chat.messages.at(1).content_parts.at(0).text == "Describe it briefly.");
+    CHECK(typed.media.size() == 1U);
+    CHECK(typed.media.at(0).message_index == 0U);
+    CHECK(typed.media.at(0).content_part_index == 1U);
+    CHECK(typed.media.at(0).source == "data:image/png;base64,AA==");
 }
 
 void test_structured_output_lowering() {
@@ -68,14 +76,8 @@ void test_structured_output_lowering() {
         }
     })");
 
-    const common_json result = server_chat_convert_responses_to_chatcmpl(request);
-    CHECK(!result.contains("text"));
-    CHECK(result.at("response_format").at("type").get<std::string>() == "json_schema");
-
-    const auto & schema = result.at("response_format").at("json_schema");
-    CHECK(schema.at("name").get<std::string>() == "answer");
-    CHECK(schema.at("strict").get<bool>());
-    CHECK(schema.at("schema").at("type").get<std::string>() == "object");
+    const server_generation_input typed = lower_responses_generation_input(request);
+    CHECK(common_json::parse(typed.chat.json_schema) == request.at("text").at("format").at("schema"));
 }
 
 void test_reasoning_effort_lowering() {
@@ -85,9 +87,8 @@ void test_reasoning_effort_lowering() {
         "reasoning": {"effort": "low"}
     })");
 
-    const common_json result = server_chat_convert_responses_to_chatcmpl(request);
-    CHECK(result.at("reasoning_effort").get<std::string>() == "low");
-    CHECK(!result.contains("reasoning"));
+    const server_generation_input typed = lower_responses_generation_input(request);
+    CHECK(typed.inference_parameters.at("reasoning_effort") == "low");
 }
 
 void test_local_shell_protocol_identity_cannot_be_renamed() {
@@ -101,9 +102,9 @@ void test_local_shell_protocol_identity_cannot_be_renamed() {
         ]
     })");
 
-    const common_json lowered = server_chat_convert_responses_to_chatcmpl(request);
-    CHECK(lowered.at("tools").at(0).at("function").at("name") == "local_shell");
-    CHECK(lowered.at("__responses_tool_metadata").at("local_shell").at("type") == "local_shell");
+    const server_generation_input typed = lower_responses_generation_input(request);
+    CHECK(typed.chat.tools.at(0).name == "local_shell");
+    CHECK(typed.tool_metadata.at("local_shell").at("type") == "local_shell");
 }
 
 void test_namespace_tools_lower_to_unique_functions_and_replay() {
@@ -141,26 +142,7 @@ void test_namespace_tools_lower_to_unique_functions_and_replay() {
         ]
     })");
 
-    const common_json lowered = server_chat_convert_responses_to_chatcmpl(request);
-    CHECK(lowered.at("tools").size() == 2);
-    CHECK(lowered.at("__responses_tool_metadata").size() == 2);
-
-    std::set<std::string> chat_names;
-    std::string           calendar_chat_name;
-    for (const common_json & tool : lowered.at("tools")) {
-        const std::string chat_name = tool.at("function").at("name").get<std::string>();
-        CHECK(chat_name.size() <= 64);
-        CHECK(chat_names.insert(chat_name).second);
-        const common_json & metadata = lowered.at("__responses_tool_metadata").at(chat_name);
-        CHECK(metadata.at("name") == "lookup");
-        CHECK(metadata.at("type") == "function");
-        if (metadata.at("namespace") == "mcp__calendar") {
-            calendar_chat_name = chat_name;
-        }
-    }
-    CHECK(!calendar_chat_name.empty());
-
-    const common_json replay         = common_json::parse(R"({
+    const common_json             replay = common_json::parse(R"({
         "input": [
             {
                 "type": "function_call",
@@ -171,8 +153,49 @@ void test_namespace_tools_lower_to_unique_functions_and_replay() {
             }
         ]
     })");
-    const common_json replay_lowered = server_chat_convert_responses_to_chatcmpl(replay);
-    CHECK(replay_lowered.at("messages").at(0).at("tool_calls").at(0).at("function").at("name") == calendar_chat_name);
+    const server_generation_input typed  = lower_responses_generation_input(request);
+    CHECK(typed.chat.tools.size() == 2U);
+    CHECK(typed.tool_metadata.size() == 2U);
+    std::set<std::string> typed_names;
+    std::string           calendar_chat_name;
+    for (const common_chat_tool & tool : typed.chat.tools) {
+        CHECK(tool.name.size() <= 64U);
+        CHECK(typed_names.insert(tool.name).second);
+        CHECK(typed.tool_metadata.at(tool.name).at("name") == "lookup");
+        if (typed.tool_metadata.at(tool.name).at("namespace") == "mcp__calendar") {
+            calendar_chat_name = tool.name;
+        }
+    }
+    CHECK(!calendar_chat_name.empty());
+
+    const server_generation_input typed_replay = lower_responses_generation_input(replay);
+    CHECK(typed_replay.chat.messages.at(0).tool_calls.at(0).name == calendar_chat_name);
+}
+
+void test_typed_server_adapter_rejects_unsupported_media() {
+    const server_generation_input typed = lower_responses_generation_input(common_json::parse(R"({
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_image", "image_url": "data:image/png;base64,AA=="}]
+        }]
+    })"));
+    server_chat_params            options;
+    options.use_jinja         = false;
+    options.prefill_assistant = false;
+    options.reasoning_format  = COMMON_REASONING_FORMAT_NONE;
+    options.allow_image       = false;
+    options.allow_audio       = false;
+    options.allow_video       = false;
+    std::vector<raw_buffer> files;
+    bool                    rejected = false;
+    try {
+        static_cast<void>(server_generation_params_parse(typed, options, files));
+    } catch (const std::invalid_argument & error) {
+        rejected = std::string(error.what()).find("image input is not supported") != std::string::npos;
+    }
+    CHECK(rejected);
+    CHECK(files.empty());
 }
 
 }  // namespace
@@ -183,6 +206,7 @@ int main() try {
     test_reasoning_effort_lowering();
     test_local_shell_protocol_identity_cannot_be_renamed();
     test_namespace_tools_lower_to_unique_functions_and_replay();
+    test_typed_server_adapter_rejects_unsupported_media();
     if (failures != 0) {
         std::cerr << failures << " server-chat Responses checks failed\n";
         return 1;

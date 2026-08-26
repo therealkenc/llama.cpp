@@ -325,10 +325,10 @@ common_json render_response(const response_state & state) {
         result["usage"] = render_usage(state.usage, result.value("usage", common_json::object()));
     }
 
-    // Defaults and field selection are intentionally shared in spirit with
-    // tools/server/server-task.cpp::build_oai_resp_metadata. Keeping this
-    // codec independent lets the old implementation remain an oracle while
-    // newer wire fields survive via wire_snapshot.
+    // Defaults and field selection remain aligned in spirit with
+    // tools/server/server-task.cpp::build_oai_resp_metadata, while this codec
+    // independently owns the sidecar wire resource and preserves newer fields
+    // via wire_snapshot.
     set_request_field(result, state.request, "instructions", nullptr);
     set_request_field(result, state.request, "tools", common_json::array());
     set_request_field(result, state.request, "tool_choice", "auto");

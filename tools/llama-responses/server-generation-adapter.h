@@ -5,8 +5,10 @@
 #include "response-store.h"
 #include "server-generation.h"
 
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 
 namespace llama_responses {
 
@@ -16,10 +18,11 @@ namespace llama_responses {
 // durable checkpoints, synchronous JSON, and SSE event bytes.
 class native_server_generation_sink final : public server_generation_sink {
   public:
-    native_server_generation_sink(generation_response_context context,
-                                  std::string                 id_namespace,
-                                  bool                        stream,
-                                  response_store *            store = nullptr);
+    native_server_generation_sink(generation_response_context                  context,
+                                  std::string                                  id_namespace,
+                                  bool                                         stream,
+                                  response_store *                             store         = nullptr,
+                                  std::unordered_map<std::string, common_json> tool_metadata = {});
     ~native_server_generation_sink() override;
 
     native_server_generation_sink(const native_server_generation_sink &)             = delete;
@@ -30,6 +33,7 @@ class native_server_generation_sink final : public server_generation_sink {
     bool        cancel_requested() const noexcept override;
 
     void request_cancel() noexcept;
+    bool wait_for_terminal(std::uint64_t timeout_ms) const;
 
     response_id    id() const;
     response_state state() const;

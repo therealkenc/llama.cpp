@@ -1,5 +1,4 @@
 #include "common.h"
-#include "ggml.h"
 #include "http.h"
 #include "server-http.h"
 #include "server-common.h"
@@ -7,27 +6,11 @@
 
 #include <cpp-httplib/httplib.h>
 
-#include <algorithm>
-#include <cctype>
-#include <cstddef>
-#include <cstdint>
-#include <cstdlib>
-#include <exception>
 #include <functional>
 #include <future>
-#include <map>
 #include <memory>
-#include <stdexcept>
 #include <string>
 #include <thread>
-#include <unordered_map>
-#include <unordered_set>
-#include <utility>
-#include <vector>
-
-#ifndef _WIN32
-#include <sys/socket.h>
-#endif
 
 //
 // HTTP implementation using cpp-httplib
@@ -74,8 +57,6 @@ static bool origin_is_localhost(const std::string & origin) {
     }
 }
 
-namespace {
-
 // For Google Cloud Platform deployment compatibility
 struct gcp_params {
     bool enabled;
@@ -103,8 +84,6 @@ struct gcp_params {
         return val;
     }
 };
-
-}  // namespace
 
 bool server_http_context::init(const common_params & params) {
     const gcp_params gcp;
@@ -164,8 +143,6 @@ bool server_http_context::init(const common_params & params) {
     });
 
     srv->set_error_handler([](const httplib::Request &, httplib::Response & res) {
-        // Preserve a structured 404 produced by a registered API handler.
-        // This fallback is only for paths that did not supply their own body.
         if (res.status == 404 && res.body.empty()) {
             res.set_content(
                 safe_json_to_str(json {
@@ -185,9 +162,6 @@ bool server_http_context::init(const common_params & params) {
     srv->set_read_timeout (params.timeout_read);
     srv->set_write_timeout(params.timeout_write);
     srv->set_socket_options([reuse_port = params.reuse_port](const socket_t sock) {
-        // cpp-httplib supplies these platform socket constants on every target;
-        // include-cleaner cannot associate them with the conditional POSIX header.
-        // NOLINTNEXTLINE(misc-include-cleaner)
         httplib::set_socket_opt(sock, SOL_SOCKET, SO_REUSEADDR, 1);
         if (reuse_port) {
 #ifdef SO_REUSEPORT
@@ -363,7 +337,7 @@ bool server_http_context::init(const common_params & params) {
                 return false;
             }
         } else {
-#ifdef LLAMA_UI_HAS_ASSETS
+#if defined(LLAMA_UI_HAS_ASSETS)
             static auto handle_gzip_header = [](const httplib::Request & req, httplib::Response & res) {
                 if (!llama_ui_use_gzip()) {
                     // no gzip build, skip
@@ -373,8 +347,9 @@ bool server_http_context::init(const common_params & params) {
                     res.status = 415; // unsupported media type
                     res.set_content("Error: gzip is not supported by this browser", "text/plain");
                     return false;
+                } else {
+                    res.set_header("Content-Encoding", "gzip");
                 }
-                res.set_header("Content-Encoding", "gzip");
                 return true;
             };
 
@@ -391,10 +366,7 @@ bool server_http_context::init(const common_params & params) {
                         return true; // returns error message
                     }
                     const llama_ui_asset * a = llama_ui_find_asset(name);
-                    if (!a) {
-                        res.status = 404;
-                        return false;
-                    }
+                    if (!a) { res.status = 404; return false; }
                     res.set_header("ETag", a->etag);
                     if (const std::string & inm = req.get_header_value("If-None-Match");
                         !inm.empty() && (inm == a->etag || inm == std::string("W/") + a->etag)) {
@@ -406,7 +378,7 @@ bool server_http_context::init(const common_params & params) {
                         res.set_header("Cross-Origin-Opener-Policy",   "same-origin");
                     }
                     res.set_header("Cache-Control", cache_control);
-                    res.set_content(reinterpret_cast<const char*>(a->data), a->size, a->type);
+                    res.set_content(reinterpret_cast<const char*>(a->data), a->size, a->type.c_str());
                     return false;
                 };
             };
@@ -422,7 +394,7 @@ bool server_http_context::init(const common_params & params) {
                         return false;
                     }
                     res.set_header("Cache-Control", "no-cache");
-                    res.set_content(reinterpret_cast<const char*>(a->data), a->size, a->type);
+                    res.set_content(reinterpret_cast<const char*>(a->data), a->size, a->type.c_str());
                     return false;
                 };
             };
@@ -442,9 +414,7 @@ bool server_http_context::init(const common_params & params) {
             };
 
             for (const auto & a : llama_ui_get_assets()) {
-                if (a.name == "index.html") {
-                    continue;  // served at "/" and "/index.html" above
-                }
+                if (a.name == "index.html") continue;  // served at "/" and "/index.html" above
                 if (no_cache_names.count(a.name)) {
                     SRV_DBG("serve nocache for %s\n", a.name.c_str());
                     srv->Get(params.api_prefix + "/" + a.name, serve_asset_nocache(a.name));
@@ -521,15 +491,9 @@ static std::string decode_path_component(const std::string & in) {
     for (size_t i = 0; i < in.size(); i++) {
         if (in[i] == '%' && i + 2 < in.size()) {
             auto hex = [](char c) -> int {
-                if (c >= '0' && c <= '9') {
-                    return c - '0';
-                }
-                if (c >= 'a' && c <= 'f') {
-                    return c - 'a' + 10;
-                }
-                if (c >= 'A' && c <= 'F') {
-                    return c - 'A' + 10;
-                }
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
                 return -1;
             };
             int hi = hex(in[i + 1]);
@@ -591,7 +555,7 @@ static void process_handler_response(server_http_req_ptr && request, server_http
 
         const auto chunked_content_provider = [response = r_ptr](size_t, httplib::DataSink & sink) -> bool {
             std::string chunk;
-            const bool has_next = response->next_chunk(chunk);
+            const bool has_next = response->next(chunk);
             if (!chunk.empty()) {
                 if (!sink.write(chunk.data(), chunk.size())) {
                     return false;
@@ -717,9 +681,7 @@ static std::string path_to_gcp_format(const std::string & path) {
     std::string result;
     bool cap = false;
     for (unsigned char c : s) {
-        if (c == ':') {
-            break;  // stop before path parameters
-        }
+        if (c == ':') break; // stop before path parameters
         if (c == '/' || c == '-' || c == '_') {
             cap = true;
         } else {

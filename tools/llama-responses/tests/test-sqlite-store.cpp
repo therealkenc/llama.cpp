@@ -282,6 +282,109 @@ void test_middle_node_detachment_survives_restart(const std::string & database_p
     }
 }
 
+void test_multimodal_tool_lineage_survives_restart_and_parent_delete(const std::string & database_path) {
+    response_state parent = make_state("resp_sqlite_media_parent", "msg_sqlite_media_output", "msg_sqlite_media_input");
+    const common_json rich_input    = common_json::array({
+        {
+         { "id", "fc_sqlite_media" },
+         { "type", "function_call" },
+         { "call_id", "call_sqlite_media" },
+         { "name", "inspect" },
+         { "arguments", "{}" },
+         },
+        {
+         { "id", "fco_sqlite_media" },
+         { "type", "function_call_output" },
+         { "call_id", "call_sqlite_media" },
+         { "output", common_json::array({
+                            { { "type", "input_text" }, { "text", "before" } },
+                            { { "type", "input_image" }, { "image_url", "data:image/png;base64,QUFB" } },
+                            { { "type", "input_file" }, { "filename", "notes.txt" }, { "file_data", "bm90ZXM=" } },
+                            { { "type", "input_text" }, { "text", "after" } },
+                        }) },
+         },
+    });
+    parent.input_items              = rich_input;
+    parent.continuation_input_items = rich_input;
+
+    {
+        sqlite_response_store store(database_path);
+        CHECK(store.create(parent) == store_write_result::stored);
+    }
+
+    response_state child =
+        make_state("resp_sqlite_media_child", "msg_sqlite_media_child_output", "msg_sqlite_media_child_input");
+    {
+        sqlite_response_store store(database_path);
+        const auto            reopened_parent = store.find(parent.id);
+        CHECK(reopened_parent.has_value());
+        if (!reopened_parent) {
+            return;
+        }
+        CHECK(reopened_parent->input_items == rich_input);
+        CHECK(reopened_parent->continuation_input_items == rich_input);
+        materialize_after(*reopened_parent, child);
+        CHECK(store.create(child) == store_write_result::stored);
+        CHECK(store.erase(parent.id));
+    }
+
+    {
+        sqlite_response_store store(database_path);
+        const auto            reopened_child = store.find(child.id);
+        CHECK(reopened_child && reopened_child->detached_context.has_value());
+        if (!reopened_child || !reopened_child->detached_context) {
+            return;
+        }
+        CHECK(reopened_child->detached_context->size() == 3U);
+        CHECK(reopened_child->detached_context->at(0) == rich_input.at(0));
+        CHECK(reopened_child->detached_context->at(1) == rich_input.at(1));
+        CHECK(reopened_child->detached_context->at(1).at("output").at(1).at("image_url") ==
+              "data:image/png;base64,QUFB");
+        CHECK(reopened_child->detached_context->at(1).at("output").at(2).at("file_data") == "bm90ZXM=");
+        CHECK(reopened_child->input_items.at(0) == rich_input.at(0));
+        CHECK(reopened_child->input_items.at(1) == rich_input.at(1));
+    }
+}
+
+void test_interrupted_responses_fail_on_restart() {
+    temporary_directory directory;
+    const std::string   database_path = directory.database_path().string();
+
+    response_state queued = make_state("resp_sqlite_queued", "msg_sqlite_queued", "msg_sqlite_queued_input");
+    queued.status         = response_status::queued;
+    response_state active = make_state("resp_sqlite_active", "msg_sqlite_active", "msg_sqlite_active_input");
+    response_state completed =
+        make_state("resp_sqlite_completed", "msg_sqlite_completed", "msg_sqlite_completed_input");
+    completed.status       = response_status::completed;
+    completed.completed_at = 1724515201;
+
+    sqlite_response_store store(database_path);
+    CHECK(store.create(queued) == store_write_result::stored);
+    CHECK(store.create(active) == store_write_result::stored);
+    CHECK(store.create(completed) == store_write_result::stored);
+    CHECK(store.fail_interrupted_responses() == 2U);
+
+    for (const response_id & id : { queued.id, active.id }) {
+        const auto failed = store.find(id);
+        CHECK(failed.has_value());
+        if (failed) {
+            CHECK(failed->revision == 2U);
+            CHECK(failed->status == response_status::failed);
+            CHECK(!failed->completed_at.has_value());
+            CHECK(failed->error.has_value());
+            CHECK(failed->error && failed->error->code == "server_restarted");
+        }
+    }
+
+    const auto unchanged = store.find(completed.id);
+    CHECK(unchanged.has_value());
+    if (unchanged) {
+        CHECK(unchanged->revision == 1U);
+        CHECK(unchanged->status == response_status::completed);
+    }
+    CHECK(store.fail_interrupted_responses() == 0U);
+}
+
 }  // namespace
 
 int main() try {
@@ -291,6 +394,8 @@ int main() try {
     test_persistence_and_compare_and_swap(database_path);
     test_descendant_detachment_and_delete(database_path);
     test_middle_node_detachment_survives_restart(database_path);
+    test_multimodal_tool_lineage_survives_restart_and_parent_delete(database_path);
+    test_interrupted_responses_fail_on_restart();
 
     if (failures != 0) {
         std::cerr << failures << " SQLite response-store checks failed\n";
