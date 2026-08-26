@@ -4139,6 +4139,17 @@ void server_context::set_state_callback(server_state_callback_t callback) {
 // server_routes
 //
 
+static void terminalize_generation_projection_failure(server_generation_projection & projection,
+                                                      const std::string &            message) noexcept {
+    try {
+        (void) projection.fail(message);
+    } catch (const std::exception & error) {
+        SRV_ERR("neutral generation sink failed while terminalizing an error: %s\n", error.what());
+    } catch (...) {
+        SRV_ERR("%s\n", "neutral generation sink failed with an unknown error while terminalizing an error");
+    }
+}
+
 static std::unique_ptr<server_res_generator> handle_generation_projection(
         std::unique_ptr<server_res_generator> res,
         const server_http_req & req,
@@ -4161,19 +4172,22 @@ static std::unique_ptr<server_res_generator> handle_generation_projection(
                 projection.accept(*all_results.error);
             } catch (const std::exception & error) {
                 SRV_ERR("neutral generation sink failed while recording an error: %s\n", error.what());
+                terminalize_generation_projection_failure(projection, error.what());
             }
             res->error(all_results.error->to_json());
             return res;
         }
         if (all_results.results.size() != 1) {
-            res->error(format_error_response(
-                "neutral generation projection requires exactly one completion", ERROR_TYPE_INVALID_REQUEST));
+            const std::string message = "neutral generation projection requires exactly one completion";
+            terminalize_generation_projection_failure(projection, message);
+            res->error(format_error_response(message, ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
         try {
             projection.accept(*all_results.results.front());
             res->ok(projection.snapshot());
         } catch (const std::exception & error) {
+            terminalize_generation_projection_failure(projection, error.what());
             res->error(format_error_response(error.what(), ERROR_TYPE_SERVER));
         }
         return res;
@@ -4183,7 +4197,9 @@ static std::unique_ptr<server_res_generator> handle_generation_projection(
         return req.should_stop() || projection.cancel_requested();
     });
     if (first_result == nullptr) {
-        GGML_ASSERT(req.should_stop() || projection.cancel_requested());
+        // Queue termination can precede the Responses route shutdown hook.
+        // Treat that ordering as cancellation instead of requiring the HTTP
+        // request or sink flag to have observed shutdown first.
         projection.cancel();
         return res;
     }
@@ -4192,17 +4208,18 @@ static std::unique_ptr<server_res_generator> handle_generation_projection(
             projection.accept(*first_result);
         } catch (const std::exception & error) {
             SRV_ERR("neutral generation sink failed while recording an error: %s\n", error.what());
+            terminalize_generation_projection_failure(projection, error.what());
         }
         res->error(first_result->to_json());
         return res;
     }
 
-    GGML_ASSERT(
-        dynamic_cast<server_task_result_cmpl_partial *>(first_result.get()) != nullptr ||
-        dynamic_cast<server_task_result_cmpl_final *>(first_result.get()) != nullptr);
+    GGML_ASSERT(dynamic_cast<server_task_result_cmpl_partial *>(first_result.get()) != nullptr ||
+                dynamic_cast<server_task_result_cmpl_final *>(first_result.get()) != nullptr);
     try {
         res->data = projection.accept(*first_result);
     } catch (const std::exception & error) {
+        terminalize_generation_projection_failure(projection, error.what());
         res->error(format_error_response(error.what(), ERROR_TYPE_SERVER));
         return res;
     }
@@ -4252,7 +4269,8 @@ static std::unique_ptr<server_res_generator> handle_generation_projection(
                 return true;
             }
             if (result == nullptr) {
-                GGML_ASSERT(effective_should_stop());
+                // The server queue can terminate just before the sidecar's
+                // shutdown hook publishes cancellation to this projection.
                 output = projection.cancel();
                 return false;
             }

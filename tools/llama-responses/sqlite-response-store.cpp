@@ -2,18 +2,26 @@
 
 #include "common.h"
 #include "json.h"
+#include "protocol-codec.h"
 #include "response-store-internal.h"
 #include "response-store.h"
 #include "response-types.h"
 
 #include <sqlite3.h>
 
+#include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <ctime>
+#include <exception>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -22,8 +30,13 @@
 namespace llama_responses {
 namespace {
 
-constexpr int database_schema_version = 1;
-constexpr int state_payload_version   = 1;
+constexpr int           database_schema_version = 5;
+constexpr int           state_payload_version   = 2;
+constexpr std::uint64_t sqlite_integer_maximum  = static_cast<std::uint64_t>(std::numeric_limits<sqlite3_int64>::max());
+
+bool sqlite_integer_can_increment(std::uint64_t value) noexcept {
+    return value < sqlite_integer_maximum;
+}
 
 [[noreturn]] void throw_sqlite_error(sqlite3 * database, const std::string & operation, int result) {
     throw std::runtime_error(operation + " failed (sqlite result " + std::to_string(result) +
@@ -188,46 +201,54 @@ common_json serialize_payload(const response_state & state) {
         };
     }
 
+    common_json stored_request = state.request;
+    // Direct input has a canonical typed representation below. It is not a
+    // field on a rendered Response resource, so persisting the normalized
+    // request copy as well would duplicate large media in every graph node.
+    stored_request.erase("input");
+
     return {
-        { "schema_version",           state_payload_version                                                   },
-        { "model",                    state.model                                                             },
-        { "request",                  state.request                                                           },
-        { "metadata",                 state.metadata                                                          },
-        { "input_items",              state.input_items                                                       },
-        { "continuation_input_items", state.continuation_input_items                                          },
-        { "wire_snapshot",            state.wire_snapshot                                                     },
-        { "detached_context",         state.detached_context ? *state.detached_context : common_json(nullptr) },
-        { "output",                   std::move(output)                                                       },
+        { "schema_version",     state_payload_version     },
+        { "model",              state.model               },
+        { "request",            std::move(stored_request) },
+        { "metadata",           state.metadata            },
+        { "input_items",        state.input_items         },
+        { "wire_snapshot",      state.wire_snapshot       },
+        { "output",             std::move(output)         },
         { "usage",
          {
               { "input_tokens", state.usage.input_tokens },
               { "cached_input_tokens", state.usage.cached_input_tokens },
               { "output_tokens", state.usage.output_tokens },
               { "reasoning_output_tokens", state.usage.reasoning_output_tokens },
-          }                                                                                                   },
-        { "error",                    std::move(error)                                                        },
-        { "incomplete_details",       state.incomplete_details                                                },
+          }                                               },
+        { "error",              std::move(error)          },
+        { "incomplete_details", state.incomplete_details  },
     };
 }
 
 response_state deserialize_payload(const std::string & payload_text) {
     common_json payload = common_json::parse(payload_text);
-    if (!payload.is_object() || payload.value("schema_version", 0) != state_payload_version) {
+    if (!payload.is_object()) {
+        throw std::runtime_error("SQLite response store contains an unsupported state payload version");
+    }
+    const int payload_version = payload.value("schema_version", 0);
+    if (payload_version != 1 && payload_version != state_payload_version) {
         throw std::runtime_error("SQLite response store contains an unsupported state payload version");
     }
 
     response_state state;
-    state.model       = payload.at("model").get<std::string>();
-    state.request     = payload.at("request");
-    state.metadata    = payload.at("metadata");
-    state.input_items = payload.at("input_items");
-    state.continuation_input_items =
-        payload.contains("continuation_input_items") ? payload.at("continuation_input_items") : state.input_items;
+    state.model              = payload.at("model").get<std::string>();
+    state.request            = payload.at("request");
+    state.metadata           = payload.at("metadata");
+    state.input_items        = payload_version == 1 && payload.contains("continuation_input_items") ?
+                                   payload.at("continuation_input_items") :
+                                   payload.at("input_items");
     state.wire_snapshot      = payload.at("wire_snapshot");
     state.incomplete_details = payload.at("incomplete_details");
 
     if (payload.contains("detached_context") && !payload.at("detached_context").is_null()) {
-        state.detached_context = payload.at("detached_context");
+        state.legacy_lineage_checkpoint = payload.at("detached_context");
     }
 
     for (const common_json & wire_item : payload.at("output")) {
@@ -298,15 +319,22 @@ class sqlite_response_store::impl {
         }
     }
 
-    store_write_result create(response_state state) {
-        if (!response_store_detail::valid_state(state) || !integers_fit(state)) {
+    store_write_result create(response_state state, const std::vector<common_json> & events) {
+        if (!response_store_detail::valid_state(state) || !integers_fit(state) || state.legacy_lineage_checkpoint ||
+            !response_store_detail::valid_event_batch(state, 0, events)) {
             return store_write_result::invalid_state;
         }
 
         std::lock_guard<std::mutex> lock(mutex);
         sqlite_transaction          transaction(database);
-        if (load(state.id)) {
+        if (load(state.id, true)) {
             return store_write_result::already_exists;
+        }
+        if (state.previous_response) {
+            const auto parent = load(*state.previous_response, true);
+            if (!parent || !response_status_is_terminal(parent->status)) {
+                return store_write_result::invalid_state;
+            }
         }
         if (!item_ids_available(state)) {
             return store_write_result::item_id_conflict;
@@ -321,12 +349,18 @@ class sqlite_response_store::impl {
                                  "VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)");
         bind_state_columns(insert, state, payload, 1);
         insert.step_done();
+        insert_head(state);
         insert_item_index(state);
+        insert_events(state.id, events);
         transaction.commit();
+        if (!events.empty()) {
+            ++event_epoch;
+            event_condition.notify_all();
+        }
         return store_write_result::stored;
     }
 
-    store_write_result replace(response_state state) {
+    store_write_result replace(response_state state, const std::vector<common_json> & events) {
         if (!response_store_detail::valid_state(state) || !integers_fit(state)) {
             return store_write_result::invalid_state;
         }
@@ -343,13 +377,16 @@ class sqlite_response_store::impl {
         if (!response_status_can_transition(current->status, state.status)) {
             return store_write_result::invalid_transition;
         }
+        if (!response_store_detail::valid_event_batch(state, current->next_sequence_number, events)) {
+            return store_write_result::invalid_state;
+        }
         if (!item_ids_available(state)) {
             return store_write_result::item_id_conflict;
         }
-        if (!state.detached_context && current->detached_context) {
-            state.detached_context = current->detached_context;
-        }
-        if (state.revision == std::numeric_limits<std::uint64_t>::max()) {
+        state.previous_response         = current->previous_response;
+        state.input_items               = current->input_items;
+        state.legacy_lineage_checkpoint = current->legacy_lineage_checkpoint;
+        if (!sqlite_integer_can_increment(state.revision)) {
             return store_write_result::invalid_state;
         }
 
@@ -357,31 +394,149 @@ class sqlite_response_store::impl {
         state.revision++;
         const std::string payload = serialize_payload(state).dump();
 
-        sqlite_statement update(database,
-                                "UPDATE responses SET revision=?, status=?, created_at=?, completed_at=?, "
-                                "next_sequence_number=?, previous_response_id=?, state_json=?, payload_bytes=? "
-                                "WHERE id=? AND revision=?");
-        update.bind_int64(1, state.revision);
-        update.bind_text(2, response_status_name(state.status));
-        update.bind_int64(3, state.created_at);
-        bind_optional_uint64(update, 4, state.completed_at);
-        update.bind_int64(5, state.next_sequence_number);
-        bind_optional_id(update, 6, state.previous_response);
-        update.bind_text(7, payload);
-        update.bind_int64(8, payload.size());
-        update.bind_text(9, state.id.str());
-        update.bind_int64(10, expected_revision);
-        update.step_done();
+        sqlite_statement update_head(database,
+                                     "UPDATE response_heads SET revision=?, generation_revision=?, status=?, "
+                                     "completed_at=?, next_sequence_number=?, journal_enabled=? "
+                                     "WHERE response_id=? AND revision=?");
+        update_head.bind_int64(1, state.revision);
+        update_head.bind_int64(2, state.revision);
+        update_head.bind_text(3, response_status_name(state.status));
+        bind_optional_uint64(update_head, 4, state.completed_at);
+        update_head.bind_int64(5, state.next_sequence_number);
+        update_head.bind_int64(6, response_store_detail::event_journal_enabled(state) ? 1U : 0U);
+        update_head.bind_text(7, state.id.str());
+        update_head.bind_int64(8, expected_revision);
+        update_head.step_done();
         if (sqlite3_changes(database) != 1) {
             return store_write_result::stale_revision;
         }
 
+        sqlite_statement update_snapshot(database,
+                                         "UPDATE responses SET revision=?, status=?, created_at=?, completed_at=?, "
+                                         "next_sequence_number=?, previous_response_id=?, state_json=?, "
+                                         "payload_bytes=? WHERE id=? AND deleted_at IS NULL");
+        update_snapshot.bind_int64(1, state.revision);
+        update_snapshot.bind_text(2, response_status_name(state.status));
+        update_snapshot.bind_int64(3, state.created_at);
+        bind_optional_uint64(update_snapshot, 4, state.completed_at);
+        update_snapshot.bind_int64(5, state.next_sequence_number);
+        bind_optional_id(update_snapshot, 6, state.previous_response);
+        update_snapshot.bind_text(7, payload);
+        update_snapshot.bind_int64(8, payload.size());
+        update_snapshot.bind_text(9, state.id.str());
+        update_snapshot.step_done();
+        if (sqlite3_changes(database) != 1) {
+            throw std::runtime_error("SQLite response snapshot disappeared during replacement");
+        }
         sqlite_statement remove_items(database, "DELETE FROM response_items WHERE response_id=?");
         remove_items.bind_text(1, state.id.str());
         remove_items.step_done();
         insert_item_index(state);
+        insert_events(state.id, events);
         transaction.commit();
+        if (!events.empty()) {
+            ++event_epoch;
+            event_condition.notify_all();
+        }
         return store_write_result::stored;
+    }
+
+    generation_store_write advance_generation(const response_state &           state,
+                                              std::uint64_t                    expected_generation_revision,
+                                              const std::vector<common_json> & events) {
+        if (state.id.empty() || !integers_fit(state)) {
+            return { store_write_result::invalid_state, 0 };
+        }
+
+        std::lock_guard<std::mutex> lock(mutex);
+        sqlite_transaction          transaction(database);
+        const auto                  current = load_head(state.id);
+        if (!current) {
+            return { store_write_result::not_found, 0 };
+        }
+        if (current->generation_revision != expected_generation_revision) {
+            return { store_write_result::stale_revision, current->value.revision };
+        }
+        if (!response_status_can_transition(current->value.status, state.status)) {
+            return { store_write_result::invalid_transition, current->value.revision };
+        }
+        if (!response_store_detail::valid_event_batch(current->value.event_journal, state.status,
+                                                      state.next_sequence_number, current->value.next_sequence_number,
+                                                      events)) {
+            return { store_write_result::invalid_state, current->value.revision };
+        }
+        if (!sqlite_integer_can_increment(current->value.revision)) {
+            return { store_write_result::invalid_state, current->value.revision };
+        }
+
+        const bool                    terminal      = response_status_is_terminal(state.status);
+        const std::uint64_t           next_revision = current->value.revision + 1U;
+        std::optional<response_state> snapshot;
+        std::string                   payload;
+        if (terminal) {
+            const auto immutable_node = load(state.id);
+            if (!immutable_node) {
+                return { store_write_result::not_found, 0 };
+            }
+            snapshot                            = state;
+            snapshot->revision                  = next_revision;
+            snapshot->previous_response         = immutable_node->previous_response;
+            snapshot->input_items               = immutable_node->input_items;
+            snapshot->legacy_lineage_checkpoint = immutable_node->legacy_lineage_checkpoint;
+            if (!response_store_detail::valid_state(*snapshot)) {
+                return { store_write_result::invalid_state, current->value.revision };
+            }
+            if (!item_ids_available(*snapshot)) {
+                return { store_write_result::item_id_conflict, current->value.revision };
+            }
+            payload = serialize_payload(*snapshot).dump();
+        }
+
+        sqlite_statement update_head(database,
+                                     "UPDATE response_heads SET revision=?, generation_revision=?, status=?, "
+                                     "completed_at=?, next_sequence_number=? "
+                                     "WHERE response_id=? AND generation_revision=?");
+        update_head.bind_int64(1, next_revision);
+        update_head.bind_int64(2, next_revision);
+        update_head.bind_text(3, response_status_name(state.status));
+        bind_optional_uint64(update_head, 4, state.completed_at);
+        update_head.bind_int64(5, state.next_sequence_number);
+        update_head.bind_text(6, state.id.str());
+        update_head.bind_int64(7, expected_generation_revision);
+        update_head.step_done();
+        if (sqlite3_changes(database) != 1) {
+            return { store_write_result::stale_revision, current->value.revision };
+        }
+
+        if (snapshot) {
+            sqlite_statement update_snapshot(database,
+                                             "UPDATE responses SET revision=?, status=?, completed_at=?, "
+                                             "next_sequence_number=?, state_json=?, payload_bytes=? "
+                                             "WHERE id=? AND deleted_at IS NULL");
+            update_snapshot.bind_int64(1, next_revision);
+            update_snapshot.bind_text(2, response_status_name(snapshot->status));
+            bind_optional_uint64(update_snapshot, 3, snapshot->completed_at);
+            update_snapshot.bind_int64(4, snapshot->next_sequence_number);
+            update_snapshot.bind_text(5, payload);
+            update_snapshot.bind_int64(6, payload.size());
+            update_snapshot.bind_text(7, snapshot->id.str());
+            update_snapshot.step_done();
+            if (sqlite3_changes(database) != 1) {
+                throw std::runtime_error("SQLite response snapshot disappeared during terminal checkpoint");
+            }
+            sqlite_statement remove_items(database, "DELETE FROM response_items WHERE response_id=?");
+            remove_items.bind_text(1, snapshot->id.str());
+            remove_items.step_done();
+            insert_item_index(*snapshot);
+        }
+
+        insert_events(state.id, events);
+        transaction.commit();
+        if (!events.empty()) {
+            ++event_epoch;
+            event_condition.notify_all();
+        }
+        return { store_write_result::stored, next_revision };
     }
 
     std::optional<response_state> find(const response_id & id) const {
@@ -391,7 +546,10 @@ class sqlite_response_store::impl {
 
     std::optional<stored_response_item> find_item(const item_id & id) const {
         std::lock_guard<std::mutex> lock(mutex);
-        sqlite_statement statement(database, "SELECT response_id, output_index FROM response_items WHERE item_id=?");
+        sqlite_statement            statement(database,
+                                              "SELECT i.response_id, i.output_index FROM response_items AS i "
+                                              "JOIN responses AS r ON r.id=i.response_id "
+                                              "WHERE i.item_id=? AND r.deleted_at IS NULL");
         statement.bind_text(1, id.str());
         if (!statement.step_row()) {
             return std::nullopt;
@@ -405,58 +563,102 @@ class sqlite_response_store::impl {
         return stored_response_item{ owner, state->output[output_index] };
     }
 
+    std::optional<common_json> materialize_input_items(const response_id & id) const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return materialize(id, false);
+    }
+
+    std::optional<common_json> materialize_continuation_context(const response_id & id) const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return materialize(id, true);
+    }
+
+    std::optional<response_event_page> events_after(const response_id &                  id,
+                                                    const std::optional<std::uint64_t> & starting_after) const {
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto                  stored_head = load_head(id);
+        if (!stored_head) {
+            return std::nullopt;
+        }
+
+        response_event_page page;
+        page.head         = stored_head->value;
+        page.change_epoch = event_epoch;
+        // A future cursor names no committed suffix. Active callers wait for
+        // a journal change; terminal callers finish with an empty page.
+        if (starting_after && *starting_after >= page.head.next_sequence_number) {
+            return page;
+        }
+        const char *     sql = starting_after ?
+                                   "SELECT sequence_number, event_json FROM response_events "
+                                   "WHERE response_id=? AND sequence_number>? ORDER BY sequence_number LIMIT 256" :
+                                   "SELECT sequence_number, event_json FROM response_events "
+                                   "WHERE response_id=? ORDER BY sequence_number LIMIT 256";
+        sqlite_statement query(database, sql);
+        query.bind_text(1, id.str());
+        if (starting_after) {
+            query.bind_int64(2, *starting_after);
+        }
+        std::optional<std::uint64_t> expected_sequence = 0;
+        if (starting_after) {
+            expected_sequence = *starting_after == std::numeric_limits<std::uint64_t>::max() ?
+                                    std::nullopt :
+                                    std::optional<std::uint64_t>(*starting_after + 1U);
+        }
+        while (query.step_row()) {
+            const std::uint64_t sequence_number  = query.column_uint64(0);
+            common_json         event            = common_json::parse(query.column_text(1));
+            std::uint64_t       payload_sequence = 0;
+            try {
+                if (!event.is_object() || !event.contains("sequence_number") ||
+                    !event.at("sequence_number").is_number_integer()) {
+                    throw std::runtime_error("event sequence is absent");
+                }
+                payload_sequence = event.at("sequence_number").get<std::uint64_t>();
+            } catch (const std::exception &) {
+                throw std::runtime_error("SQLite response event journal contains an inconsistent event payload");
+            }
+            if (payload_sequence != sequence_number || !expected_sequence || sequence_number != *expected_sequence) {
+                throw std::runtime_error("SQLite response event journal contains an inconsistent event payload");
+            }
+            page.events.push_back(std::move(event));
+            expected_sequence = sequence_number == std::numeric_limits<std::uint64_t>::max() ?
+                                    std::nullopt :
+                                    std::optional<std::uint64_t>(sequence_number + 1U);
+        }
+        if (page.head.event_journal && page.events.size() < 256U && expected_sequence &&
+            *expected_sequence < page.head.next_sequence_number) {
+            throw std::runtime_error("SQLite response event journal is missing a committed suffix");
+        }
+        return page;
+    }
+
+    bool wait_for_event_change(std::uint64_t observed_epoch, std::uint64_t timeout_ms) const {
+        std::unique_lock<std::mutex> lock(mutex);
+        return event_condition.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                                        [this, observed_epoch] { return event_epoch != observed_epoch; });
+    }
+
     bool erase(const response_id & id) {
         std::lock_guard<std::mutex> lock(mutex);
         sqlite_transaction          transaction(database);
-        const auto                  state = load(id);
-        if (!state) {
-            return false;
-        }
-
-        const common_json        context = response_store_detail::detached_context(*state);
-        std::vector<response_id> children;
-        sqlite_statement select_children(database, "SELECT id FROM responses WHERE previous_response_id=? ORDER BY id");
-        select_children.bind_text(1, id.str());
-        while (select_children.step_row()) {
-            children.emplace_back(select_children.column_text(0));
-        }
-
-        for (const response_id & child_id : children) {
-            auto child = load(child_id);
-            if (!child || child->revision == std::numeric_limits<std::uint64_t>::max()) {
-                throw std::runtime_error("unable to detach SQLite response descendant");
-            }
-            const std::uint64_t expected_revision = child->revision;
-            child->detached_context               = context;
-            child->revision++;
-            const std::string payload = serialize_payload(*child).dump();
-
-            sqlite_statement update_child(
-                database, "UPDATE responses SET revision=?, state_json=?, payload_bytes=? WHERE id=? AND revision=?");
-            update_child.bind_int64(1, child->revision);
-            update_child.bind_text(2, payload);
-            update_child.bind_int64(3, payload.size());
-            update_child.bind_text(4, child_id.str());
-            update_child.bind_int64(5, expected_revision);
-            update_child.step_done();
-            if (sqlite3_changes(database) != 1) {
-                throw std::runtime_error("SQLite response descendant changed while detaching its context");
-            }
-        }
-
-        sqlite_statement remove(database, "DELETE FROM responses WHERE id=?");
-        remove.bind_text(1, id.str());
-        remove.step_done();
+        sqlite_statement  tombstone(database, "UPDATE responses SET deleted_at=? WHERE id=? AND deleted_at IS NULL");
+        const std::time_t now = std::time(nullptr);
+        tombstone.bind_int64(1, now < 0 ? 0U : static_cast<std::uint64_t>(now));
+        tombstone.bind_text(2, id.str());
+        tombstone.step_done();
         if (sqlite3_changes(database) != 1) {
             return false;
         }
         transaction.commit();
+        ++event_epoch;
+        event_condition.notify_all();
         return true;
     }
 
     std::size_t size() const {
         std::lock_guard<std::mutex> lock(mutex);
-        sqlite_statement            statement(database, "SELECT COUNT(*) FROM responses");
+        sqlite_statement            statement(database, "SELECT COUNT(*) FROM responses WHERE deleted_at IS NULL");
         if (!statement.step_row()) {
             throw std::runtime_error("SQLite response count query returned no row");
         }
@@ -467,19 +669,23 @@ class sqlite_response_store::impl {
         std::lock_guard<std::mutex> lock(mutex);
         sqlite_transaction          transaction(database);
         std::vector<response_id>    active_ids;
-        sqlite_statement active_query(database,
-                                      "SELECT id FROM responses WHERE status IN ('queued', 'in_progress') ORDER BY id");
+        sqlite_statement            active_query(
+            database,
+            "SELECT h.response_id FROM response_heads AS h JOIN responses AS r ON r.id=h.response_id "
+            "WHERE h.status IN ('queued', 'in_progress') AND r.deleted_at IS NULL ORDER BY h.response_id");
         while (active_query.step_row()) {
             active_ids.emplace_back(active_query.column_text(0));
         }
 
-        std::size_t failed_count = 0;
+        std::size_t failed_count   = 0;
+        bool        appended_event = false;
         for (const response_id & id : active_ids) {
-            auto state = load(id);
-            if (!state || response_status_is_terminal(state->status)) {
+            auto       state = load(id);
+            const auto head  = load_head(id);
+            if (!state || !head || response_status_is_terminal(state->status)) {
                 continue;
             }
-            if (state->revision == std::numeric_limits<std::uint64_t>::max()) {
+            if (!sqlite_integer_can_increment(state->revision)) {
                 throw std::runtime_error("unable to terminalize an interrupted response at maximum revision");
             }
 
@@ -493,24 +699,54 @@ class sqlite_response_store::impl {
                 "",
             };
             state->incomplete_details = nullptr;
+            std::vector<common_json> events;
+            if (head->value.event_journal) {
+                const std::uint64_t sequence_number = state->next_sequence_number;
+                if (!sqlite_integer_can_increment(sequence_number)) {
+                    throw std::runtime_error("unable to append a restart failure at maximum event sequence");
+                }
+                ++state->next_sequence_number;
+                events.push_back(render_terminal_event(*state, sequence_number));
+            }
             const std::string payload = serialize_payload(*state).dump();
 
-            sqlite_statement update(database,
-                                    "UPDATE responses SET revision=?, status=?, completed_at=NULL, "
-                                    "state_json=?, payload_bytes=? WHERE id=? AND revision=?");
-            update.bind_int64(1, state->revision);
-            update.bind_text(2, response_status_name(state->status));
-            update.bind_text(3, payload);
-            update.bind_int64(4, payload.size());
-            update.bind_text(5, state->id.str());
-            update.bind_int64(6, expected_revision);
-            update.step_done();
+            sqlite_statement update_head(database,
+                                         "UPDATE response_heads SET revision=?, generation_revision=?, status=?, "
+                                         "completed_at=NULL, next_sequence_number=? "
+                                         "WHERE response_id=? AND revision=?");
+            update_head.bind_int64(1, state->revision);
+            update_head.bind_int64(2, state->revision);
+            update_head.bind_text(3, response_status_name(state->status));
+            update_head.bind_int64(4, state->next_sequence_number);
+            update_head.bind_text(5, state->id.str());
+            update_head.bind_int64(6, expected_revision);
+            update_head.step_done();
             if (sqlite3_changes(database) != 1) {
                 throw std::runtime_error("interrupted response changed while terminalizing it");
             }
+
+            sqlite_statement update_snapshot(database,
+                                             "UPDATE responses SET revision=?, status=?, completed_at=NULL, "
+                                             "next_sequence_number=?, state_json=?, payload_bytes=? WHERE id=?");
+            update_snapshot.bind_int64(1, state->revision);
+            update_snapshot.bind_text(2, response_status_name(state->status));
+            update_snapshot.bind_int64(3, state->next_sequence_number);
+            update_snapshot.bind_text(4, payload);
+            update_snapshot.bind_int64(5, payload.size());
+            update_snapshot.bind_text(6, state->id.str());
+            update_snapshot.step_done();
+            if (sqlite3_changes(database) != 1) {
+                throw std::runtime_error("interrupted response snapshot disappeared while terminalizing it");
+            }
+            insert_events(state->id, events);
+            appended_event = appended_event || !events.empty();
             failed_count++;
         }
         transaction.commit();
+        if (appended_event) {
+            ++event_epoch;
+            event_condition.notify_all();
+        }
         return failed_count;
     }
 
@@ -531,9 +767,6 @@ class sqlite_response_store::impl {
         if (version == database_schema_version) {
             return;
         }
-        if (version != 0) {
-            throw std::runtime_error("SQLite response store requires an unavailable schema migration");
-        }
 
         sqlite_transaction transaction(database);
         // Another llama-server may have initialized a shared cache database
@@ -543,39 +776,205 @@ class sqlite_response_store::impl {
             transaction.commit();
             return;
         }
-        if (version != 0) {
-            throw std::runtime_error("SQLite response store schema changed while acquiring the migration lock");
+        if (version == 0) {
+            execute(database,
+                    "CREATE TABLE responses ("
+                    " id TEXT PRIMARY KEY NOT NULL,"
+                    " revision INTEGER NOT NULL,"
+                    " status TEXT NOT NULL,"
+                    " created_at INTEGER NOT NULL,"
+                    " completed_at INTEGER,"
+                    " expires_at INTEGER,"
+                    " next_sequence_number INTEGER NOT NULL,"
+                    " previous_response_id TEXT,"
+                    " state_json TEXT NOT NULL,"
+                    " payload_bytes INTEGER NOT NULL"
+                    ")");
+            execute(database, "CREATE INDEX responses_previous_response_idx ON responses(previous_response_id)");
+            execute(database,
+                    "CREATE TABLE response_items ("
+                    " item_id TEXT PRIMARY KEY NOT NULL,"
+                    " response_id TEXT NOT NULL,"
+                    " output_index INTEGER NOT NULL,"
+                    " UNIQUE(response_id, output_index),"
+                    " FOREIGN KEY(response_id) REFERENCES responses(id) ON DELETE CASCADE"
+                    ")");
+            version = 1;
         }
-        execute(database,
-                "CREATE TABLE responses ("
-                " id TEXT PRIMARY KEY NOT NULL,"
-                " revision INTEGER NOT NULL,"
-                " status TEXT NOT NULL,"
-                " created_at INTEGER NOT NULL,"
-                " completed_at INTEGER,"
-                " expires_at INTEGER,"
-                " next_sequence_number INTEGER NOT NULL,"
-                " previous_response_id TEXT,"
-                " state_json TEXT NOT NULL,"
-                " payload_bytes INTEGER NOT NULL"
-                ")");
-        execute(database, "CREATE INDEX responses_previous_response_idx ON responses(previous_response_id)");
-        execute(database,
-                "CREATE TABLE response_items ("
-                " item_id TEXT PRIMARY KEY NOT NULL,"
-                " response_id TEXT NOT NULL,"
-                " output_index INTEGER NOT NULL,"
-                " UNIQUE(response_id, output_index),"
-                " FOREIGN KEY(response_id) REFERENCES responses(id) ON DELETE CASCADE"
-                ")");
-        execute(database, "PRAGMA user_version=1");
+        if (version == 1) {
+            execute(database,
+                    "CREATE TABLE response_events ("
+                    " response_id TEXT NOT NULL,"
+                    " sequence_number INTEGER NOT NULL,"
+                    " event_type TEXT NOT NULL,"
+                    " event_json TEXT NOT NULL,"
+                    " payload_bytes INTEGER NOT NULL,"
+                    " PRIMARY KEY(response_id, sequence_number),"
+                    " FOREIGN KEY(response_id) REFERENCES responses(id) ON DELETE CASCADE"
+                    ") WITHOUT ROWID");
+            version = 2;
+        }
+        if (version == 2) {
+            execute(database,
+                    "CREATE TABLE response_heads ("
+                    " response_id TEXT PRIMARY KEY NOT NULL,"
+                    " revision INTEGER NOT NULL,"
+                    " generation_revision INTEGER NOT NULL,"
+                    " status TEXT NOT NULL,"
+                    " completed_at INTEGER,"
+                    " next_sequence_number INTEGER NOT NULL,"
+                    " journal_enabled INTEGER NOT NULL,"
+                    " FOREIGN KEY(response_id) REFERENCES responses(id) ON DELETE CASCADE"
+                    ") WITHOUT ROWID");
+            execute(database,
+                    "CREATE TABLE response_lineage ("
+                    " response_id TEXT PRIMARY KEY NOT NULL,"
+                    " detached_context_json TEXT NOT NULL,"
+                    " FOREIGN KEY(response_id) REFERENCES responses(id) ON DELETE CASCADE"
+                    ") WITHOUT ROWID");
+
+            // detached_context lived inside the v1 state payload. Extract it
+            // once during migration so future head-only generation writes and
+            // graph materialization never have to parse it from the hot path.
+            sqlite_statement payloads(database,
+                                      "SELECT id, revision, status, completed_at, next_sequence_number, state_json, "
+                                      "EXISTS(SELECT 1 FROM response_events WHERE response_events.response_id="
+                                      "responses.id) FROM responses");
+            while (payloads.step_row()) {
+                const response_state state = deserialize_payload(payloads.column_text(5));
+                sqlite_statement     insert(database,
+                                            "INSERT INTO response_heads "
+                                            "(response_id, revision, generation_revision, status, completed_at, "
+                                            "next_sequence_number, journal_enabled) VALUES (?, ?, ?, ?, ?, ?, ?)");
+                insert.bind_text(1, payloads.column_text(0));
+                insert.bind_int64(2, payloads.column_uint64(1));
+                insert.bind_int64(3, payloads.column_uint64(1));
+                insert.bind_text(4, payloads.column_text(2));
+                if (payloads.column_is_null(3)) {
+                    insert.bind_null(5);
+                } else {
+                    insert.bind_int64(5, payloads.column_uint64(3));
+                }
+                insert.bind_int64(6, payloads.column_uint64(4));
+                insert.bind_int64(7, payloads.column_uint64(6) != 0 ? 1U : 0U);
+                insert.step_done();
+                if (state.legacy_lineage_checkpoint) {
+                    sqlite_statement lineage(
+                        database, "INSERT INTO response_lineage (response_id, detached_context_json) VALUES (?, ?)");
+                    lineage.bind_text(1, payloads.column_text(0));
+                    lineage.bind_text(2, state.legacy_lineage_checkpoint->dump());
+                    lineage.step_done();
+                }
+            }
+            version = 4;
+        }
+        if (version == 3) {
+            // Schema 3 existed briefly during development with the hot fields
+            // added to the large responses row. Accept those local databases
+            // and move their current heads/lineage into the split layout.
+            bool has_heads = false;
+            {
+                sqlite_statement heads_exist(
+                    database, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='response_heads'");
+                has_heads = heads_exist.step_row();
+            }
+            if (!has_heads) {
+                execute(database,
+                        "CREATE TABLE response_heads ("
+                        " response_id TEXT PRIMARY KEY NOT NULL,"
+                        " revision INTEGER NOT NULL,"
+                        " generation_revision INTEGER NOT NULL,"
+                        " status TEXT NOT NULL,"
+                        " completed_at INTEGER,"
+                        " next_sequence_number INTEGER NOT NULL,"
+                        " journal_enabled INTEGER NOT NULL,"
+                        " FOREIGN KEY(response_id) REFERENCES responses(id) ON DELETE CASCADE"
+                        ") WITHOUT ROWID");
+                execute(database,
+                        "CREATE TABLE response_lineage ("
+                        " response_id TEXT PRIMARY KEY NOT NULL,"
+                        " detached_context_json TEXT NOT NULL,"
+                        " FOREIGN KEY(response_id) REFERENCES responses(id) ON DELETE CASCADE"
+                        ") WITHOUT ROWID");
+                execute(database,
+                        "INSERT INTO response_heads "
+                        "(response_id, revision, generation_revision, status, completed_at, "
+                        "next_sequence_number, journal_enabled) "
+                        "SELECT id, revision, generation_revision, status, completed_at, "
+                        "next_sequence_number, journal_enabled FROM responses");
+                execute(database,
+                        "INSERT INTO response_lineage (response_id, detached_context_json) "
+                        "SELECT id, detached_context_json FROM responses WHERE detached_context_json IS NOT NULL");
+            } else {
+                bool has_lineage = false;
+                {
+                    sqlite_statement lineage_exists(
+                        database, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='response_lineage'");
+                    has_lineage = lineage_exists.step_row();
+                }
+                bool head_has_detached_context = false;
+                {
+                    sqlite_statement columns(database, "PRAGMA table_info(response_heads)");
+                    while (columns.step_row()) {
+                        head_has_detached_context =
+                            head_has_detached_context || columns.column_text(1) == "detached_context_json";
+                    }
+                }
+                if (!has_lineage) {
+                    execute(database,
+                            "CREATE TABLE response_lineage ("
+                            " response_id TEXT PRIMARY KEY NOT NULL,"
+                            " detached_context_json TEXT NOT NULL,"
+                            " FOREIGN KEY(response_id) REFERENCES responses(id) ON DELETE CASCADE"
+                            ") WITHOUT ROWID");
+                }
+                if (head_has_detached_context) {
+                    execute(database,
+                            "INSERT OR REPLACE INTO response_lineage (response_id, detached_context_json) "
+                            "SELECT response_id, detached_context_json FROM response_heads "
+                            "WHERE detached_context_json IS NOT NULL");
+                    execute(database,
+                            "CREATE TABLE response_heads_v4 ("
+                            " response_id TEXT PRIMARY KEY NOT NULL,"
+                            " revision INTEGER NOT NULL,"
+                            " generation_revision INTEGER NOT NULL,"
+                            " status TEXT NOT NULL,"
+                            " completed_at INTEGER,"
+                            " next_sequence_number INTEGER NOT NULL,"
+                            " journal_enabled INTEGER NOT NULL,"
+                            " FOREIGN KEY(response_id) REFERENCES responses(id) ON DELETE CASCADE"
+                            ") WITHOUT ROWID");
+                    execute(database,
+                            "INSERT INTO response_heads_v4 "
+                            "(response_id, revision, generation_revision, status, completed_at, "
+                            "next_sequence_number, journal_enabled) "
+                            "SELECT response_id, revision, generation_revision, status, completed_at, "
+                            "next_sequence_number, journal_enabled FROM response_heads");
+                    execute(database, "DROP TABLE response_heads");
+                    execute(database, "ALTER TABLE response_heads_v4 RENAME TO response_heads");
+                }
+            }
+            version = 4;
+        }
+        if (version == 4) {
+            execute(database, "ALTER TABLE responses ADD COLUMN deleted_at INTEGER");
+            execute(database,
+                    "CREATE INDEX responses_live_created_idx ON responses(created_at, id) "
+                    "WHERE deleted_at IS NULL");
+            version = 5;
+        }
+        if (version != database_schema_version) {
+            throw std::runtime_error("SQLite response store requires an unavailable schema migration");
+        }
+        execute(database, "PRAGMA user_version=5");
         transaction.commit();
     }
 
     static bool integers_fit(const response_state & state) {
-        constexpr std::uint64_t maximum = static_cast<std::uint64_t>(std::numeric_limits<sqlite3_int64>::max());
-        return state.created_at <= maximum && state.revision <= maximum && state.next_sequence_number <= maximum &&
-               (!state.completed_at || *state.completed_at <= maximum) && state.output.size() <= maximum;
+        return state.created_at <= sqlite_integer_maximum && state.revision <= sqlite_integer_maximum &&
+               state.next_sequence_number <= sqlite_integer_maximum &&
+               (!state.completed_at || *state.completed_at <= sqlite_integer_maximum) &&
+               state.output.size() <= sqlite_integer_maximum;
     }
 
     static void bind_optional_uint64(sqlite_statement &                   statement,
@@ -611,11 +1010,60 @@ class sqlite_response_store::impl {
         statement.bind_int64(first_index + 8, payload.size());
     }
 
-    std::optional<response_state> load(const response_id & id) const {
+    void insert_head(const response_state & state) {
+        sqlite_statement insert(database,
+                                "INSERT INTO response_heads "
+                                "(response_id, revision, generation_revision, status, completed_at, "
+                                "next_sequence_number, journal_enabled) VALUES (?, ?, ?, ?, ?, ?, ?)");
+        insert.bind_text(1, state.id.str());
+        insert.bind_int64(2, state.revision);
+        insert.bind_int64(3, state.revision);
+        insert.bind_text(4, response_status_name(state.status));
+        bind_optional_uint64(insert, 5, state.completed_at);
+        insert.bind_int64(6, state.next_sequence_number);
+        insert.bind_int64(7, response_store_detail::event_journal_enabled(state) ? 1U : 0U);
+        insert.step_done();
+    }
+
+    struct stored_response_head {
+        response_store_head value;
+        std::uint64_t       generation_revision = 0;
+    };
+
+    std::optional<stored_response_head> load_head(const response_id & id) const {
         sqlite_statement statement(database,
-                                   "SELECT id, revision, status, created_at, completed_at, "
-                                   "next_sequence_number, previous_response_id, state_json "
-                                   "FROM responses WHERE id=?");
+                                   "SELECT h.response_id, h.revision, h.generation_revision, h.status, "
+                                   "h.next_sequence_number, h.journal_enabled FROM response_heads AS h "
+                                   "JOIN responses AS r ON r.id=h.response_id "
+                                   "WHERE h.response_id=? AND r.deleted_at IS NULL");
+        statement.bind_text(1, id.str());
+        if (!statement.step_row()) {
+            return std::nullopt;
+        }
+
+        stored_response_head result;
+        result.value.id                   = response_id(statement.column_text(0));
+        result.value.revision             = statement.column_uint64(1);
+        result.generation_revision        = statement.column_uint64(2);
+        result.value.status               = parse_status(statement.column_text(3));
+        result.value.next_sequence_number = statement.column_uint64(4);
+        result.value.event_journal        = statement.column_uint64(5) != 0;
+        return result;
+    }
+
+    std::optional<response_state> load(const response_id & id, bool include_deleted = false) const {
+        const char *     sql = include_deleted ? "SELECT r.id, h.revision, h.status, r.created_at, h.completed_at, "
+                                                 "h.next_sequence_number, r.previous_response_id, r.state_json, "
+                                                 "l.detached_context_json FROM responses AS r "
+                                                 "JOIN response_heads AS h ON h.response_id=r.id "
+                                                 "LEFT JOIN response_lineage AS l ON l.response_id=r.id WHERE r.id=?" :
+                                                 "SELECT r.id, h.revision, h.status, r.created_at, h.completed_at, "
+                                                 "h.next_sequence_number, r.previous_response_id, r.state_json, "
+                                                 "l.detached_context_json FROM responses AS r "
+                                                 "JOIN response_heads AS h ON h.response_id=r.id "
+                                                 "LEFT JOIN response_lineage AS l ON l.response_id=r.id "
+                                                 "WHERE r.id=? AND r.deleted_at IS NULL";
+        sqlite_statement statement(database, sql);
         statement.bind_text(1, id.str());
         if (!statement.step_row()) {
             return std::nullopt;
@@ -633,10 +1081,66 @@ class sqlite_response_store::impl {
         if (!statement.column_is_null(6)) {
             state.previous_response = response_id(statement.column_text(6));
         }
+        if (!statement.column_is_null(8)) {
+            state.legacy_lineage_checkpoint = common_json::parse(statement.column_text(8));
+        }
         if (!response_store_detail::valid_state(state)) {
             throw std::runtime_error("SQLite response store contains an invalid response state");
         }
         return state;
+    }
+
+    std::optional<common_json> materialize(const response_id & id, bool include_target_output) const {
+        sqlite_statement query(
+            database,
+            "WITH RECURSIVE lineage(id, previous_response_id, state_json, checkpoint_json) AS ("
+            " SELECT r.id, r.previous_response_id, r.state_json, l.detached_context_json"
+            " FROM responses AS r LEFT JOIN response_lineage AS l ON l.response_id=r.id"
+            " WHERE r.id=? AND r.deleted_at IS NULL"
+            " UNION"
+            " SELECT parent.id, parent.previous_response_id, parent.state_json, l.detached_context_json"
+            " FROM responses AS parent JOIN lineage AS child ON parent.id=child.previous_response_id"
+            " LEFT JOIN response_lineage AS l ON l.response_id=parent.id"
+            " WHERE child.checkpoint_json IS NULL"
+            ") SELECT id, previous_response_id, state_json, checkpoint_json FROM lineage");
+        query.bind_text(1, id.str());
+
+        std::map<response_id, response_state> nodes;
+        while (query.step_row()) {
+            response_state state = deserialize_payload(query.column_text(2));
+            state.id             = response_id(query.column_text(0));
+            if (!query.column_is_null(1)) {
+                state.previous_response = response_id(query.column_text(1));
+            }
+            if (!query.column_is_null(3)) {
+                state.legacy_lineage_checkpoint = common_json::parse(query.column_text(3));
+            }
+            if (!response_store_detail::valid_state(state) || !nodes.emplace(state.id, std::move(state)).second) {
+                throw std::runtime_error("SQLite response store contains an invalid lineage node");
+            }
+        }
+        if (nodes.empty()) {
+            return std::nullopt;
+        }
+
+        std::vector<const response_state *> lineage;
+        std::set<response_id>               visited;
+        auto                                current = nodes.find(id);
+        for (;;) {
+            if (current == nodes.end()) {
+                throw std::runtime_error("SQLite response lineage references a missing ancestor");
+            }
+            if (!visited.insert(current->first).second) {
+                throw std::runtime_error("SQLite response lineage contains a cycle");
+            }
+            lineage.push_back(&current->second);
+            if (current->second.legacy_lineage_checkpoint || !current->second.previous_response) {
+                break;
+            }
+            current = nodes.find(*current->second.previous_response);
+        }
+        std::reverse(lineage.begin(), lineage.end());
+        return response_store_detail::materialize_lineage(lineage, include_target_output);
     }
 
     bool item_ids_available(const response_state & state) const {
@@ -661,8 +1165,26 @@ class sqlite_response_store::impl {
         }
     }
 
-    sqlite3 *          database = nullptr;
-    mutable std::mutex mutex;
+    void insert_events(const response_id & id, const std::vector<common_json> & events) {
+        for (const common_json & event : events) {
+            const std::string payload = event.dump();
+            sqlite_statement  statement(
+                database,
+                "INSERT INTO response_events "
+                "(response_id, sequence_number, event_type, event_json, payload_bytes) VALUES (?, ?, ?, ?, ?)");
+            statement.bind_text(1, id.str());
+            statement.bind_int64(2, event.at("sequence_number").get<std::uint64_t>());
+            statement.bind_text(3, event.at("type").get<std::string>());
+            statement.bind_text(4, payload);
+            statement.bind_int64(5, payload.size());
+            statement.step_done();
+        }
+    }
+
+    sqlite3 *                       database = nullptr;
+    mutable std::mutex              mutex;
+    mutable std::condition_variable event_condition;
+    std::uint64_t                   event_epoch = 0;
 };
 
 std::string default_sqlite_response_store_path() {
@@ -677,12 +1199,18 @@ sqlite_response_store::sqlite_response_store(const std::string & path) : pimpl(s
 
 sqlite_response_store::~sqlite_response_store() = default;
 
-store_write_result sqlite_response_store::create(response_state state) {
-    return pimpl->create(std::move(state));
+store_write_result sqlite_response_store::create(response_state state, const std::vector<common_json> & events) {
+    return pimpl->create(std::move(state), events);
 }
 
-store_write_result sqlite_response_store::replace(response_state state) {
-    return pimpl->replace(std::move(state));
+store_write_result sqlite_response_store::replace(response_state state, const std::vector<common_json> & events) {
+    return pimpl->replace(std::move(state), events);
+}
+
+generation_store_write sqlite_response_store::advance_generation(const response_state & state,
+                                                                 std::uint64_t          expected_generation_revision,
+                                                                 const std::vector<common_json> & events) {
+    return pimpl->advance_generation(state, expected_generation_revision, events);
 }
 
 std::optional<response_state> sqlite_response_store::find(const response_id & id) const {
@@ -691,6 +1219,24 @@ std::optional<response_state> sqlite_response_store::find(const response_id & id
 
 std::optional<stored_response_item> sqlite_response_store::find_item(const item_id & id) const {
     return pimpl->find_item(id);
+}
+
+std::optional<common_json> sqlite_response_store::materialize_input_items(const response_id & id) const {
+    return pimpl->materialize_input_items(id);
+}
+
+std::optional<common_json> sqlite_response_store::materialize_continuation_context(const response_id & id) const {
+    return pimpl->materialize_continuation_context(id);
+}
+
+std::optional<response_event_page> sqlite_response_store::events_after(
+    const response_id &                  id,
+    const std::optional<std::uint64_t> & starting_after) const {
+    return pimpl->events_after(id, starting_after);
+}
+
+bool sqlite_response_store::wait_for_event_change(std::uint64_t observed_epoch, std::uint64_t timeout_ms) const {
+    return pimpl->wait_for_event_change(observed_epoch, timeout_ms);
 }
 
 bool sqlite_response_store::erase(const response_id & id) {

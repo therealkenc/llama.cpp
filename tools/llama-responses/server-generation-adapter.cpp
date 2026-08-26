@@ -44,45 +44,6 @@ response_error response_error_from_server(const server_generation_error & error)
     };
 }
 
-bool same_error(const std::optional<response_error> & lhs, const std::optional<response_error> & rhs) {
-    if (lhs.has_value() != rhs.has_value()) {
-        return false;
-    }
-    return !lhs || (lhs->code == rhs->code && lhs->message == rhs->message && lhs->param == rhs->param);
-}
-
-bool same_usage(const response_usage & lhs, const response_usage & rhs) {
-    return lhs.input_tokens == rhs.input_tokens && lhs.cached_input_tokens == rhs.cached_input_tokens &&
-           lhs.output_tokens == rhs.output_tokens && lhs.reasoning_output_tokens == rhs.reasoning_output_tokens;
-}
-
-bool same_output(const std::vector<response_output_item> & lhs, const std::vector<response_output_item> & rhs) {
-    if (lhs.size() != rhs.size()) {
-        return false;
-    }
-    for (std::size_t index = 0; index < lhs.size(); ++index) {
-        if (lhs[index].id != rhs[index].id || lhs[index].call != rhs[index].call ||
-            lhs[index].type != rhs[index].type || lhs[index].value != rhs[index].value) {
-            return false;
-        }
-    }
-    return true;
-}
-
-// An ancestor deletion may fold prompt-visible lineage into an active child.
-// That deliberately increments the child's store revision, but it is not a
-// competing generation write. Retry only when every generation-owned field is
-// still exactly the snapshot this sink last committed.
-bool same_generation_state(const response_state & lhs, const response_state & rhs) {
-    return lhs.id == rhs.id && lhs.status == rhs.status && lhs.created_at == rhs.created_at &&
-           lhs.completed_at == rhs.completed_at && lhs.next_sequence_number == rhs.next_sequence_number &&
-           lhs.model == rhs.model && lhs.previous_response == rhs.previous_response && lhs.request == rhs.request &&
-           lhs.metadata == rhs.metadata && lhs.input_items == rhs.input_items &&
-           lhs.continuation_input_items == rhs.continuation_input_items && lhs.wire_snapshot == rhs.wire_snapshot &&
-           same_output(lhs.output, rhs.output) && same_usage(lhs.usage, rhs.usage) &&
-           same_error(lhs.error, rhs.error) && lhs.incomplete_details == rhs.incomplete_details;
-}
-
 common_json parse_arguments(const std::string & arguments) {
     if (arguments.empty()) {
         return common_json::object();
@@ -157,13 +118,17 @@ std::string normalize_apply_patch_input(const std::string & input) {
 std::optional<std::string> semantic_custom_input(const std::string & raw_arguments,
                                                  const std::string & name,
                                                  bool                terminal) {
+    // apply_patch normalization can retract or rewrite bytes (notably hunk
+    // ranges), so its parser snapshot is authoritative. Avoid reparsing the
+    // growing JSON wrapper before that terminal boundary.
+    if (name == "apply_patch" && !terminal) {
+        return std::nullopt;
+    }
     const common_json arguments = parse_arguments(raw_arguments);
     std::string       input;
     if (custom_input_if_present(arguments, input)) {
-        // Normalizing a partially parsed patch could require retracting bytes.
-        // Buffer it until the authoritative final parser snapshot instead.
         if (name == "apply_patch") {
-            return terminal ? std::optional<std::string>(normalize_apply_patch_input(input)) : std::nullopt;
+            return normalize_apply_patch_input(input);
         }
         return input;
     }
@@ -276,7 +241,16 @@ class server_delta_translator {
         std::string          upstream_call_id;
         std::string          raw_arguments;
         std::string          emitted_custom_input;
-        bool                 started = false;
+        std::size_t          boundary_cursor      = 0;
+        std::size_t          structured_depth     = 0;
+        bool                 argument_started     = false;
+        bool                 structured_argument  = false;
+        bool                 argument_string      = false;
+        bool                 argument_escape      = false;
+        bool                 structured_complete  = false;
+        bool                 structured_invalid   = false;
+        bool                 semantic_parse_tried = false;
+        bool                 started              = false;
     };
 
     std::map<std::size_t, tool_decode_state>     tools;
@@ -330,10 +304,67 @@ class server_delta_translator {
         }
     }
 
+    static void advance_argument_boundary(tool_decode_state & tool) {
+        for (; tool.boundary_cursor < tool.raw_arguments.size(); ++tool.boundary_cursor) {
+            const char character = tool.raw_arguments[tool.boundary_cursor];
+            if (!tool.argument_started) {
+                if (character == ' ' || character == '\t' || character == '\r' || character == '\n') {
+                    continue;
+                }
+                tool.argument_started    = true;
+                tool.structured_argument = character == '{' || character == '[';
+                if (!tool.structured_argument) {
+                    tool.structured_invalid = true;
+                    continue;
+                }
+                tool.structured_depth = 1;
+                continue;
+            }
+            if (!tool.structured_argument || tool.structured_invalid) {
+                continue;
+            }
+            if (tool.structured_complete) {
+                if (character != ' ' && character != '\t' && character != '\r' && character != '\n') {
+                    tool.structured_invalid = true;
+                }
+                continue;
+            }
+            if (tool.argument_string) {
+                if (tool.argument_escape) {
+                    tool.argument_escape = false;
+                } else if (character == '\\') {
+                    tool.argument_escape = true;
+                } else if (character == '"') {
+                    tool.argument_string = false;
+                }
+                continue;
+            }
+            if (character == '"') {
+                tool.argument_string = true;
+            } else if (character == '{' || character == '[') {
+                ++tool.structured_depth;
+            } else if (character == '}' || character == ']') {
+                if (tool.structured_depth == 0) {
+                    tool.structured_invalid = true;
+                } else {
+                    --tool.structured_depth;
+                    tool.structured_complete = tool.structured_depth == 0;
+                }
+            }
+        }
+    }
+
     static void emit_custom_delta(std::size_t                      index,
                                   tool_decode_state &              tool,
                                   bool                             terminal,
                                   std::vector<generation_update> & output) {
+        if (!terminal) {
+            advance_argument_boundary(tool);
+            if (!tool.structured_complete || tool.structured_invalid || tool.semantic_parse_tried) {
+                return;
+            }
+            tool.semantic_parse_tried = true;
+        }
         const std::optional<std::string> current =
             semantic_custom_input(tool.raw_arguments, tool.public_name, terminal);
         if (!current) {
@@ -467,27 +498,66 @@ class native_server_generation_sink::impl {
          std::string                                  id_namespace,
          bool                                         stream,
          response_store *                             store,
-         std::unordered_map<std::string, common_json> tool_metadata) :
+         std::unordered_map<std::string, common_json> tool_metadata,
+         bool                                         journal_events) :
         ids(std::move(id_namespace)),
         machine(std::move(context), ids),
         translator(std::move(tool_metadata)),
         stream(stream),
-        store(store) {}
+        store(store),
+        journal_events(journal_events) {
+        if (journal_events && store == nullptr) {
+            throw std::invalid_argument("journaled Responses generation requires durable storage");
+        }
+    }
 
     std::string accept(const server_generation_update & update) {
         std::lock_guard<std::mutex> lock(mutex);
         if (checkpoint_failed) {
             return {};
         }
-
-        const std::vector<generation_update> translated = translator.consume(update);
-        std::vector<response_event>          events;
-        for (const generation_update & native_update : translated) {
-            std::vector<response_event> next = machine.apply(native_update);
-            events.insert(events.end(), std::make_move_iterator(next.begin()), std::make_move_iterator(next.end()));
+        const bool failed_update    = std::holds_alternative<server_generation_failed>(update);
+        const bool cancelled_update = std::holds_alternative<server_generation_cancelled>(update);
+        const bool terminal_update  = failed_update || cancelled_update ||
+                                      std::holds_alternative<server_generation_completed>(update) ||
+                                      std::holds_alternative<server_generation_incomplete>(update);
+        const bool recovery_update =
+            std::holds_alternative<server_generation_started>(update) || failed_update || cancelled_update;
+        if (acceptance_failed && !recovery_update) {
+            throw std::logic_error("generation projection rejected a non-terminal update after an earlier failure");
         }
 
-        if (!checkpoint()) {
+        std::vector<response_event> events = std::move(pending_events);
+        std::vector<common_json>    journal_batch;
+        std::string                 stream_output;
+        try {
+            const std::vector<generation_update> translated = translator.consume(update);
+            for (const generation_update & native_update : translated) {
+                std::vector<response_event> next = machine.apply(native_update);
+                events.insert(events.end(), std::make_move_iterator(next.begin()), std::make_move_iterator(next.end()));
+            }
+
+            if (journal_events) {
+                journal_batch.reserve(events.size());
+                for (const response_event & event : events) {
+                    journal_batch.push_back(render_generation_event(event));
+                }
+            }
+
+            // Render before committing. If projection itself fails, the next
+            // failed update can still publish and checkpoint the complete
+            // uncommitted suffix without leaving a client-visible gap.
+            stream_output = stream ? sse_frames(events) : std::string();
+        } catch (...) {
+            acceptance_failed                   = true;
+            std::vector<response_event> partial = machine.take_pending_events();
+            events.insert(events.end(), std::make_move_iterator(partial.begin()),
+                          std::make_move_iterator(partial.end()));
+            pending_events = std::move(events);
+            throw;
+        }
+
+        if (!checkpoint(journal_batch)) {
             cancellation_requested.store(true);
             discard_persisted_state_unlocked();
             checkpoint_failed = true;
@@ -497,6 +567,10 @@ class native_server_generation_sink::impl {
             }
             return storage_error_frame(next_stream_sequence++, checkpoint_error);
         }
+        pending_events.clear();
+        if (terminal_update) {
+            acceptance_failed = false;
+        }
 
         if (machine.terminal()) {
             terminal_condition.notify_all();
@@ -505,11 +579,10 @@ class native_server_generation_sink::impl {
         if (!stream) {
             return {};
         }
-        const std::string output = sse_frames(events);
         if (!events.empty()) {
             next_stream_sequence = events.back().sequence_number + 1;
         }
-        return output;
+        return stream_output;
     }
 
     common_json snapshot() const {
@@ -522,12 +595,12 @@ class native_server_generation_sink::impl {
 
     response_id id() const {
         std::lock_guard<std::mutex> lock(mutex);
-        return machine.state().id;
+        return machine.active_state().id;
     }
 
     response_state state() const {
         std::lock_guard<std::mutex> lock(mutex);
-        response_state              result = machine.state();
+        response_state              result = machine.materialized_state();
         result.revision                    = persisted_revision;
         return result;
     }
@@ -558,43 +631,44 @@ class native_server_generation_sink::impl {
         discard_persisted_state_unlocked();
     }
 
-    bool checkpoint() {
+    bool checkpoint(const std::vector<common_json> & events) {
         if (store == nullptr) {
             return true;
         }
         try {
-            response_state     current = machine.state();
-            store_write_result result;
-            std::uint64_t      next_revision;
             if (persisted_revision == 0) {
-                result        = store->create(current);
-                next_revision = 1;
-            } else {
-                if (persisted_state && persisted_state->detached_context) {
-                    current.detached_context = persisted_state->detached_context;
+                response_state           current = machine.materialized_state();
+                const store_write_result result  = store->create(std::move(current), events);
+                if (result != store_write_result::stored) {
+                    checkpoint_error = "The generated response could not be persisted (" +
+                                       std::string(store_write_result_name(result)) + ")";
+                    return false;
                 }
-                current.revision = persisted_revision;
-                result           = store->replace(current);
-                next_revision    = persisted_revision + 1;
-
-                if (result == store_write_result::stale_revision && persisted_state) {
-                    const auto latest = store->find(current.id);
-                    if (latest && same_generation_state(*latest, *persisted_state)) {
-                        current.revision         = latest->revision;
-                        current.detached_context = latest->detached_context;
-                        result                   = store->replace(current);
-                        next_revision            = latest->revision + 1;
-                    }
-                }
+                persisted_revision = 1;
+                return true;
             }
-            if (result != store_write_result::stored) {
+
+            // Without a public event journal, intermediate output lives in
+            // the active in-process projection. Polling needs only the stable
+            // in-progress head; the complete durable snapshot is installed at
+            // the terminal boundary.
+            if (!machine.terminal() && (!journal_events || events.empty())) {
+                return true;
+            }
+
+            generation_store_write result;
+            if (machine.terminal()) {
+                response_state current = machine.materialized_state();
+                result                 = store->advance_generation(current, persisted_revision, events);
+            } else {
+                result = store->advance_generation(machine.active_state(), persisted_revision, events);
+            }
+            if (result.result != store_write_result::stored) {
                 checkpoint_error = "The generated response could not be persisted (" +
-                                   std::string(store_write_result_name(result)) + ")";
+                                   std::string(store_write_result_name(result.result)) + ")";
                 return false;
             }
-            persisted_revision = next_revision;
-            current.revision   = persisted_revision;
-            persisted_state    = std::move(current);
+            persisted_revision = result.revision;
             return true;
         } catch (const std::exception & error) {
             checkpoint_error = std::string("The generated response could not be persisted: ") + error.what();
@@ -607,7 +681,7 @@ class native_server_generation_sink::impl {
             return;
         }
         try {
-            store->erase(machine.state().id);
+            store->erase(machine.active_state().id);
             // Cleanup is best effort; the owning route reports the original
             // generation or storage failure and must not replace it here.
             // NOLINTNEXTLINE(bugprone-empty-catch)
@@ -621,24 +695,30 @@ class native_server_generation_sink::impl {
     server_delta_translator         translator;
     const bool                      stream;
     response_store * const          store;
+    const bool                      journal_events;
     mutable std::mutex              mutex;
     mutable std::condition_variable terminal_condition;
     std::atomic_bool                cancellation_requested{ false };
-    std::uint64_t                   persisted_revision = 0;
-    std::optional<response_state>   persisted_state;
+    std::uint64_t                   persisted_revision   = 0;
     std::uint64_t                   next_stream_sequence = 0;
-    bool                            checkpoint_failed    = false;
+    std::vector<response_event>     pending_events;
+    bool                            acceptance_failed = false;
+    bool                            checkpoint_failed = false;
     std::string                     checkpoint_error;
 };
 
-native_server_generation_sink::native_server_generation_sink(
-    generation_response_context                  context,
-    std::string                                  id_namespace,
-    bool                                         stream,
-    response_store *                             store,
-    std::unordered_map<std::string, common_json> tool_metadata) :
-    implementation(
-        std::make_unique<impl>(std::move(context), std::move(id_namespace), stream, store, std::move(tool_metadata))) {}
+native_server_generation_sink::native_server_generation_sink(generation_response_context                  context,
+                                                             std::string                                  id_namespace,
+                                                             bool                                         stream,
+                                                             response_store *                             store,
+                                                             std::unordered_map<std::string, common_json> tool_metadata,
+                                                             bool journal_events) :
+    implementation(std::make_unique<impl>(std::move(context),
+                                          std::move(id_namespace),
+                                          stream,
+                                          store,
+                                          std::move(tool_metadata),
+                                          journal_events)) {}
 
 native_server_generation_sink::~native_server_generation_sink() = default;
 

@@ -159,6 +159,30 @@ void test_resource_service() {
     PROTOCOL_CHECK(invalid.kind == resource_result_kind::invalid_request);
     PROTOCOL_CHECK(invalid.body.at("error").at("param").get<std::string>() == "limit");
 
+    common_json child_request             = make_request();
+    child_request["input"]                = "child input";
+    child_request["previous_response_id"] = "resp_protocol";
+    common_json child_wire                = make_wire_response();
+    child_wire["id"]                      = "resp_protocol_child";
+    child_wire["previous_response_id"]    = "resp_protocol";
+    child_wire["output"][0]["id"]         = "msg_protocol_child";
+    child_wire["output"][1]["id"]         = "fc_protocol_child";
+    child_wire["output"][1]["call_id"]    = "call_protocol_child";
+    const common_json child_inputs =
+        capture_input_items(child_request, [](std::size_t, const common_json &) { return item_id("msg_child_input"); });
+    const response_state child = capture_response_state(child_wire, child_request, child_inputs);
+    PROTOCOL_CHECK(child.input_items.size() == 1);
+    PROTOCOL_CHECK(store.create(child) == store_write_result::stored);
+
+    input_item_page_options child_page;
+    child_page.limit             = 2;
+    resource_result child_listed = service.list_input_items(response_id("resp_protocol_child"), child_page);
+    PROTOCOL_CHECK(child_listed.ok());
+    PROTOCOL_CHECK(child_listed.body.at("data").size() == 2);
+    PROTOCOL_CHECK(child_listed.body.at("first_id") == "msg_child_input");
+    PROTOCOL_CHECK(child_listed.body.at("last_id") == "fc_protocol");
+    PROTOCOL_CHECK(child_listed.body.at("has_more").get<bool>());
+
     resource_result deleted = service.erase(response_id("resp_protocol"));
     PROTOCOL_CHECK(deleted.ok());
     PROTOCOL_CHECK(deleted.body.at("deleted").get<bool>());
@@ -167,6 +191,33 @@ void test_resource_service() {
     resource_result missing = service.retrieve(response_id("resp_protocol"));
     PROTOCOL_CHECK(missing.kind == resource_result_kind::not_found);
     PROTOCOL_CHECK(missing.body.at("error").at("code").get<std::string>() == "response_not_found");
+    PROTOCOL_CHECK(service.list_input_items(response_id("resp_protocol"), {}).kind == resource_result_kind::not_found);
+    PROTOCOL_CHECK(!store.find_item(item_id("msg_protocol")).has_value());
+
+    child_page.order = input_item_order::ascending;
+    child_page.limit = 100;
+    child_listed     = service.list_input_items(response_id("resp_protocol_child"), child_page);
+    PROTOCOL_CHECK(child_listed.ok());
+    PROTOCOL_CHECK(child_listed.body.at("data").size() == 6);
+    PROTOCOL_CHECK(child_listed.body.at("data").at(0).at("id") == "msg_input_0");
+    PROTOCOL_CHECK(child_listed.body.at("data").at(3).at("id") == "msg_protocol");
+    PROTOCOL_CHECK(child_listed.body.at("data").at(5).at("id") == "msg_child_input");
+    PROTOCOL_CHECK(service.retrieve(response_id("resp_protocol_child")).ok());
+    PROTOCOL_CHECK(service.erase(response_id("resp_protocol_child")).ok());
+
+    common_json active_wire             = make_wire_response();
+    active_wire["id"]                   = "resp_protocol_active";
+    active_wire["status"]               = "in_progress";
+    active_wire["completed_at"]         = nullptr;
+    active_wire["output"][0]["id"]      = "msg_protocol_active";
+    active_wire["output"][1]["id"]      = "fc_protocol_active";
+    active_wire["output"][1]["call_id"] = "call_protocol_active";
+    const response_state active         = capture_response_state(active_wire, make_request());
+    PROTOCOL_CHECK(store.create(active) == store_write_result::stored);
+    const resource_result active_deleted = service.erase(active.id);
+    PROTOCOL_CHECK(active_deleted.kind == resource_result_kind::conflict);
+    PROTOCOL_CHECK(active_deleted.body.at("error").at("code") == "response_active");
+    PROTOCOL_CHECK(service.retrieve(active.id).ok());
 }
 
 void test_errors_and_validation() {

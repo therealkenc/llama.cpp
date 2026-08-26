@@ -95,4 +95,13 @@ if (LLAMA_BUILD_TESTS)
     target_link_libraries(test-llama-responses-sqlite-store PRIVATE llama-responses)
     target_compile_features(test-llama-responses-sqlite-store PRIVATE cxx_std_17)
     add_test(NAME test-llama-responses-sqlite-store COMMAND test-llama-responses-sqlite-store)
+
+    # This is intentionally not a CTest. It reports scaling evidence for the
+    # Responses projection and persistence path without making wall-clock
+    # performance a correctness gate.
+    add_executable(bench-llama-responses-generation
+        tests/bench-server-generation-adapter.cpp
+    )
+    target_link_libraries(bench-llama-responses-generation PRIVATE llama-responses)
+    target_compile_features(bench-llama-responses-generation PRIVATE cxx_std_17)
 endif()

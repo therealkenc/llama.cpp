@@ -19,12 +19,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <ctime>
 #include <exception>
 #include <functional>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -978,6 +980,126 @@ void validate_unique_input_item_ids(const common_json & items) {
     }
 }
 
+std::optional<std::uint64_t> parse_starting_after(const server_http_req & request) {
+    const auto found = request.params.find("starting_after");
+    if (found == request.params.end()) {
+        return std::nullopt;
+    }
+    if (found->second.empty() || !std::all_of(found->second.begin(), found->second.end(),
+                                              [](unsigned char character) { return std::isdigit(character) != 0; })) {
+        throw invalid_request_field("starting_after", "invalid_parameter",
+                                    "Invalid starting_after event sequence number");
+    }
+    try {
+        std::size_t         parsed = 0;
+        const std::uint64_t value  = std::stoull(found->second, &parsed);
+        if (parsed != found->second.size()) {
+            throw std::invalid_argument("trailing cursor data");
+        }
+        return value;
+    } catch (const std::exception &) {
+        throw invalid_request_field("starting_after", "invalid_parameter",
+                                    "Invalid starting_after event sequence number");
+    }
+}
+
+std::uint64_t event_sequence_number(const common_json & event) {
+    if (!event.is_object() || !event.contains("sequence_number") || !event.at("sequence_number").is_number_integer()) {
+        throw std::runtime_error("Stored Responses event has no sequence number");
+    }
+    return event.at("sequence_number").get<std::uint64_t>();
+}
+
+std::string event_sse_frames(const std::vector<common_json> & events) {
+    std::string output;
+    for (const common_json & event : events) {
+        if (!event.is_object() || !event.contains("type") || !event.at("type").is_string()) {
+            throw std::runtime_error("Stored Responses event has no type");
+        }
+        output += "event: ";
+        output += event.at("type").get<std::string>();
+        output += "\ndata: ";
+        output += event.dump();
+        output += "\n\n";
+    }
+    return output;
+}
+
+std::string stream_error_sse_frame(const std::optional<std::uint64_t> & cursor,
+                                   const std::string &                  code,
+                                   const std::string &                  message) {
+    std::uint64_t sequence_number = 0;
+    if (cursor) {
+        sequence_number = *cursor == std::numeric_limits<std::uint64_t>::max() ? *cursor : *cursor + 1U;
+    }
+    const common_json event = {
+        { "type",            "error"         },
+        { "sequence_number", sequence_number },
+        { "code",            code            },
+        { "message",         message         },
+        { "param",           nullptr         },
+    };
+    return "event: error\ndata: " + event.dump() + "\n\n";
+}
+
+struct response_journal_cursor {
+    response_store &                               store;
+    response_id                                    id;
+    std::optional<std::uint64_t>                   cursor;
+    std::function<bool()>                          should_stop;
+    std::shared_ptr<native_server_generation_sink> active_sink;
+
+    bool next(std::string & output) {
+        try {
+            while (!should_stop()) {
+                const auto page = store.events_after(id, cursor);
+                if (!page) {
+                    if (active_sink && active_sink->storage_failed()) {
+                        output = stream_error_sse_frame(cursor, "response_store_error", active_sink->storage_error());
+                    } else {
+                        output.clear();
+                    }
+                    return false;
+                }
+                if (!page->events.empty()) {
+                    output = event_sse_frames(page->events);
+                    cursor = event_sequence_number(page->events.back());
+                    return !response_status_is_terminal(page->head.status) || page->head.next_sequence_number == 0 ||
+                           *cursor < page->head.next_sequence_number - 1U;
+                }
+                if (response_status_is_terminal(page->head.status)) {
+                    output.clear();
+                    return false;
+                }
+                store.wait_for_event_change(page->change_epoch, 200);
+            }
+            output.clear();
+            return false;
+        } catch (const std::exception & error) {
+            output = stream_error_sse_frame(cursor, "response_store_error", error.what());
+            return false;
+        } catch (...) {
+            output = stream_error_sse_frame(cursor, "server_error", "Response event streaming failed");
+            return false;
+        }
+    }
+};
+
+server_http_res_ptr journal_stream_response(response_store &                               store,
+                                            const response_id &                            id,
+                                            std::optional<std::uint64_t>                   starting_after,
+                                            const std::function<bool()> &                  should_stop,
+                                            std::shared_ptr<native_server_generation_sink> active_sink = nullptr) {
+    auto cursor = std::make_shared<response_journal_cursor>(
+        response_journal_cursor{ store, id, starting_after, should_stop, std::move(active_sink) });
+    auto response          = std::make_unique<server_http_res>();
+    response->content_type = "text/event-stream";
+    response->next         = [cursor = std::move(cursor)](std::string & output) {
+        return cursor->next(output);
+    };
+    return response;
+}
+
 class active_response_registry {
   public:
     void add(const std::shared_ptr<native_server_generation_sink> & sink) {
@@ -1045,6 +1167,24 @@ class active_response_registry {
     std::unordered_map<std::string, std::weak_ptr<native_server_generation_sink>> active;
 };
 
+bool header_name_equals(const std::string & lhs, const char * rhs) {
+    const std::size_t rhs_size = std::char_traits<char>::length(rhs);
+    return lhs.size() == rhs_size &&
+           std::equal(lhs.begin(), lhs.end(), rhs, [](unsigned char left, unsigned char right) {
+               return std::tolower(left) == std::tolower(right);
+           });
+}
+
+std::map<std::string, std::string> background_worker_headers(const std::map<std::string, std::string> & source) {
+    std::map<std::string, std::string> result;
+    for (const auto & header : source) {
+        if (!header_name_equals(header.first, "X-Conversation-Id")) {
+            result.insert(header);
+        }
+    }
+    return result;
+}
+
 class background_response_job final {
   public:
     background_response_job(server_generation_service                      service,
@@ -1056,15 +1196,16 @@ class background_response_job final {
         sink(std::move(sink)),
         should_stop([this] { return stop_requested.load() || this->sink->cancel_requested(); }),
         request{
-            source_request.params, source_request.headers, source_request.path, source_request.query_string,
-            source_request.body,   source_request.files,   should_stop,
+            source_request.params, background_worker_headers(source_request.headers),
+            source_request.path,   source_request.query_string,
+            source_request.body,   source_request.files,
+            should_stop,
         },
         generation(std::move(generation)),
         active_responses(active_responses) {
-        // The public background request returns an ordinary Response resource.
-        // Internally, use the existing synchronous generation projection on an
-        // owned worker; no HTTP request or socket lifetime crosses this seam.
-        this->generation.inference_parameters["stream"] = false;
+        // The worker owns this private transport. For a streaming background
+        // response it drains model deltas into the durable journal; the public
+        // HTTP subscriber is a separate reader and can disconnect harmlessly.
     }
 
     ~background_response_job() {
@@ -1119,7 +1260,10 @@ class background_response_job final {
                 terminalize_after_failure("Background generation returned no response");
             } else {
                 if (response->is_stream()) {
-                    terminalize_after_failure("Background generation unexpectedly returned a streaming response");
+                    std::string ignored;
+                    while (response->next(ignored)) {
+                        ignored.clear();
+                    }
                 } else if (response->status < 200 || response->status >= 300) {
                     terminalize_after_failure("Background generation failed before producing a terminal response");
                 }
@@ -1277,9 +1421,8 @@ class responses_routes_impl final {
 
     struct prepared_request {
         server_generation_input generation;
-        common_json             original                 = common_json::object();
-        common_json             continuation_input_items = common_json::array();
-        common_json             materialized_input_items = common_json::array();
+        common_json             original    = common_json::object();
+        common_json             input_items = common_json::array();
     };
 
     server_generation_service       service;
@@ -1330,18 +1473,23 @@ class responses_routes_impl final {
     }
 
     void append_response_context(const response_id & previous, common_json & expanded) const {
-        // Every stored response owns a fully materialized input snapshot. One
-        // read is therefore sufficient and remains valid if an ancestor (or
-        // this parent) is deleted before the new terminal response is stored.
-        const auto state = store->find(previous);
-        if (!state) {
+        // Public selection requires a visible target, while the store's graph
+        // materializer may traverse tombstoned ancestors which still belong to
+        // this already-created lineage.
+        const auto parent = store->find(previous);
+        if (!parent) {
             throw std::out_of_range(previous.str());
         }
-        for (const common_json & item : state->input_items) {
-            expanded.push_back(item);
+        if (!response_status_is_terminal(parent->status)) {
+            throw invalid_request_field("previous_response_id", "response_not_complete",
+                                        "Response '" + previous.str() + "' has not reached a terminal state.");
         }
-        for (const response_output_item & item : state->output) {
-            expanded.push_back(render_output_item(item));
+        const auto context = store->materialize_continuation_context(previous);
+        if (!context) {
+            throw std::out_of_range(previous.str());
+        }
+        for (const common_json & item : *context) {
+            expanded.push_back(item);
         }
     }
 
@@ -1355,10 +1503,6 @@ class responses_routes_impl final {
         if (original.contains("background") && !original.at("background").is_boolean()) {
             throw invalid_request_field("background", "invalid_type",
                                         "Invalid type for 'background': expected a boolean.");
-        }
-        if (original.value("background", false) && original.value("stream", false)) {
-            throw unsupported_request_field(
-                "stream", "Streaming background responses are not available; poll the response resource instead");
         }
         if (original.contains("conversation") && !original.at("conversation").is_null()) {
             throw unsupported_request_field(
@@ -1424,7 +1568,6 @@ class responses_routes_impl final {
             std::move(generation),
             std::move(original),
             std::move(current_items),
-            std::move(expanded),
         };
     }
 
@@ -1451,11 +1594,10 @@ class responses_routes_impl final {
 
     static generation_response_context native_context(const prepared_request & prepared) {
         generation_response_context context;
-        context.model                    = prepared.original.value("model", std::string());
-        context.request                  = prepared.original;
-        context.input_items              = prepared.materialized_input_items;
-        context.continuation_input_items = prepared.continuation_input_items;
-        context.created_at               = static_cast<std::uint64_t>(std::time(nullptr));
+        context.model       = prepared.original.value("model", std::string());
+        context.request     = prepared.original;
+        context.input_items = prepared.input_items;
+        context.created_at  = static_cast<std::uint64_t>(std::time(nullptr));
         if (prepared.original.contains("previous_response_id") &&
             prepared.original.at("previous_response_id").is_string()) {
             const std::string previous = prepared.original.at("previous_response_id").get<std::string>();
@@ -1512,17 +1654,28 @@ class responses_routes_impl final {
         // OpenAI retains background resources even when `store` is false so
         // they can be polled. SQLite is our process-independent resource
         // backing; expiry policy remains deliberately deferred.
-        auto sink = std::make_shared<native_server_generation_sink>(native_context(prepared), random_id_suffix(), false,
-                                                                    store.get(), prepared.generation.tool_metadata);
+        const bool stream                                  = prepared.original.value("stream", false);
+        prepared.generation.inference_parameters["stream"] = stream;
+        // The worker's llama-server stream is a private inference transport.
+        // Public background SSE is rendered from the durable journal below,
+        // so asking the sink to also build transport bytes would serialize
+        // every event once only to discard those bytes in the worker.
+        auto sink =
+            std::make_shared<native_server_generation_sink>(native_context(prepared), random_id_suffix(), false,
+                                                            store.get(), prepared.generation.tool_metadata, stream);
         try {
             // Allocate, render, and durably checkpoint the response before the
             // HTTP handler returns. `in_progress` is an allowed initial
             // background state; exact queued scheduling is not observable
             // enough to justify a second scheduler state machine here.
             sink->accept(server_generation_started{});
+            if (sink->storage_failed()) {
+                throw std::runtime_error(sink->storage_error());
+            }
             active_responses.add(sink);
             background_jobs.start(request, std::move(prepared.generation), sink);
-            return json_response(sink->snapshot());
+            return stream ? journal_stream_response(*store, sink->id(), std::nullopt, request.should_stop, sink) :
+                            json_response(sink->snapshot());
         } catch (const std::exception & error) {
             active_responses.remove(sink);
             sink->discard_persisted_state();
@@ -1561,15 +1714,33 @@ class responses_routes_impl final {
 
     server_http_res_ptr retrieve(const server_http_req & request) {
         background_jobs.reap();
-        const std::string stream = request.get_param("stream");
-        if (!stream.empty() && stream != "false" && stream != "true") {
+        const auto        stream_parameter = request.params.find("stream");
+        const std::string stream = stream_parameter == request.params.end() ? std::string() : stream_parameter->second;
+        if (stream_parameter != request.params.end() && stream != "false" && stream != "true") {
             return api_error(400, "Invalid retrieve stream parameter", "invalid_parameter", std::string("stream"));
         }
-        if (stream == "true" || !request.get_param("starting_after").empty() ||
-            request.get_param("include_obfuscation") == "true") {
-            return api_error(
-                501, "Streaming or projected response retrieval is not available in the persistent foreground profile",
-                "not_supported");
+        std::optional<std::uint64_t> starting_after;
+        try {
+            starting_after = parse_starting_after(request);
+        } catch (const invalid_request_field & error) {
+            return api_error(400, error.what(), error.code, error.field);
+        }
+        if (starting_after && stream != "true") {
+            return api_error(400, "starting_after requires stream=true", "invalid_parameter",
+                             std::string("starting_after"));
+        }
+        const auto        include_obfuscation_parameter = request.params.find("include_obfuscation");
+        const std::string include_obfuscation           = include_obfuscation_parameter == request.params.end() ?
+                                                              std::string() :
+                                                              include_obfuscation_parameter->second;
+        if (include_obfuscation_parameter != request.params.end() && include_obfuscation != "false" &&
+            include_obfuscation != "true") {
+            return api_error(400, "Invalid include_obfuscation parameter", "invalid_parameter",
+                             std::string("include_obfuscation"));
+        }
+        if (include_obfuscation == "true") {
+            return api_error(501, "Stream obfuscation is not available", "not_supported",
+                             std::string("include_obfuscation"));
         }
         static const std::set<std::string> supported_includes = {
             "code_interpreter_call.outputs",  "computer_call_output.output.image_url",
@@ -1589,7 +1760,25 @@ class responses_routes_impl final {
                                  std::string("include"));
             }
         }
-        const resource_result result = resources.retrieve(response_id(response_id_param(request)));
+        const response_id id(response_id_param(request));
+        if (stream == "true") {
+            const auto page = store->events_after(id);
+            if (!page) {
+                return json_response(render_response_not_found(id), 404);
+            }
+            if (!page->head.event_journal) {
+                return api_error(400, "Response '" + id.str() + "' was not created as a background stream.",
+                                 "invalid_parameter", std::string("stream"));
+            }
+            return journal_stream_response(*store, id, starting_after, request.should_stop, active_responses.find(id));
+        }
+        if (auto sink = active_responses.find(id)) {
+            if (sink->storage_failed()) {
+                return api_error(500, sink->storage_error(), "response_store_error");
+            }
+            return json_response(sink->snapshot());
+        }
+        const resource_result result = resources.retrieve(id);
         return json_response(result.body, status_for(result.kind));
     }
 

@@ -138,25 +138,20 @@ struct response_state {
     std::uint64_t                     next_sequence_number = 0;
     std::string                       model;
     std::optional<response_id>        previous_response;
-    common_json                       request                  = common_json::object();
-    common_json                       metadata                 = common_json::object();
+    common_json                       request       = common_json::object();
+    common_json                       metadata      = common_json::object();
     // Forward-compatible canonical wire material. request holds the complete
-    // normalized create request; input_items is the resource exposed by
-    // /responses/{id}/input_items; wire_snapshot preserves response fields the
-    // typed core does not know yet. Renderers overlay typed authoritative state
-    // on top of the snapshot rather than losing newer OpenAI fields.
-    // input_items is the fully materialized list returned by the resource
-    // endpoint: inherited input/output followed by this response's input.
-    // continuation_input_items holds only this create request's contribution,
-    // so walking a previous_response_id chain does not duplicate ancestors.
-    common_json                       input_items              = common_json::array();
-    common_json                       continuation_input_items = common_json::array();
-    common_json                       wire_snapshot            = common_json::object();
-    // When an ancestor is evicted or explicitly deleted, its prompt-visible
-    // context is folded into the direct child before removal. This keeps a
-    // bounded store from making otherwise-live descendants impossible to
-    // continue, without materializing the full chain in every response.
-    std::optional<common_json>        detached_context;
+    // normalized create request; input_items contains only the items introduced
+    // by this response. The response store materializes inherited input/output
+    // at continuation and /input_items read boundaries instead of copying each
+    // prior turn into every descendant. wire_snapshot preserves response fields
+    // the typed core does not know yet. Renderers overlay typed authoritative
+    // state on top of the snapshot rather than losing newer OpenAI fields.
+    common_json                       input_items   = common_json::array();
+    common_json                       wire_snapshot = common_json::object();
+    // Read-only migration prefix for a pre-v5 database in which a hard delete
+    // already removed an ancestor. New responses and deletes never create one.
+    std::optional<common_json>        legacy_lineage_checkpoint;
     std::vector<response_output_item> output;
     response_usage                    usage;
     std::optional<response_error>     error;

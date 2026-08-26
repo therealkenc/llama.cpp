@@ -1,5 +1,6 @@
 #include "generation.h"
 #include "json.h"
+#include "protocol-codec.h"
 #include "response-types.h"
 
 #include <cstddef>
@@ -8,7 +9,6 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
-#include <utility>
 #include <variant>
 #include <vector>
 
@@ -51,7 +51,7 @@ generation_response_context fixture_context(const std::string & suffix) {
         { "temperature", 0.25                      },
         { "metadata",    { { "fixture", suffix } } },
     };
-    context.input_items              = common_json::array({
+    context.input_items = common_json::array({
         {
          { "id", "msg_input_" + suffix },
          { "type", "message" },
@@ -64,9 +64,22 @@ generation_response_context fixture_context(const std::string & suffix) {
                          }) },
          },
     });
-    context.continuation_input_items = context.input_items;
     return context;
 }
+
+class empty_call_id_source final : public generation_id_source {
+  public:
+    explicit empty_call_id_source(const std::string & suffix) : delegate(suffix) {}
+
+    response_id next_response_id() override { return delegate.next_response_id(); }
+
+    item_id next_item_id(generation_item_kind kind) override { return delegate.next_item_id(kind); }
+
+    call_id next_call_id(const std::string & /*upstream_call_id*/) override { return call_id(); }
+
+  private:
+    counter_generation_id_source delegate;
+};
 
 std::vector<common_json> events_named(const std::vector<common_json> & events, const std::string & type) {
     std::vector<common_json> result;
@@ -78,8 +91,16 @@ std::vector<common_json> events_named(const std::vector<common_json> & events, c
     return result;
 }
 
-void drain(generation_port & port, native_response_state_machine & machine) {
-    generation_request request;
+void append_events(std::vector<common_json> & output, const std::vector<response_event> & events) {
+    output.reserve(output.size() + events.size());
+    for (const response_event & event : events) {
+        output.push_back(render_generation_event(event));
+    }
+}
+
+std::vector<common_json> drain(generation_port & port, native_response_state_machine & machine) {
+    std::vector<common_json> events;
+    generation_request       request;
     request.model      = "fixture-model";
     request.prompt     = "prepared prompt";
     request.parameters = {
@@ -88,12 +109,13 @@ void drain(generation_port & port, native_response_state_machine & machine) {
     std::unique_ptr<generation_session> session = port.start(request);
     GENERATION_CHECK(session != nullptr);
     if (!session) {
-        return;
+        return events;
     }
-    machine.start();
+    append_events(events, machine.start());
     while (const std::optional<generation_update> update = session->next()) {
-        machine.apply(*update);
+        append_events(events, machine.apply(*update));
     }
+    return events;
 }
 
 void test_scripted_interleaving() {
@@ -117,9 +139,9 @@ void test_scripted_interleaving() {
         generation_completed{ usage, 101 },
     });
 
-    counter_generation_id_source  ids("interleave");
-    native_response_state_machine machine(fixture_context("interleave"), ids);
-    drain(port, machine);
+    counter_generation_id_source   ids("interleave");
+    native_response_state_machine  machine(fixture_context("interleave"), ids);
+    const std::vector<common_json> events = drain(port, machine);
 
     GENERATION_CHECK(machine.terminal());
     const common_json snapshot = machine.snapshot();
@@ -130,7 +152,6 @@ void test_scripted_interleaving() {
     GENERATION_CHECK(snapshot.at("usage").at("input_tokens_details").at("cached_tokens") == 7);
     GENERATION_CHECK(snapshot.at("usage").at("output_tokens_details").at("reasoning_tokens") == 3);
     GENERATION_CHECK(snapshot.at("metadata").at("fixture") == "interleave");
-    GENERATION_CHECK(machine.state().continuation_input_items == machine.state().input_items);
 
     const common_json & output = snapshot.at("output");
     GENERATION_CHECK(output.size() == 4);
@@ -155,7 +176,6 @@ void test_scripted_interleaving() {
     GENERATION_CHECK(custom_call_id == "call_tool_b");
     GENERATION_CHECK(custom_item_id != custom_call_id);
 
-    const std::vector<common_json> events = machine.rendered_events();
     GENERATION_CHECK(!events.empty());
     for (std::size_t index = 0; index < events.size(); ++index) {
         GENERATION_CHECK(events[index].at("sequence_number").get<std::size_t>() == index);
@@ -190,12 +210,11 @@ void test_scripted_interleaving() {
 }
 
 common_json run_terminal(const generation_update & terminal_update, const std::string & suffix) {
-    scripted_generation_port      port({ terminal_update });
-    counter_generation_id_source  ids(suffix);
-    native_response_state_machine machine(fixture_context(suffix), ids);
-    drain(port, machine);
+    scripted_generation_port       port({ terminal_update });
+    counter_generation_id_source   ids(suffix);
+    native_response_state_machine  machine(fixture_context(suffix), ids);
+    const std::vector<common_json> events = drain(port, machine);
     GENERATION_CHECK(machine.terminal());
-    const std::vector<common_json> events = machine.rendered_events();
     GENERATION_CHECK(!events.empty());
     GENERATION_CHECK(events.back().at("response") == machine.snapshot());
     return common_json{
@@ -230,12 +249,70 @@ void test_terminal_states() {
     GENERATION_CHECK(cancelled.at("events").back().at("type") == "response.cancelled");
 }
 
-void test_continuation_input_fallback() {
-    generation_response_context context = fixture_context("continuation");
-    context.continuation_input_items    = nullptr;
-    counter_generation_id_source  ids("continuation");
-    native_response_state_machine machine(std::move(context), ids);
-    GENERATION_CHECK(machine.state().continuation_input_items == machine.state().input_items);
+void test_active_output_is_materialized_only_at_read_boundaries() {
+    counter_generation_id_source  ids("materialize");
+    native_response_state_machine machine(fixture_context("materialize"), ids);
+
+    machine.apply(generation_text_delta{ "hel" });
+    GENERATION_CHECK(machine.active_state().output.at(0).value.at("content").empty());
+    GENERATION_CHECK(machine.snapshot().at("output_text") == "hel");
+
+    machine.apply(generation_text_delta{ "lo" });
+    GENERATION_CHECK(machine.active_state().output.at(0).value.at("content").empty());
+    const response_state materialized_message = machine.materialized_state();
+    GENERATION_CHECK(render_response(materialized_message).at("output_text") == "hello");
+
+    machine.apply(generation_tool_call_started{
+        0,
+        generation_tool_kind::function,
+        "lookup",
+        "materialize",
+        "",
+    });
+    machine.apply(generation_tool_call_delta{ 0, R"({"query":"llama"})" });
+    GENERATION_CHECK(machine.active_state().output.at(1).value.at("arguments").get<std::string>().empty());
+    const common_json active_snapshot = machine.snapshot();
+    GENERATION_CHECK(active_snapshot.at("output").at(1).at("arguments") == R"({"query":"llama"})");
+}
+
+void test_partial_failure_events_remain_drainable() {
+    empty_call_id_source              ids("failure-forward");
+    native_response_state_machine     machine(fixture_context("failure-forward"), ids);
+    const std::vector<response_event> initial = machine.apply(generation_text_delta{ "prefix" });
+    GENERATION_CHECK(!initial.empty());
+
+    bool threw = false;
+    try {
+        machine.apply(generation_tool_call_started{
+            0,
+            generation_tool_kind::function,
+            "lookup",
+            "",
+            "",
+        });
+    } catch (const std::invalid_argument &) {
+        threw = true;
+    }
+    GENERATION_CHECK(threw);
+
+    const std::vector<response_event> partial = machine.take_pending_events();
+    GENERATION_CHECK(partial.size() == 3);
+    if (!partial.empty()) {
+        GENERATION_CHECK(partial.front().sequence_number == initial.back().sequence_number + 1);
+        GENERATION_CHECK(partial.back().type == response_event_type::output_item_done);
+    }
+    GENERATION_CHECK(machine.take_pending_events().empty());
+    GENERATION_CHECK(machine.snapshot().at("output_text") == "prefix");
+
+    response_error error;
+    error.code                                 = "projection_error";
+    error.message                              = "invalid generated call id";
+    const std::vector<response_event> terminal = machine.apply(generation_failed{ error, std::nullopt });
+    GENERATION_CHECK(!terminal.empty());
+    if (!partial.empty() && !terminal.empty()) {
+        GENERATION_CHECK(terminal.front().sequence_number == partial.back().sequence_number + 1);
+    }
+    GENERATION_CHECK(machine.terminal());
 }
 
 void test_scripted_cancellation() {
@@ -281,7 +358,8 @@ void test_scripted_cancellation() {
 int test_generation() {
     test_scripted_interleaving();
     test_terminal_states();
-    test_continuation_input_fallback();
+    test_active_output_is_materialized_only_at_read_boundaries();
+    test_partial_failure_events_remain_drainable();
     test_scripted_cancellation();
     return failures;
 }

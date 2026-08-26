@@ -191,14 +191,13 @@ class counter_generation_id_source final : public generation_id_source {
 
 struct generation_response_context {
     std::string                model;
-    common_json                request                  = common_json::object();
-    common_json                input_items              = common_json::array();
-    // When omitted, the current input resource is also the contribution
-    // replayed into a descendant. Continuations can supply a materialized
-    // lineage in input_items while keeping only the new contribution here.
-    common_json                continuation_input_items = nullptr;
-    common_json                wire_snapshot            = common_json::object();
-    std::uint64_t              created_at               = 0;
+    common_json                request       = common_json::object();
+    // Only this create request's direct input contribution. The separately
+    // lowered server_generation_input already owns the materialized inference
+    // context and must not leak that expanded prompt into durable state.
+    common_json                input_items   = common_json::array();
+    common_json                wire_snapshot = common_json::object();
+    std::uint64_t              created_at    = 0;
     std::optional<response_id> previous_response;
 };
 
@@ -223,11 +222,20 @@ class native_response_state_machine final {
     std::vector<response_event> start();
     std::vector<response_event> apply(const generation_update & update);
 
-    const response_state &              state() const noexcept;
-    common_json                         snapshot() const;
-    const std::vector<response_event> & events() const noexcept;
-    std::vector<common_json>            rendered_events() const;
-    bool                                terminal() const noexcept;
+    // `active_state()` is the cheap generation head. During generation, the
+    // accumulated text/tool values live in typed state-machine buffers and are
+    // deliberately not copied into this JSON-shaped view after every delta.
+    // Call materialized_state() or snapshot() at an explicit read boundary.
+    const response_state & active_state() const noexcept;
+    response_state         materialized_state() const;
+    common_json            snapshot() const;
+
+    // A failed apply() can have emitted a valid event prefix before detecting
+    // an invalid later transition. Drain that suffix so the caller can publish
+    // it immediately before the terminal failure events. Successful apply()
+    // calls drain their own staging buffer in the returned vector.
+    std::vector<response_event> take_pending_events() noexcept;
+    bool                        terminal() const noexcept;
 
   private:
     class impl;

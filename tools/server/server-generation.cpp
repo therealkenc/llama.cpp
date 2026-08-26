@@ -330,6 +330,7 @@ struct server_generation_projection::state {
     }
 
     server_generation_sink_ptr sink;
+    std::string                pending_output;
     bool                       started  = false;
     bool                       terminal = false;
 };
@@ -387,11 +388,10 @@ std::string server_generation_projection::accept(const std::vector<server_genera
     if (state_->sink == nullptr) {
         throw std::logic_error("generation projection has no sink");
     }
-    std::string output;
     for (const server_generation_update & update : updates) {
-        output += state_->sink->accept(update);
+        state_->pending_output += state_->sink->accept(update);
         state_->started |= std::holds_alternative<server_generation_started>(update);
         state_->terminal |= server_generation_update_is_terminal(update);
     }
-    return output;
+    return std::exchange(state_->pending_output, {});
 }

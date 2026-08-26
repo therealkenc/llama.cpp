@@ -8,6 +8,7 @@
 #include "server-generation.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <iostream>
 #include <optional>
@@ -40,7 +41,7 @@ generation_response_context fixture_context(const std::string & suffix) {
         { "input", "fixture"     },
         { "store", true          },
     };
-    context.input_items              = common_json::array({
+    context.input_items = common_json::array({
         {
          { "id", "msg_input_" + suffix },
          { "type", "message" },
@@ -53,7 +54,6 @@ generation_response_context fixture_context(const std::string & suffix) {
                          }) },
          },
     });
-    context.continuation_input_items = context.input_items;
     return context;
 }
 
@@ -116,7 +116,9 @@ void test_text_reasoning_reconciliation_and_persistence() {
     CHECK(stored.has_value());
     if (stored) {
         CHECK(stored->status == response_status::completed);
-        CHECK(stored->revision == 4);
+        // Initial create plus one terminal snapshot. Intermediate output lives
+        // in the active projection instead of rewriting the resource.
+        CHECK(stored->revision == 2);
         CHECK(render_response(*stored).at("output_text") == "answer");
     }
 
@@ -244,15 +246,77 @@ void test_partial_tool_name_is_buffered_until_arguments() {
     CHECK(events_named(parse_sse(stream), "response.output_item.added").size() == 1);
 }
 
+void test_custom_argument_boundary_ignores_nested_string_syntax() {
+    const std::unordered_map<std::string, common_json> metadata = {
+        {
+         "flat_custom", {
+                { "type", "custom" },
+                { "name", "code" },
+            }, },
+    };
+    native_server_generation_sink sink(fixture_context("custom_boundary"), "adapter_custom_boundary", true, nullptr,
+                                       metadata);
+
+    const std::string first  = R"({"input":"brace { and )";
+    const std::string second = R"(quote \" still text)";
+    const std::string third  = R"("})";
+    const std::string raw    = first + second + third;
+
+    std::string stream = sink.accept(server_generation_started{});
+    stream += sink.accept(server_generation_message_deltas{ { tool_diff(0, "flat_custom", "custom_id", first) } });
+    stream += sink.accept(server_generation_message_deltas{ { tool_diff(0, "", "", second) } });
+    CHECK(events_named(parse_sse(stream), "response.custom_tool_call_input.delta").empty());
+    stream += sink.accept(server_generation_message_deltas{ { tool_diff(0, "", "", third) } });
+
+    common_chat_msg final_message;
+    final_message.tool_calls = {
+        { "flat_custom", raw, "custom_id" }
+    };
+    stream += sink.accept(server_generation_message_snapshot{ final_message });
+    stream += sink.accept(server_generation_completed{ fixture_usage(), 101 });
+
+    const common_json snapshot = sink.snapshot();
+    CHECK(snapshot.at("output").at(0).at("input") == "brace { and quote \" still text");
+    CHECK(events_named(parse_sse(stream), "response.custom_tool_call_input.delta").size() == 1U);
+}
+
 class failing_store final : public response_store {
   public:
-    store_write_result create(response_state /*state*/) override { return store_write_result::invalid_state; }
+    store_write_result create(response_state /*state*/, const std::vector<common_json> & /*events*/) override {
+        return store_write_result::invalid_state;
+    }
 
-    store_write_result replace(response_state /*state*/) override { return store_write_result::invalid_state; }
+    store_write_result replace(response_state /*state*/, const std::vector<common_json> & /*events*/) override {
+        return store_write_result::invalid_state;
+    }
+
+    generation_store_write advance_generation(const response_state & /*state*/,
+                                              std::uint64_t /*expected_generation_revision*/,
+                                              const std::vector<common_json> & /*events*/) override {
+        return { store_write_result::invalid_state, 0 };
+    }
 
     std::optional<response_state> find(const response_id & /*id*/) const override { return std::nullopt; }
 
     std::optional<stored_response_item> find_item(const item_id & /*id*/) const override { return std::nullopt; }
+
+    std::optional<common_json> materialize_input_items(const response_id & /*id*/) const override {
+        return std::nullopt;
+    }
+
+    std::optional<common_json> materialize_continuation_context(const response_id & /*id*/) const override {
+        return std::nullopt;
+    }
+
+    std::optional<response_event_page> events_after(
+        const response_id & /*id*/,
+        const std::optional<std::uint64_t> & /*starting_after*/) const override {
+        return std::nullopt;
+    }
+
+    bool wait_for_event_change(std::uint64_t /*observed_epoch*/, std::uint64_t /*timeout_ms*/) const override {
+        return false;
+    }
 
     bool erase(const response_id & /*id*/) override { return false; }
 
@@ -278,24 +342,38 @@ void test_checkpoint_failure_and_cancellation_contract() {
     CHECK(cancellable.cancel_requested());
 }
 
-void test_lineage_detachment_revision_is_reconciled() {
+void test_tombstoned_parent_does_not_revise_active_child() {
     in_memory_response_store store;
 
     native_server_generation_sink parent(fixture_context("detach_parent"), "adapter_detach_parent", false, &store);
     parent.accept(server_generation_started{});
-    parent.accept(server_generation_message_snapshot{ common_chat_msg{} });
+    common_chat_msg parent_message;
+    parent_message.content = "parent output";
+    parent.accept(server_generation_message_snapshot{ std::move(parent_message) });
     parent.accept(server_generation_completed{ fixture_usage(), 101 });
 
     generation_response_context child_context = fixture_context("detach_child");
     child_context.previous_response           = parent.id();
-    native_server_generation_sink child(std::move(child_context), "adapter_detach_child", true, &store);
+    child_context.request["background"]       = true;
+    child_context.request["stream"]           = true;
+    native_server_generation_sink child(std::move(child_context), "adapter_detach_child", true, &store, {}, true);
     child.accept(server_generation_started{});
 
+    const auto initial_child = store.find(child.id());
+    CHECK(initial_child && initial_child->revision == 1U);
     CHECK(store.erase(parent.id()));
-    const auto detached = store.find(child.id());
-    CHECK(detached.has_value());
-    CHECK(detached && detached->revision == 2);
-    CHECK(detached && detached->detached_context.has_value());
+    CHECK(!store.find(parent.id()).has_value());
+    const auto unchanged_child = store.find(child.id());
+    CHECK(unchanged_child && unchanged_child->revision == 1U);
+    CHECK(unchanged_child && !unchanged_child->legacy_lineage_checkpoint.has_value());
+
+    const auto input_items = store.materialize_input_items(child.id());
+    CHECK(input_items && input_items->size() == 3U);
+    if (input_items && input_items->size() == 3U) {
+        CHECK(input_items->at(0).at("id") == "msg_input_detach_parent");
+        CHECK(input_items->at(1).at("role") == "assistant");
+        CHECK(input_items->at(2).at("id") == "msg_input_detach_child");
+    }
 
     common_chat_msg_diff text;
     text.content_delta       = "still streaming";
@@ -305,8 +383,151 @@ void test_lineage_detachment_revision_is_reconciled() {
 
     const auto updated = store.find(child.id());
     CHECK(updated.has_value());
-    CHECK(updated && updated->revision == 3);
-    CHECK(updated && updated->detached_context.has_value());
+    CHECK(updated && updated->revision == 2U);
+    CHECK(updated && !updated->legacy_lineage_checkpoint.has_value());
+    const auto journal = store.events_after(child.id());
+    CHECK(journal && journal->events.size() == 5U);
+    if (journal) {
+        for (std::size_t index = 0; index < journal->events.size(); ++index) {
+            CHECK(journal->events[index].at("sequence_number") == index);
+        }
+    }
+}
+
+void test_journaled_incomplete_and_failed_terminals() {
+    in_memory_response_store store;
+
+    generation_response_context incomplete_context = fixture_context("journal_incomplete");
+    incomplete_context.request["background"]       = true;
+    incomplete_context.request["stream"]           = true;
+    native_server_generation_sink incomplete(std::move(incomplete_context), "adapter_journal_incomplete", true, &store,
+                                             {}, true);
+    incomplete.accept(server_generation_started{});
+    incomplete.accept(server_generation_incomplete{ fixture_usage(), "max_output_tokens" });
+    const auto incomplete_journal = store.events_after(incomplete.id());
+    CHECK(incomplete_journal && incomplete_journal->head.status == response_status::incomplete);
+    CHECK(incomplete_journal && !incomplete_journal->events.empty());
+    if (incomplete_journal && !incomplete_journal->events.empty()) {
+        CHECK(incomplete_journal->events.back().at("type") == "response.incomplete");
+    }
+
+    generation_response_context failed_context = fixture_context("journal_failed");
+    failed_context.request["background"]       = true;
+    failed_context.request["stream"]           = true;
+    native_server_generation_sink failed(std::move(failed_context), "adapter_journal_failed", true, &store, {}, true);
+    failed.accept(server_generation_started{});
+    failed.accept(server_generation_failed{
+        { "server_error", "fixture failure", "" },
+        std::nullopt,
+    });
+    const auto failed_journal = store.events_after(failed.id());
+    CHECK(failed_journal && failed_journal->head.status == response_status::failed);
+    CHECK(failed_journal && !failed_journal->events.empty());
+    if (failed_journal && !failed_journal->events.empty()) {
+        CHECK(failed_journal->events.back().at("type") == "response.failed");
+    }
+}
+
+void test_translated_update_failure_preserves_a_contiguous_terminal() {
+    in_memory_response_store store;
+
+    generation_response_context context = fixture_context("atomic_update");
+    context.request["background"]       = true;
+    context.request["stream"]           = true;
+    native_server_generation_sink sink(std::move(context), "adapter_atomic_update", true, &store, {}, true);
+    sink.accept(server_generation_started{});
+
+    common_chat_msg_diff text;
+    text.content_delta = "preserved before failure";
+    common_chat_msg_diff invalid_reasoning;
+    invalid_reasoning.reasoning_content_delta = "reasoning cannot follow text";
+    bool threw                                = false;
+    try {
+        sink.accept(server_generation_message_deltas{
+            { text, invalid_reasoning }
+        });
+    } catch (const std::logic_error &) {
+        threw = true;
+    }
+    CHECK(threw);
+    CHECK(!sink.storage_failed());
+
+    const auto active       = store.events_after(sink.id());
+    const auto active_state = store.find(sink.id());
+    // The durable checkpoint remains at the last complete server update until
+    // the caller translates the projection error into a failed terminal.
+    CHECK(active && active->head.next_sequence_number == 2U);
+    CHECK(active_state && active_state->output.empty());
+    CHECK(active && active->events.size() == 2U);
+
+    const std::string terminal = sink.accept(server_generation_failed{
+        { "server_error", "invalid generated delta order", "" },
+        std::nullopt,
+    });
+    CHECK(terminal.find("preserved before failure") != std::string::npos);
+    CHECK(terminal.find("response.output_text.delta") != std::string::npos);
+    CHECK(terminal.find("response.failed") != std::string::npos);
+    CHECK(terminal.find("response_store_error") == std::string::npos);
+    const auto failed = store.events_after(sink.id());
+    CHECK(failed && failed->head.status == response_status::failed);
+    CHECK(failed && failed->events.size() == failed->head.next_sequence_number);
+    if (failed) {
+        for (std::size_t index = 0; index < failed->events.size(); ++index) {
+            CHECK(failed->events[index].at("sequence_number") == index);
+        }
+        CHECK(failed->events.back().at("type") == "response.failed");
+    }
+}
+
+void test_translation_failure_poisoning_terminalizes_from_the_last_checkpoint() {
+    in_memory_response_store    store;
+    generation_response_context context                         = fixture_context("translation_failure");
+    context.request["background"]                               = true;
+    context.request["stream"]                                   = true;
+    const std::unordered_map<std::string, common_json> metadata = {
+        {
+         "unsupported_tool", {
+                { "type", "not_a_generation_tool" },
+            }, },
+    };
+    native_server_generation_sink sink(std::move(context), "adapter_translation_failure", true, &store, metadata, true);
+    sink.accept(server_generation_started{});
+
+    common_chat_msg_diff text;
+    text.content_delta               = "buffered by the rejected translation";
+    const common_chat_msg_diff tool  = tool_diff(0, "unsupported_tool", "bad_tool", "{}");
+    bool                       threw = false;
+    try {
+        sink.accept(server_generation_message_deltas{
+            { text, tool }
+        });
+    } catch (const std::invalid_argument &) {
+        threw = true;
+    }
+    CHECK(threw);
+
+    threw = false;
+    try {
+        sink.accept(server_generation_progress{});
+    } catch (const std::logic_error &) {
+        threw = true;
+    }
+    CHECK(threw);
+
+    const std::string terminal = sink.accept(server_generation_failed{
+        { "server_error", "invalid generated tool type", "" },
+        std::nullopt,
+    });
+    CHECK(terminal.find("buffered by the rejected translation") == std::string::npos);
+    CHECK(terminal.find("response.failed") != std::string::npos);
+    const auto failed = store.events_after(sink.id());
+    CHECK(failed && failed->head.status == response_status::failed);
+    CHECK(failed && failed->events.size() == failed->head.next_sequence_number);
+    if (failed) {
+        for (std::size_t index = 0; index < failed->events.size(); ++index) {
+            CHECK(failed->events[index].at("sequence_number") == index);
+        }
+    }
 }
 
 }  // namespace
@@ -315,8 +536,12 @@ int main() try {
     test_text_reasoning_reconciliation_and_persistence();
     test_interleaved_namespace_custom_and_local_shell_tools();
     test_partial_tool_name_is_buffered_until_arguments();
+    test_custom_argument_boundary_ignores_nested_string_syntax();
     test_checkpoint_failure_and_cancellation_contract();
-    test_lineage_detachment_revision_is_reconciled();
+    test_tombstoned_parent_does_not_revise_active_child();
+    test_journaled_incomplete_and_failed_terminals();
+    test_translated_update_failure_preserves_a_contiguous_terminal();
+    test_translation_failure_poisoning_terminalizes_from_the_last_checkpoint();
     if (failures != 0) {
         std::cerr << failures << " server generation adapter checks failed\n";
         return 1;

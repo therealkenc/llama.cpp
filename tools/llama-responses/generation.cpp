@@ -215,24 +215,18 @@ class native_response_state_machine::impl {
         if (!context.input_items.is_array()) {
             throw std::invalid_argument("generation response input_items must be an array");
         }
-        if (!context.continuation_input_items.is_null() && !context.continuation_input_items.is_array()) {
-            throw std::invalid_argument("generation response continuation_input_items must be an array");
-        }
         if (!context.wire_snapshot.is_object()) {
             throw std::invalid_argument("generation response wire_snapshot must be an object");
         }
 
-        response.id                       = ids.next_response_id();
-        response.status                   = response_status::in_progress;
-        response.created_at               = context.created_at;
-        response.model                    = std::move(context.model);
-        response.request                  = std::move(context.request);
-        response.input_items              = std::move(context.input_items);
-        response.continuation_input_items = context.continuation_input_items.is_null() ?
-                                                response.input_items :
-                                                std::move(context.continuation_input_items);
-        response.wire_snapshot            = std::move(context.wire_snapshot);
-        response.previous_response        = std::move(context.previous_response);
+        response.id                = ids.next_response_id();
+        response.status            = response_status::in_progress;
+        response.created_at        = context.created_at;
+        response.model             = std::move(context.model);
+        response.request           = std::move(context.request);
+        response.input_items       = std::move(context.input_items);
+        response.wire_snapshot     = std::move(context.wire_snapshot);
+        response.previous_response = std::move(context.previous_response);
         if (response.id.empty()) {
             throw std::invalid_argument("generation id source returned an empty response id");
         }
@@ -249,9 +243,8 @@ class native_response_state_machine::impl {
     }
 
     std::vector<response_event> start() {
-        const std::size_t first = emitted.size();
         ensure_started();
-        return events_since(first);
+        return take_pending_events();
     }
 
     std::vector<response_event> apply(const generation_update & update) {
@@ -259,17 +252,35 @@ class native_response_state_machine::impl {
             throw std::logic_error("generation update arrived after the terminal update");
         }
 
-        const std::size_t first = emitted.size();
         ensure_started();
         std::visit([this](const auto & value) { apply_one(value); }, update);
-        return events_since(first);
+        return take_pending_events();
     }
 
-    const response_state & state() const noexcept { return response; }
+    const response_state & active_state() const noexcept { return response; }
 
-    common_json snapshot() const { return render_response(response); }
+    response_state materialized_state() const {
+        response_state result = response;
+        if (reasoning_item) {
+            materialize_reasoning_item(result.output.at(*reasoning_item));
+        }
+        if (message_item) {
+            materialize_message_item(result.output.at(*message_item));
+        }
+        for (const auto & entry : tools) {
+            const tool_state & tool = entry.second;
+            materialize_tool_item(tool, result.output.at(tool.response_item_index));
+        }
+        return result;
+    }
 
-    const std::vector<response_event> & events() const noexcept { return emitted; }
+    common_json snapshot() const { return render_response(materialized_state()); }
+
+    std::vector<response_event> take_pending_events() noexcept {
+        std::vector<response_event> result;
+        result.swap(pending_events);
+        return result;
+    }
 
     bool terminal() const noexcept { return is_terminal; }
 
@@ -288,7 +299,7 @@ class native_response_state_machine::impl {
 
     generation_id_source &            ids;
     response_state                    response;
-    std::vector<response_event>       emitted;
+    std::vector<response_event>       pending_events;
     std::optional<std::size_t>        reasoning_item;
     std::optional<std::size_t>        message_item;
     std::optional<std::size_t>        open_reasoning;
@@ -299,10 +310,6 @@ class native_response_state_machine::impl {
     bool                              started     = false;
     bool                              is_terminal = false;
 
-    std::vector<response_event> events_since(std::size_t first) const {
-        return { emitted.begin() + static_cast<std::ptrdiff_t>(first), emitted.end() };
-    }
-
     response_event & emit(response_event_type        type,
                           common_json                data,
                           std::optional<item_id>     item          = std::nullopt,
@@ -310,14 +317,15 @@ class native_response_state_machine::impl {
                           std::optional<std::size_t> content_index = std::nullopt) {
         response_event event;
         event.type            = type;
-        event.sequence_number = response.next_sequence_number++;
+        event.sequence_number = response.next_sequence_number;
         event.response        = response.id;
         event.item            = std::move(item);
         event.output_index    = output_index;
         event.content_index   = content_index;
         event.data            = std::move(data);
-        emitted.push_back(std::move(event));
-        return emitted.back();
+        pending_events.push_back(std::move(event));
+        ++response.next_sequence_number;
+        return pending_events.back();
     }
 
     void emit_response(response_event_type type) {
@@ -388,13 +396,9 @@ class native_response_state_machine::impl {
              stored.id, output_index);
     }
 
-    void update_reasoning_item() {
-        if (!reasoning_item) {
-            return;
-        }
-        response_output_item & item = output_item(*reasoning_item);
-        item.value["summary"]       = common_json::array({ reasoning_part(reasoning_text) });
-        item.value["content"]       = common_json::array({ reasoning_content(reasoning_text) });
+    void materialize_reasoning_item(response_output_item & item) const {
+        item.value["summary"] = common_json::array({ reasoning_part(reasoning_text) });
+        item.value["content"] = common_json::array({ reasoning_content(reasoning_text) });
     }
 
     void close_reasoning_item(const char * status) {
@@ -404,7 +408,7 @@ class native_response_state_machine::impl {
         const std::size_t      output_index = *open_reasoning;
         response_output_item & item         = output_item(output_index);
         item.value["status"]                = status;
-        update_reasoning_item();
+        materialize_reasoning_item(item);
         emit(response_event_type::reasoning_summary_text_done,
              {
                  { "output_index",  output_index   },
@@ -474,12 +478,8 @@ class native_response_state_machine::impl {
              stored.id, output_index, 0);
     }
 
-    void update_message_item() {
-        if (!message_item) {
-            return;
-        }
-        response_output_item & item = output_item(*message_item);
-        item.value["content"]       = common_json::array({ text_part(message_text) });
+    void materialize_message_item(response_output_item & item) const {
+        item.value["content"] = common_json::array({ text_part(message_text) });
     }
 
     void close_message_item(const char * status, bool has_tools) {
@@ -490,7 +490,7 @@ class native_response_state_machine::impl {
         response_output_item & item         = output_item(output_index);
         item.value["status"]                = status;
         item.value["phase"]                 = has_tools ? "commentary" : "final_answer";
-        update_message_item();
+        materialize_message_item(item);
         const common_json part = text_part(message_text);
         emit(response_event_type::output_text_done,
              {
@@ -520,7 +520,12 @@ class native_response_state_machine::impl {
 
     void apply_one(const generation_started & /*update*/) {}
 
-    void apply_one(const generation_progress & /*update*/) { emit_response(response_event_type::in_progress); }
+    void apply_one(const generation_progress & /*update*/) {
+        // llama-server can report prompt-processing progress more than once.
+        // Responses already emitted its single lifecycle in_progress event at
+        // start; projecting runtime progress as another full response envelope
+        // would repeatedly copy static input and the growing output prefix.
+    }
 
     void apply_one(const generation_reasoning_delta & update) {
         if (update.delta.empty()) {
@@ -535,7 +540,6 @@ class native_response_state_machine::impl {
         }
         const std::size_t output_index = open_reasoning.value();
         reasoning_text += update.delta;
-        update_reasoning_item();
         const response_output_item & item = output_item(output_index);
         emit(response_event_type::reasoning_summary_text_delta,
              {
@@ -568,7 +572,6 @@ class native_response_state_machine::impl {
         }
         const std::size_t output_index = open_message.value();
         message_text += update.delta;
-        update_message_item();
         const response_output_item & item = output_item(output_index);
         emit(response_event_type::output_text_delta,
              {
@@ -618,8 +621,8 @@ class native_response_state_machine::impl {
         }
 
         response_output_item item;
-        item.id    = tool.item;
-        item.call  = tool.call;
+        item.id   = tool.item;
+        item.call = tool.call;
         switch (update.kind) {
             case generation_tool_kind::function:
                 item.type = "function_call";
@@ -672,9 +675,7 @@ class native_response_state_machine::impl {
             return;
         }
         tool.value += update.delta;
-        response_output_item & item = output_item(tool.response_item_index);
         if (tool.kind == generation_tool_kind::function) {
-            item.value["arguments"] = tool.value;
             emit(response_event_type::function_call_arguments_delta,
                  {
                      { "output_index", tool.output_index },
@@ -685,10 +686,8 @@ class native_response_state_machine::impl {
             return;
         }
         if (tool.kind == generation_tool_kind::local_shell) {
-            item.value["action"] = local_shell_action(tool.value);
             return;
         }
-        item.value["input"] = tool.value;
         emit(response_event_type::custom_tool_call_input_delta,
              {
                  { "output_index", tool.output_index },
@@ -706,7 +705,6 @@ class native_response_state_machine::impl {
             open_reasoning_item();
         }
         reasoning_text = update.reasoning;
-        update_reasoning_item();
 
         if (!message_item && !update.text.empty()) {
             if (!tools.empty()) {
@@ -715,7 +713,6 @@ class native_response_state_machine::impl {
             open_message_item();
         }
         message_text = update.text;
-        update_message_item();
 
         for (const generation_tool_call_reconciliation & tool_update : update.tools) {
             const auto found = tools.find(tool_update.index);
@@ -726,19 +723,7 @@ class native_response_state_machine::impl {
             if (tool.done) {
                 throw std::logic_error("final tool value arrived after the item was closed");
             }
-            tool.value                  = tool_update.value;
-            response_output_item & item = output_item(tool.response_item_index);
-            switch (tool.kind) {
-                case generation_tool_kind::function:
-                    item.value["arguments"] = tool.value;
-                    break;
-                case generation_tool_kind::custom:
-                    item.value["input"] = tool.value;
-                    break;
-                case generation_tool_kind::local_shell:
-                    item.value["action"] = local_shell_action(tool.value);
-                    break;
-            }
+            tool.value = tool_update.value;
         }
     }
 
@@ -755,14 +740,28 @@ class native_response_state_machine::impl {
         return ordered;
     }
 
+    static void materialize_tool_item(const tool_state & tool, response_output_item & item) {
+        switch (tool.kind) {
+            case generation_tool_kind::function:
+                item.value["arguments"] = tool.value;
+                break;
+            case generation_tool_kind::custom:
+                item.value["input"] = tool.value;
+                break;
+            case generation_tool_kind::local_shell:
+                item.value["action"] = local_shell_action(tool.value);
+                break;
+        }
+    }
+
     void close_tool(tool_state & tool, const char * status) {
         if (tool.done) {
             return;
         }
         response_output_item & item = output_item(tool.response_item_index);
         item.value["status"]        = status;
+        materialize_tool_item(tool, item);
         if (tool.kind == generation_tool_kind::function) {
-            item.value["arguments"] = tool.value;
             emit(response_event_type::function_call_arguments_done,
                  {
                      { "output_index", tool.output_index },
@@ -772,7 +771,6 @@ class native_response_state_machine::impl {
             },
                  tool.item, tool.output_index);
         } else if (tool.kind == generation_tool_kind::custom) {
-            item.value["input"] = tool.value;
             emit(response_event_type::custom_tool_call_input_done,
                  {
                      { "output_index", tool.output_index },
@@ -780,8 +778,6 @@ class native_response_state_machine::impl {
                      { "input",        tool.value        },
             },
                  tool.item, tool.output_index);
-        } else {
-            item.value["action"] = local_shell_action(tool.value);
         }
         emit(response_event_type::output_item_done,
              {
@@ -869,25 +865,20 @@ std::vector<response_event> native_response_state_machine::apply(const generatio
     return implementation->apply(update);
 }
 
-const response_state & native_response_state_machine::state() const noexcept {
-    return implementation->state();
+const response_state & native_response_state_machine::active_state() const noexcept {
+    return implementation->active_state();
+}
+
+response_state native_response_state_machine::materialized_state() const {
+    return implementation->materialized_state();
 }
 
 common_json native_response_state_machine::snapshot() const {
     return implementation->snapshot();
 }
 
-const std::vector<response_event> & native_response_state_machine::events() const noexcept {
-    return implementation->events();
-}
-
-std::vector<common_json> native_response_state_machine::rendered_events() const {
-    std::vector<common_json> result;
-    result.reserve(events().size());
-    for (const response_event & event : events()) {
-        result.push_back(render_generation_event(event));
-    }
-    return result;
+std::vector<response_event> native_response_state_machine::take_pending_events() noexcept {
+    return implementation->take_pending_events();
 }
 
 bool native_response_state_machine::terminal() const noexcept {

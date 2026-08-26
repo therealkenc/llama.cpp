@@ -32,20 +32,31 @@ resource_result response_resource_service::retrieve(const response_id & id) cons
 }
 
 resource_result response_resource_service::erase(const response_id & id) {
+    const auto state = store.find(id);
+    if (!state) {
+        return not_found(id);
+    }
+    if (!response_status_is_terminal(state->status)) {
+        return {
+            resource_result_kind::conflict,
+            render_error("Response '" + id.str() + "' is still active and cannot be deleted.", "invalid_request_error",
+                         std::string("response_id"), std::string("response_active")),
+        };
+    }
     return store.erase(id) ? resource_result{ resource_result_kind::ok, render_deleted_response(id) } : not_found(id);
 }
 
 resource_result response_resource_service::list_input_items(const response_id &             id,
                                                             const input_item_page_options & options) const {
-    const auto state = store.find(id);
-    if (!state) {
+    const auto input_items = store.materialize_input_items(id);
+    if (!input_items) {
         return not_found(id);
     }
     if (options.limit < 1 || options.limit > 100) {
         return invalid_request("input item page limit must be between 1 and 100", "limit");
     }
     try {
-        return { resource_result_kind::ok, render_input_items_page(state->input_items, options) };
+        return { resource_result_kind::ok, render_input_items_page(*input_items, options) };
     } catch (const std::invalid_argument & error) {
         return invalid_request(error.what(), options.after ? "after" : "response_id");
     }

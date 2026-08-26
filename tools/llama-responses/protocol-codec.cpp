@@ -230,8 +230,7 @@ response_state capture_response_state(const common_json & wire_response,
                                     return item_id(prefix + state.id.str() + "_input_" + std::to_string(index));
                                 }) :
             input_items;
-    state.continuation_input_items = state.input_items;
-    state.wire_snapshot            = wire_response;
+    state.wire_snapshot = wire_response;
 
     if (wire_response.contains("completed_at") && wire_response.at("completed_at").is_number_integer()) {
         state.completed_at = uint_field(wire_response, "completed_at");

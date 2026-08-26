@@ -7,9 +7,11 @@
 #include "server-task.h"
 
 #include <chrono>
+#include <cstddef>
 #include <exception>
 #include <iostream>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <variant>
@@ -128,6 +130,23 @@ class recording_sink final : public server_generation_sink {
     std::vector<server_generation_update> received;
 };
 
+class throwing_sink final : public server_generation_sink {
+  public:
+    std::string accept(const server_generation_update & update) override {
+        ++attempts;
+        if (attempts == 2U) {
+            throw std::logic_error("rejected second neutral update");
+        }
+        received.push_back(update);
+        return "opaque-frame-" + std::to_string(attempts) + ';';
+    }
+
+    common_json snapshot() const override { return common_json::object(); }
+
+    std::size_t                           attempts = 0;
+    std::vector<server_generation_update> received;
+};
+
 void test_sink_contract_keeps_projection_opaque() {
     recording_sink    sink;
     const std::string first  = sink.accept(server_generation_started{});
@@ -157,6 +176,34 @@ void test_abandoned_projection_terminalizes_once_after_last_copy() {
     CHECK(sink->received.size() == 2U);
     CHECK(std::holds_alternative<server_generation_started>(sink->received.at(0)));
     CHECK(std::holds_alternative<server_generation_cancelled>(sink->received.at(1)));
+}
+
+void test_projection_preserves_output_before_a_later_update_fails() {
+    auto sink = std::make_shared<throwing_sink>();
+    {
+        server_generation_projection  projection(sink);
+        server_task_result_cmpl_final final;
+        common_chat_msg_diff          text;
+        text.content_delta = "partial";
+        final.oaicompat_msg_diffs.push_back(text);
+        final.oaicompat_msg.content = "partial";
+        final.stop                  = STOP_TYPE_EOS;
+
+        bool threw = false;
+        try {
+            (void) projection.accept(final);
+        } catch (const std::logic_error &) {
+            threw = true;
+        }
+        CHECK(threw);
+
+        const std::string terminal = projection.fail("rejected second neutral update");
+        CHECK(terminal == "opaque-frame-1;opaque-frame-3;");
+    }
+
+    CHECK(sink->received.size() == 2U);
+    CHECK(std::holds_alternative<server_generation_started>(sink->received.at(0)));
+    CHECK(std::holds_alternative<server_generation_failed>(sink->received.at(1)));
 }
 
 void test_queue_shutdown_releases_sleep_waiters() {
@@ -191,6 +238,7 @@ int main() try {
     test_error_mapping();
     test_sink_contract_keeps_projection_opaque();
     test_abandoned_projection_terminalizes_once_after_last_copy();
+    test_projection_preserves_output_before_a_later_update_fails();
     test_queue_shutdown_releases_sleep_waiters();
     if (failures != 0) {
         std::cerr << failures << " neutral generation sink checks failed\n";

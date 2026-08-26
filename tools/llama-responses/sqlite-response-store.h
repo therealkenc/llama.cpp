@@ -1,11 +1,16 @@
 #ifndef LLAMA_RESPONSES_SQLITE_RESPONSE_STORE_H
 #define LLAMA_RESPONSES_SQLITE_RESPONSE_STORE_H
 
+#include "json.h"
 #include "response-store.h"
+#include "response-types.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
+#include <vector>
 
 namespace llama_responses {
 
@@ -26,12 +31,21 @@ class sqlite_response_store final : public response_store {
     sqlite_response_store(const sqlite_response_store &)             = delete;
     sqlite_response_store & operator=(const sqlite_response_store &) = delete;
 
-    store_write_result                  create(response_state state) override;
-    store_write_result                  replace(response_state state) override;
-    std::optional<response_state>       find(const response_id & id) const override;
+    store_write_result            create(response_state state, const std::vector<common_json> & events = {}) override;
+    store_write_result            replace(response_state state, const std::vector<common_json> & events = {}) override;
+    generation_store_write        advance_generation(const response_state &           state,
+                                                     std::uint64_t                    expected_generation_revision,
+                                                     const std::vector<common_json> & events = {}) override;
+    std::optional<response_state> find(const response_id & id) const override;
     std::optional<stored_response_item> find_item(const item_id & id) const override;
-    bool                                erase(const response_id & id) override;
-    std::size_t                         size() const override;
+    std::optional<common_json>          materialize_input_items(const response_id & id) const override;
+    std::optional<common_json>          materialize_continuation_context(const response_id & id) const override;
+    std::optional<response_event_page>  events_after(
+        const response_id &                  id,
+        const std::optional<std::uint64_t> & starting_after = std::nullopt) const override;
+    bool        wait_for_event_change(std::uint64_t observed_epoch, std::uint64_t timeout_ms) const override;
+    bool        erase(const response_id & id) override;
+    std::size_t size() const override;
 
     // This store deliberately does not resurrect inference after a server
     // restart. Mark snapshots whose process-local worker disappeared as

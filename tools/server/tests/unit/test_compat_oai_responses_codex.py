@@ -551,17 +551,6 @@ def test_codex_replayed_function_and_custom_tool_outputs_round_trip_through_sdk(
             "conversation",
         ),
         (
-            {
-                "model": "tinyllama-2",
-                "input": "hello",
-                "background": True,
-                "stream": True,
-            },
-            "Streaming background responses are not available",
-            "unsupported_parameter",
-            "stream",
-        ),
-        (
             {"model": "tinyllama-2", "input": "hello", "instructions": {}},
             "Invalid type for 'instructions'",
             "invalid_type",
@@ -1349,11 +1338,20 @@ def test_stored_response_retrieve_and_delete_via_sdk():
     output_message = next(item for item in projected.output if item.type == "message")
     assert output_message.content[0].logprobs == []
 
+    accepted_projections = [
+        "code_interpreter_call.outputs",
+        "computer_call_output.output.image_url",
+        "file_search_call.results",
+        "message.input_image.image_url",
+        "message.output_text.logprobs",
+        "web_search_call.action.sources",
+        "web_search_call.results",
+    ]
+    projection_query = "&".join(
+        f"include%5B%5D={quote(value, safe='')}" for value in accepted_projections
+    )
     repeated = authenticated_request(
-        "GET",
-        f"/v1/responses/{created.id}"
-        "?include%5B%5D=message.output_text.logprobs"
-        "&include%5B%5D=web_search_call.action.sources",
+        "GET", f"/v1/responses/{created.id}?{projection_query}"
     )
     assert repeated.status_code == 200
 
@@ -1378,8 +1376,11 @@ def test_stored_response_retrieve_and_delete_via_sdk():
     assert exc_info.value.body["param"] == "response_id"
 
 
-@pytest.mark.parametrize("background", [False, True])
-def test_store_true_fails_if_the_resource_cannot_be_persisted(background):
+@pytest.mark.parametrize(
+    ("background", "stream"),
+    [(False, False), (True, False), (True, True)],
+)
+def test_store_true_fails_if_the_resource_cannot_be_persisted(background, stream):
     global server
     server.start()
     database_path = os.environ["LLAMA_RESPONSES_DB"]
@@ -1395,6 +1396,7 @@ def test_store_true_fails_if_the_resource_cannot_be_persisted(background):
                 "max_output_tokens": 16,
                 "store": True,
                 "background": background,
+                "stream": stream,
             },
         )
     finally:
@@ -1844,8 +1846,6 @@ def test_unavailable_resource_operations_fail_explicitly():
     )
 
     requests = [
-        ("GET", f"/v1/responses/{created.id}?stream=true"),
-        ("GET", f"/v1/responses/{created.id}?starting_after=7"),
         ("POST", "/v1/responses/compact"),
         ("GET", f"/v1/responses/{created.id}/input_items?include=reasoning"),
     ]
@@ -1854,6 +1854,24 @@ def test_unavailable_resource_operations_fail_explicitly():
         assert response.status_code == 501, path
         assert response.body["error"]["type"] == "invalid_request_error"
         assert response.body["error"]["code"] == "not_supported"
+
+    for path, code, param in [
+        (
+            f"/v1/responses/{created.id}?stream=true",
+            "invalid_parameter",
+            "stream",
+        ),
+        (
+            f"/v1/responses/{created.id}?starting_after=7",
+            "invalid_parameter",
+            "starting_after",
+        ),
+    ]:
+        response = authenticated_request("GET", path)
+        assert response.status_code == 400, path
+        assert response.body["error"]["type"] == "invalid_request_error"
+        assert response.body["error"]["code"] == code
+        assert response.body["error"]["param"] == param
 
     completed_cancel = authenticated_request(
         "POST", f"/v1/responses/{created.id}/cancel"
@@ -1864,18 +1882,19 @@ def test_unavailable_resource_operations_fail_explicitly():
     assert client.responses.delete(created.id) is None
 
 
-def test_background_response_survives_the_create_request_lifetime():
+@pytest.mark.parametrize("store", [False, True])
+def test_background_response_survives_the_create_request_lifetime(store):
     client = openai_client()
     response = client.responses.create(
         model="tinyllama-2",
         input="Finish this background response.",
         max_output_tokens=16,
         background=True,
-        store=False,
+        store=store,
     )
 
     assert response.background is True
-    assert response.store is False
+    assert response.store is store
     deadline = time.monotonic() + 10
     while response.status in {"queued", "in_progress"}:
         assert time.monotonic() < deadline
@@ -1884,6 +1903,134 @@ def test_background_response_survives_the_create_request_lifetime():
 
     assert_foreground_terminal(response)
     assert client.responses.delete(response.id) is None
+
+
+def test_active_background_delete_conflicts_then_sdk_cancel_succeeds():
+    global server
+    # Force a deterministic active window without test-only route hooks: the
+    # response resource is checkpointed before its owned worker wakes the
+    # sleeping model, so HTTP can observe and cancel real queued inference.
+    server.sleep_idle_seconds = 1
+    client = openai_client()
+    deadline = time.monotonic() + 10
+    while not authenticated_request("GET", "/props").body["is_sleeping"]:
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+
+    stream = client.responses.create(
+        model="tinyllama-2",
+        input="Exercise the active background cancellation lifecycle.",
+        max_output_tokens=64,
+        background=True,
+        store=True,
+        stream=True,
+    )
+
+    first = next(iter(stream))
+    assert first.type == "response.created"
+    response_id = first.response.id
+    stream.close()
+
+    active_delete = authenticated_request("DELETE", f"/v1/responses/{response_id}")
+    assert active_delete.status_code == 409
+    assert active_delete.body["error"]["code"] == "response_active"
+
+    cancelled = client.responses.cancel(response_id)
+    assert cancelled.id == response_id
+    assert cancelled.status == "cancelled"
+    retrieved = client.responses.retrieve(response_id)
+    assert retrieved.status == "cancelled"
+    assert client.responses.delete(response_id) is None
+
+
+@pytest.mark.parametrize("store", [False, True])
+def test_background_stream_detaches_and_resumes_via_sync_sdk(store):
+    client = openai_client()
+    stream = client.responses.create(
+        model="tinyllama-2",
+        input="Stream this response in the background.",
+        max_output_tokens=16,
+        background=True,
+        store=store,
+        stream=True,
+    )
+
+    first = next(iter(stream))
+    assert first.type == "response.created"
+    response_id = first.response.id
+    cursor = first.sequence_number
+    stream.close()
+
+    resumed = list(
+        client.responses.retrieve(
+            response_id,
+            stream=True,
+            starting_after=cursor,
+        )
+    )
+    assert resumed
+    assert [event.sequence_number for event in resumed] == list(
+        range(cursor + 1, cursor + 1 + len(resumed))
+    )
+    assert resumed[-1].type in {
+        "response.completed",
+        "response.failed",
+        "response.incomplete",
+    }
+    terminal = resumed[-1].response
+    assert terminal.id == response_id
+
+    retrieved = client.responses.retrieve(response_id)
+    assert retrieved.status == terminal.status
+    assert retrieved.output == terminal.output
+    assert client.responses.delete(response_id) is None
+
+
+@pytest.mark.parametrize("store", [False, True])
+def test_background_stream_detaches_and_resumes_via_async_sdk(store):
+    global server
+    server.start()
+
+    async def exercise() -> None:
+        async with AsyncOpenAI(
+            api_key=TEST_API_KEY,
+            base_url=f"http://{server.server_host}:{server.server_port}/v1",
+        ) as client:
+            stream = await client.responses.create(
+                model="tinyllama-2",
+                input="Stream this asynchronous response in the background.",
+                max_output_tokens=16,
+                background=True,
+                store=store,
+                stream=True,
+            )
+
+            first = await stream.__anext__()
+            assert first.type == "response.created"
+            response_id = first.response.id
+            cursor = first.sequence_number
+            await stream.close()
+
+            tail = await client.responses.retrieve(
+                response_id,
+                stream=True,
+                starting_after=cursor,
+            )
+            resumed = [event async for event in tail]
+            assert resumed
+            assert [event.sequence_number for event in resumed] == list(
+                range(cursor + 1, cursor + 1 + len(resumed))
+            )
+            assert resumed[-1].type in {
+                "response.completed",
+                "response.failed",
+                "response.incomplete",
+            }
+            retrieved = await client.responses.retrieve(response_id)
+            assert retrieved.status == resumed[-1].response.status
+            assert await client.responses.delete(response_id) is None
+
+    asyncio.run(exercise())
 
 
 def test_missing_response_resources_share_the_not_found_envelope():
@@ -1902,13 +2049,14 @@ def test_missing_response_resources_share_the_not_found_envelope():
         assert response.body["error"]["param"] == "response_id"
 
 
-def test_streamed_response_is_stored_and_retrievable_via_sdk():
+@pytest.mark.parametrize("store", [False, True])
+def test_streamed_response_store_policy_via_sdk(store):
     client = openai_client()
     stream = client.responses.create(
         model="tinyllama-2",
         input="Store this streamed response.",
         max_output_tokens=16,
-        store=True,
+        store=store,
         stream=True,
     )
 
@@ -1919,9 +2067,13 @@ def test_streamed_response_is_stored_and_retrievable_via_sdk():
 
     assert terminal is not None
     assert_foreground_terminal(terminal)
-    retrieved = client.responses.retrieve(terminal.id)
-    assert retrieved.id == terminal.id
-    assert retrieved.output == terminal.output
+    if store:
+        retrieved = client.responses.retrieve(terminal.id)
+        assert retrieved.id == terminal.id
+        assert retrieved.output == terminal.output
+    else:
+        with pytest.raises(NotFoundError):
+            client.responses.retrieve(terminal.id)
 
 
 def test_max_output_tokens_produces_incomplete_sync_and_stream_resources():

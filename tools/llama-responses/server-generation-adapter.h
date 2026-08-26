@@ -2,7 +2,9 @@
 #define LLAMA_RESPONSES_SERVER_GENERATION_ADAPTER_H
 
 #include "generation.h"
+#include "json.h"
 #include "response-store.h"
+#include "response-types.h"
 #include "server-generation.h"
 
 #include <cstdint>
@@ -21,8 +23,9 @@ class native_server_generation_sink final : public server_generation_sink {
     native_server_generation_sink(generation_response_context                  context,
                                   std::string                                  id_namespace,
                                   bool                                         stream,
-                                  response_store *                             store         = nullptr,
-                                  std::unordered_map<std::string, common_json> tool_metadata = {});
+                                  response_store *                             store          = nullptr,
+                                  std::unordered_map<std::string, common_json> tool_metadata  = {},
+                                  bool                                         journal_events = false);
     ~native_server_generation_sink() override;
 
     native_server_generation_sink(const native_server_generation_sink &)             = delete;
