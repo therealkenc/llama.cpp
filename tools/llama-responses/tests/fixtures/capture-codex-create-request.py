@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Capture and normalize one Codex CLI POST /v1/responses request.
 
-The listener serves a deterministic private model catalog and terminates the
-first Responses request with a non-retryable 400.  It never contacts a model or
-an external service.  Run Codex separately with the loopback provider described
-in codex-create-request-0.149.1.md.
+The listener advertises Responses Lite through a deterministic private model
+catalog and terminates the first Responses request with a non-retryable 400. It
+never contacts a model or an external service. Run Codex separately with the
+loopback provider described in codex-create-request-0.149.1.md.
 """
 
 from __future__ import annotations
@@ -40,7 +40,9 @@ def json_shape(value: Any) -> Any:
     if isinstance(value, dict):
         return {
             "type": "object",
-            "properties": {key: json_shape(item) for key, item in sorted(value.items())},
+            "properties": {
+                key: json_shape(item) for key, item in sorted(value.items())
+            },
         }
     if isinstance(value, list):
         return {
@@ -94,8 +96,8 @@ def private_catalog(base_instructions: str) -> dict[str, Any]:
                 "effective_context_window_percent": 95,
                 "experimental_supported_tools": [],
                 "input_modalities": ["text", "image"],
-                "supports_search_tool": False,
-                "use_responses_lite": False,
+                "supports_search_tool": True,
+                "use_responses_lite": True,
                 "context_window": 32_768,
                 "max_context_window": 32_768,
             }
@@ -117,9 +119,33 @@ def normalize_request(
     replacements: list[dict[str, Any]] = []
 
     instructions = normalized.get("instructions")
-    if not isinstance(instructions, str):
-        raise ValueError("captured request has no string instructions field")
-    normalized["instructions"] = "$CODEX_BASE_INSTRUCTIONS"
+    instructions_pointer = "/request/instructions"
+    if isinstance(instructions, str):
+        normalized["instructions"] = "$CODEX_BASE_INSTRUCTIONS"
+    elif "instructions" not in normalized:
+        input_items = normalized.get("input")
+        if not isinstance(input_items, list) or len(input_items) < 2:
+            raise ValueError(
+                "Responses Lite capture has no base-instructions input item"
+            )
+        developer = input_items[1]
+        if (
+            not isinstance(developer, dict)
+            or developer.get("type") != "message"
+            or developer.get("role") != "developer"
+            or not isinstance(developer.get("content"), list)
+            or not developer["content"]
+            or not isinstance(developer["content"][0], dict)
+            or not isinstance(developer["content"][0].get("text"), str)
+        ):
+            raise ValueError(
+                "Responses Lite capture has no developer base-instructions message"
+            )
+        instructions = developer["content"][0]["text"]
+        instructions_pointer = "/request/input/1/content/0/text"
+        developer["content"][0]["text"] = "$CODEX_BASE_INSTRUCTIONS"
+    else:
+        raise ValueError("captured request instructions is not a string")
 
     client_metadata = normalized.get("client_metadata")
     if not isinstance(client_metadata, dict):
@@ -171,17 +197,28 @@ def normalize_request(
         if not isinstance(item, dict):
             raise ValueError(f"captured input[{item_index}] is not an object")
         item_id = item.get("id")
-        if not isinstance(item_id, str):
-            raise ValueError(f"captured input[{item_index}].id is not a string")
-        stable_id = f"msg_fixture_{item_index}"
-        replacements.append(
-            {
-                "pointer": f"/request/input/{item_index}/id",
-                "replacement": stable_id,
-                **text_fingerprint(item_id),
-            }
-        )
-        item["id"] = stable_id
+        if item_id is not None:
+            if not isinstance(item_id, str) or not item_id:
+                raise ValueError(
+                    f"captured input[{item_index}].id is not a non-empty string"
+                )
+            stable_id = f"msg_fixture_{item_index}"
+            replacements.append(
+                {
+                    "pointer": f"/request/input/{item_index}/id",
+                    "replacement": stable_id,
+                    **text_fingerprint(item_id),
+                }
+            )
+            item["id"] = stable_id
+        if item.get("type") == "additional_tools":
+            if item.get("role") != "developer" or not isinstance(
+                item.get("tools"), list
+            ):
+                raise ValueError(
+                    "captured additional_tools item has an invalid Lite shape"
+                )
+            continue
         content = item.get("content")
         if not isinstance(content, list):
             raise ValueError(f"captured input[{item_index}].content is not an array")
@@ -189,6 +226,8 @@ def normalize_request(
             if not isinstance(part, dict) or not isinstance(part.get("text"), str):
                 continue
             text = part["text"]
+            if text == "$CODEX_BASE_INSTRUCTIONS":
+                continue
             if item_index == len(input_items) - 1 and text == CAPTURE_PROMPT:
                 continue
             placeholder = f"$INPUT_TEXT_{item_index}_{content_index}"
@@ -206,7 +245,13 @@ def normalize_request(
     safe_header_values = {
         key.lower(): value
         for key, value in request_headers.items()
-        if key.lower() in {"accept", "content-type", "content-encoding"}
+        if key.lower()
+        in {
+            "accept",
+            "content-type",
+            "content-encoding",
+            "x-openai-internal-codex-responses-lite",
+        }
     }
     return {
         "fixture_schema": "llama.cpp.codex.responses_create_request.v1",
@@ -239,6 +284,7 @@ def normalize_request(
         "normalization": {
             "instructions": {
                 "request_placeholder": "$CODEX_BASE_INSTRUCTIONS",
+                "pointer": instructions_pointer,
                 "source": PROMPT_REFERENCE,
                 **text_fingerprint(instructions),
             },
@@ -248,7 +294,7 @@ def normalize_request(
             "comparison_policy": [
                 "Materialize or replace the instructions placeholder from the referenced prompt before byte-level replay.",
                 "Normalize the listed dynamic JSON pointers before comparing a fresh capture.",
-                "Compare tools and all unlisted request fields exactly.",
+                "Compare additional_tools and all unlisted request fields exactly.",
                 "Input-text fingerprints are provenance only; generated developer and environment prose may change with Codex.",
             ],
         },
@@ -257,7 +303,9 @@ def normalize_request(
 
 
 def write_private_json(path: Path, value: Any) -> None:
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     os.chmod(path, 0o600)
 
 
@@ -312,11 +360,20 @@ def main() -> None:
             write_private_json(args.raw_output, request)
             headers = {
                 "header_names": sorted(key.lower() for key in self.headers),
-                "authorization": "<redacted>" if self.headers.get("Authorization") else None,
+                "authorization": "<redacted>"
+                if self.headers.get("Authorization")
+                else None,
                 "safe_values": {
                     key.lower(): value
                     for key, value in self.headers.items()
-                    if key.lower() in {"accept", "content-type", "content-encoding", "user-agent"}
+                    if key.lower()
+                    in {
+                        "accept",
+                        "content-type",
+                        "content-encoding",
+                        "user-agent",
+                        "x-openai-internal-codex-responses-lite",
+                    }
                 },
             }
             write_private_json(args.headers_output, headers)

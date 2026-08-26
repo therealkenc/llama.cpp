@@ -169,6 +169,29 @@ bool json_integer_is_negative(const common_json & value) {
     return !encoded.empty() && encoded.front() == '-';
 }
 
+common_json canonical_json_value(const common_json & value) {
+    if (value.is_array()) {
+        common_json result = common_json::array();
+        for (const common_json & element : value) {
+            result.push_back(canonical_json_value(element));
+        }
+        return result;
+    }
+    if (!value.is_object()) {
+        return value;
+    }
+
+    std::map<std::string, common_json> sorted;
+    for (const auto & entry : value.items()) {
+        sorted.emplace(entry.key(), canonical_json_value(entry.value()));
+    }
+    common_json result = common_json::object();
+    for (auto & [key, element] : sorted) {
+        result[key] = std::move(element);
+    }
+    return result;
+}
+
 std::string random_id_suffix() {
     static constexpr char alphabet[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     std::random_device    source;
@@ -341,6 +364,11 @@ bool valid_tool_name(const std::string & name, std::size_t max_length) {
            });
 }
 
+std::string optional_string_field(const common_json & value, const char * name) {
+    return value.is_object() && value.contains(name) && value.at(name).is_string() ? value.at(name).get<std::string>() :
+                                                                                     std::string();
+}
+
 std::string require_tool_name(const common_json & value, const std::string & field, std::size_t max_length = 64U) {
     if (!value.contains("name")) {
         throw invalid_request_field(field, "missing_required_parameter",
@@ -423,9 +451,6 @@ void validate_custom_tool_format(const common_json & tool, const std::string & p
 
 void validate_deferred_tool(const common_json & tool, const std::string & prefix) {
     validate_optional_tool_field(tool, "defer_loading", prefix, &common_json::is_boolean, "a boolean or null");
-    if (tool.contains("defer_loading") && !tool.at("defer_loading").is_null() && tool.at("defer_loading").get<bool>()) {
-        throw unsupported_request_field(prefix + ".defer_loading", "Deferred tool loading is not available");
-    }
 }
 
 std::string validate_function_tool(const common_json & tool,
@@ -456,9 +481,33 @@ struct declared_tools {
     std::set<std::string> custom;
     std::set<std::string> namespaces;
     bool                  local_shell = false;
+    bool                  tool_search = false;
 
-    bool empty() const { return functions.empty() && custom.empty() && namespaces.empty() && !local_shell; }
+    bool has_required_choice_target() const {
+        return !functions.empty() || !custom.empty() || !namespaces.empty() || local_shell;
+    }
 };
+
+void validate_client_tool_search(const common_json & tool, const std::string & prefix) {
+    validate_optional_tool_field(tool, "description", prefix, &common_json::is_string, "a string or null");
+    validate_optional_tool_field(tool, "parameters", prefix, &common_json::is_object, "an object or null");
+    if (!tool.contains("execution") || tool.at("execution").is_null()) {
+        throw unsupported_request_field(prefix + ".execution",
+                                        "Hosted tool search is not available; use execution 'client'");
+    }
+    if (!tool.at("execution").is_string()) {
+        throw invalid_request_field(prefix + ".execution", "invalid_type",
+                                    "Invalid type for '" + prefix + ".execution': expected a string.");
+    }
+    const std::string execution = tool.at("execution").get<std::string>();
+    if (execution == "server") {
+        throw unsupported_request_field(prefix + ".execution", "Hosted tool search is not available");
+    }
+    if (execution != "client") {
+        throw invalid_request_field(prefix + ".execution", "invalid_value",
+                                    "Invalid value for '" + prefix + ".execution': expected 'client' or 'server'.");
+    }
+}
 
 declared_tools validate_tools(common_json & request) {
     declared_tools declared;
@@ -483,7 +532,6 @@ declared_tools validate_tools(common_json & request) {
         "mcp",
         "programmatic_tool_calling",
         "shell",
-        "tool_search",
         "web_search",
         "web_search_preview",
         "web_search_preview_2025_03_11",
@@ -508,14 +556,14 @@ declared_tools validate_tools(common_json & request) {
             const std::string name = validate_function_tool(tool, prefix);
             if (!declared.functions.insert(name).second || declared.custom.find(name) != declared.custom.end() ||
                 declared.namespaces.find(name) != declared.namespaces.end() ||
-                (declared.local_shell && name == "local_shell")) {
+                (declared.local_shell && name == "local_shell") || (declared.tool_search && name == "tool_search")) {
                 throw invalid_request_field(prefix + ".name", "invalid_value", "Tool names must be unique.");
             }
         } else if (type == "custom") {
             const std::string name = validate_custom_tool(tool, prefix);
             if (!declared.custom.insert(name).second || declared.functions.find(name) != declared.functions.end() ||
                 declared.namespaces.find(name) != declared.namespaces.end() ||
-                (declared.local_shell && name == "local_shell")) {
+                (declared.local_shell && name == "local_shell") || (declared.tool_search && name == "tool_search")) {
                 throw invalid_request_field(prefix + ".name", "invalid_value", "Tool names must be unique.");
             }
         } else if (type == "namespace") {
@@ -531,7 +579,7 @@ declared_tools validate_tools(common_json & request) {
             }
             if (!declared.namespaces.insert(name).second || declared.functions.find(name) != declared.functions.end() ||
                 declared.custom.find(name) != declared.custom.end() ||
-                (declared.local_shell && name == "local_shell")) {
+                (declared.local_shell && name == "local_shell") || (declared.tool_search && name == "tool_search")) {
                 throw invalid_request_field(prefix + ".name", "invalid_value", "Tool names must be unique.");
             }
 
@@ -576,6 +624,15 @@ declared_tools validate_tools(common_json & request) {
                                             "Only one local_shell tool may be declared.");
             }
             declared.local_shell = true;
+        } else if (type == "tool_search") {
+            validate_client_tool_search(tool, prefix);
+            if (declared.tool_search || declared.functions.find("tool_search") != declared.functions.end() ||
+                declared.custom.find("tool_search") != declared.custom.end() ||
+                declared.namespaces.find("tool_search") != declared.namespaces.end()) {
+                throw invalid_request_field(prefix + ".type", "invalid_value",
+                                            "Only one client tool_search tool may be declared.");
+            }
+            declared.tool_search = true;
         } else if (hosted_types.find(type) != hosted_types.end()) {
             throw unsupported_request_field(prefix + ".type",
                                             "The requested hosted tool '" + type + "' is not available");
@@ -586,6 +643,163 @@ declared_tools validate_tools(common_json & request) {
         ++index;
     }
     return declared;
+}
+
+std::string tool_declaration_identity(const common_json & tool) {
+    std::string type = optional_string_field(tool, "type");
+    if (type == "local_shell" || type == "tool_search") {
+        return type;
+    }
+    const std::string name           = optional_string_field(tool, "name");
+    const std::string namespace_name = optional_string_field(tool, "namespace");
+    return namespace_name.empty() ? name : namespace_name + '\n' + name;
+}
+
+struct effective_tool_definition {
+    common_json comparable;
+    std::size_t index = 0;
+};
+
+common_json comparable_namespace_shell(common_json tool) {
+    tool.erase("tools");
+    return canonical_json_value(tool);
+}
+
+void merge_namespace_declaration(common_json & target, const common_json & incoming, const std::string & prefix) {
+    if (comparable_namespace_shell(target) != comparable_namespace_shell(incoming)) {
+        throw invalid_request_field(
+            prefix, "invalid_value",
+            "Conflicting namespace declarations were supplied for '" + optional_string_field(incoming, "name") + "'.");
+    }
+
+    std::map<std::string, common_json> members;
+    for (const common_json & member : target.at("tools")) {
+        members.emplace(optional_string_field(member, "name"), canonical_json_value(member));
+    }
+    std::size_t member_index = 0;
+    for (const common_json & member : incoming.at("tools")) {
+        const std::string name       = optional_string_field(member, "name");
+        const common_json comparable = canonical_json_value(member);
+        const auto        existing   = members.find(name);
+        if (existing == members.end()) {
+            members.emplace(name, comparable);
+            target["tools"].push_back(member);
+        } else if (existing->second != comparable) {
+            throw invalid_request_field(prefix + ".tools[" + std::to_string(member_index) + "]", "invalid_value",
+                                        "Conflicting namespace member declarations were supplied for '" + name + "'.");
+        }
+        ++member_index;
+    }
+}
+
+void append_effective_tool(common_json &                                      effective,
+                           std::map<std::string, effective_tool_definition> & definitions,
+                           const common_json &                                tool,
+                           const std::string &                                prefix) {
+    const std::string identity = tool_declaration_identity(tool);
+    if (identity.empty()) {
+        // The declaration validator will produce the precise missing/type
+        // error after collection. Keep malformed entries distinct here.
+        effective.push_back(tool);
+        return;
+    }
+
+    const common_json comparable = canonical_json_value(tool);
+    const auto        existing   = definitions.find(identity);
+    if (existing == definitions.end()) {
+        definitions.emplace(identity, effective_tool_definition{ comparable, effective.size() });
+        effective.push_back(tool);
+        return;
+    }
+    if (optional_string_field(tool, "type") == "namespace" &&
+        optional_string_field(effective.at(existing->second.index), "type") == "namespace") {
+        merge_namespace_declaration(effective[existing->second.index], tool, prefix);
+        existing->second.comparable = canonical_json_value(effective.at(existing->second.index));
+        return;
+    }
+    if (existing->second.comparable != comparable) {
+        throw invalid_request_field(prefix, "invalid_value",
+                                    "Conflicting tool declarations were supplied for '" + identity + "'.");
+    }
+    // A stored Responses Lite lineage may contain the same complete tool
+    // snapshot more than once. Exact semantic duplicates are one declaration,
+    // not a reason to grow the model-visible schema on each continuation.
+}
+
+common_json collect_effective_tools(const common_json & request, const common_json & input) {
+    common_json                                      effective = common_json::array();
+    std::map<std::string, effective_tool_definition> definitions;
+
+    if (request.contains("tools") && request.at("tools").is_array()) {
+        std::size_t index = 0;
+        for (const common_json & tool : request.at("tools")) {
+            append_effective_tool(effective, definitions, tool, "tools[" + std::to_string(index) + "]");
+            ++index;
+        }
+    }
+
+    std::size_t item_index = 0;
+    for (const common_json & item : input) {
+        if (!item.is_object() || optional_string_field(item, "type") != "additional_tools") {
+            ++item_index;
+            continue;
+        }
+        const std::string prefix = "input[" + std::to_string(item_index) + "]";
+        if (!item.contains("role")) {
+            throw invalid_request_field(prefix + ".role", "missing_required_parameter",
+                                        "Missing required parameter: '" + prefix + ".role'.");
+        }
+        if (!item.at("role").is_string()) {
+            throw invalid_request_field(prefix + ".role", "invalid_type",
+                                        "Invalid type for '" + prefix + ".role': expected a string.");
+        }
+        if (item.at("role").get<std::string>() != "developer") {
+            throw invalid_request_field(prefix + ".role", "invalid_value",
+                                        "Invalid value for '" + prefix + ".role': expected 'developer'.");
+        }
+        if (!item.contains("tools")) {
+            throw invalid_request_field(prefix + ".tools", "missing_required_parameter",
+                                        "Missing required parameter: '" + prefix + ".tools'.");
+        }
+        if (!item.at("tools").is_array()) {
+            throw invalid_request_field(prefix + ".tools", "invalid_type",
+                                        "Invalid type for '" + prefix + ".tools': expected an array.");
+        }
+
+        // Reuse the ordinary declaration validator for each positional item so
+        // nested schema and within-item collision behavior cannot drift.
+        common_json item_request = {
+            { "tools", item.at("tools") }
+        };
+        (void) validate_tools(item_request);
+        std::size_t tool_index = 0;
+        for (const common_json & tool : item.at("tools")) {
+            append_effective_tool(effective, definitions, tool, prefix + ".tools[" + std::to_string(tool_index) + "]");
+            ++tool_index;
+        }
+        ++item_index;
+    }
+
+    item_index = 0;
+    for (const common_json & item : input) {
+        if (item.is_object() && optional_string_field(item, "type") == "tool_search_output" && item.contains("tools") &&
+            item.at("tools").is_array()) {
+            std::size_t tool_index = 0;
+            for (const common_json & tool : item.at("tools")) {
+                append_effective_tool(
+                    effective, definitions, tool,
+                    "input[" + std::to_string(item_index) + "].tools[" + std::to_string(tool_index) + "]");
+                ++tool_index;
+            }
+        }
+        ++item_index;
+    }
+
+    common_json effective_request = {
+        { "tools", effective }
+    };
+    (void) validate_tools(effective_request);
+    return effective;
 }
 
 void validate_tool_choice(common_json & request, const declared_tools & declared) {
@@ -600,9 +814,9 @@ void validate_tool_choice(common_json & request, const declared_tools & declared
             throw invalid_request_field("tool_choice", "invalid_value",
                                         "Invalid value for 'tool_choice': expected 'none', 'auto', or 'required'.");
         }
-        if (value == "required" && declared.empty()) {
+        if (value == "required" && !declared.has_required_choice_target()) {
             throw invalid_request_field("tool_choice", "invalid_value",
-                                        "Invalid value for 'tool_choice': no tools were declared.");
+                                        "Invalid value for 'tool_choice': no directly callable tools were declared.");
         }
         return;
     }
@@ -619,6 +833,10 @@ void validate_tool_choice(common_json & request, const declared_tools & declared
                                     "Invalid type for 'tool_choice.type': expected a string.");
     }
     const std::string type = choice.at("type").get<std::string>();
+    if (type == "tool_search") {
+        throw invalid_request_field("tool_choice.type", "invalid_value",
+                                    "Client tool_search cannot be selected directly; use tool_choice 'auto'.");
+    }
     if (type != "function" && type != "custom") {
         static const std::set<std::string> hosted_choices = {
             "allowed_tools",
@@ -632,7 +850,6 @@ void validate_tool_choice(common_json & request, const declared_tools & declared
             "namespace",
             "programmatic_tool_calling",
             "shell",
-            "tool_search",
             "web_search",
             "web_search_preview",
             "web_search_preview_2025_03_11",
@@ -741,7 +958,18 @@ void validate_reasoning(const common_json & request) {
         throw unsupported_request_field("reasoning.generate_summary", "Reasoning summaries are not available");
     }
     if (reasoning.contains("context") && !reasoning.at("context").is_null()) {
-        throw unsupported_request_field("reasoning.context", "Opaque reasoning context is not available");
+        if (!reasoning.at("context").is_string()) {
+            throw invalid_request_field("reasoning.context", "invalid_type",
+                                        "Invalid type for 'reasoning.context': expected a string or null.");
+        }
+        if (reasoning.at("context").get<std::string>() != "all_turns") {
+            throw invalid_request_field("reasoning.context", "invalid_value",
+                                        "Invalid value for 'reasoning.context': expected 'all_turns'.");
+        }
+        // Responses Lite moves the base instructions and tool declarations
+        // into replayable input items. This route already materializes the
+        // complete lineage for each inference, so all_turns is truthful and
+        // requires no separate opaque reasoning store.
     }
     if (reasoning.contains("mode") && !reasoning.at("mode").is_null()) {
         throw unsupported_request_field("reasoning.mode", "Reasoning mode selection is not available");
@@ -852,8 +1080,7 @@ void validate_create_policy(common_json & request) {
     }
     validate_metadata(request);
     validate_client_metadata(request);
-    const declared_tools tools = validate_tools(request);
-    validate_tool_choice(request, tools);
+    (void) validate_tools(request);
     validate_include(request);
     validate_stream_options(request);
     validate_reasoning(request);
@@ -976,6 +1203,207 @@ void validate_unique_input_item_ids(const common_json & items) {
             throw invalid_request_field(
                 "input", "invalid_value",
                 "Responses input item ids must be non-empty and unique after continuation expansion.");
+        }
+    }
+}
+
+std::string selected_tool_identity(const std::string & namespace_name, const std::string & name) {
+    return namespace_name + '\n' + name;
+}
+
+common_json comparable_selected_tool(common_json         tool,
+                                     const std::string & namespace_name,
+                                     const std::string & namespace_description = {}) {
+    tool.erase("defer_loading");
+    if (!namespace_name.empty()) {
+        tool["namespace"] = namespace_name;
+    }
+    if (!namespace_description.empty()) {
+        tool["_llama_namespace_description"] = namespace_description;
+    }
+    return canonical_json_value(tool);
+}
+
+void remember_selected_tool(const common_json &                  tool,
+                            const std::string &                  namespace_name,
+                            const std::string &                  namespace_description,
+                            const std::string &                  prefix,
+                            std::map<std::string, common_json> & selected) {
+    const std::string name       = optional_string_field(tool, "name");
+    const std::string identity   = selected_tool_identity(namespace_name, name);
+    common_json       comparable = comparable_selected_tool(tool, namespace_name, namespace_description);
+    const auto        existing   = selected.find(identity);
+    if (existing == selected.end()) {
+        selected.emplace(identity, std::move(comparable));
+        return;
+    }
+    if (existing->second != comparable) {
+        throw invalid_request_field(prefix, "invalid_value",
+                                    "Conflicting definitions were supplied for selected tool '" +
+                                        (namespace_name.empty() ? name : namespace_name + "." + name) + "'.");
+    }
+}
+
+void validate_selected_tool(const common_json &                  tool,
+                            const std::string &                  prefix,
+                            std::map<std::string, common_json> & selected) {
+    if (!tool.is_object()) {
+        throw invalid_request_field(prefix, "invalid_type", "Invalid type for '" + prefix + "': expected an object.");
+    }
+    if (!tool.contains("type")) {
+        throw invalid_request_field(prefix + ".type", "missing_required_parameter",
+                                    "Missing required parameter: '" + prefix + ".type'.");
+    }
+    if (!tool.at("type").is_string()) {
+        throw invalid_request_field(prefix + ".type", "invalid_type",
+                                    "Invalid type for '" + prefix + ".type': expected a string.");
+    }
+
+    const std::string type = tool.at("type").get<std::string>();
+    if (type == "function" || type == "custom") {
+        if (type == "function") {
+            validate_function_tool(tool, prefix, 128U);
+        } else {
+            validate_custom_tool(tool, prefix, 128U);
+        }
+        validate_optional_tool_field(tool, "namespace", prefix, &common_json::is_string, "a string or null");
+        const std::string namespace_name = optional_string_field(tool, "namespace");
+        remember_selected_tool(tool, namespace_name, {}, prefix, selected);
+        return;
+    }
+    if (type != "namespace") {
+        throw invalid_request_field(
+            prefix + ".type", "invalid_value",
+            "Invalid value for '" + prefix + ".type': expected 'function', 'custom', or 'namespace'.");
+    }
+
+    const std::string namespace_name        = require_tool_name(tool, prefix + ".name");
+    const std::string namespace_description = optional_string_field(tool, "description");
+    validate_optional_tool_field(tool, "description", prefix, &common_json::is_string, "a string or null");
+    if (!tool.contains("tools")) {
+        throw invalid_request_field(prefix + ".tools", "missing_required_parameter",
+                                    "Missing required parameter: '" + prefix + ".tools'.");
+    }
+    if (!tool.at("tools").is_array()) {
+        throw invalid_request_field(prefix + ".tools", "invalid_type",
+                                    "Invalid type for '" + prefix + ".tools': expected an array.");
+    }
+    std::size_t nested_index = 0;
+    for (const common_json & nested : tool.at("tools")) {
+        const std::string nested_prefix = prefix + ".tools[" + std::to_string(nested_index) + "]";
+        if (!nested.is_object()) {
+            throw invalid_request_field(nested_prefix, "invalid_type",
+                                        "Invalid type for '" + nested_prefix + "': expected an object.");
+        }
+        const std::string nested_type = optional_string_field(nested, "type");
+        if (nested_type == "function") {
+            validate_function_tool(nested, nested_prefix, 128U);
+        } else if (nested_type == "custom") {
+            validate_custom_tool(nested, nested_prefix, 128U);
+        } else {
+            throw invalid_request_field(nested_prefix + ".type", "invalid_value",
+                                        "Invalid selected namespace member type; expected 'function' or 'custom'.");
+        }
+        remember_selected_tool(nested, namespace_name, namespace_description, nested_prefix, selected);
+        ++nested_index;
+    }
+}
+
+void validate_tool_search_lineage(const common_json & items) {
+    std::set<std::string>              calls;
+    std::set<std::string>              outputs;
+    std::map<std::string, common_json> selected;
+
+    std::size_t index = 0;
+    for (const common_json & item : items) {
+        if (!item.is_object()) {
+            ++index;
+            continue;
+        }
+        const std::string type   = item.value("type", std::string());
+        const std::string prefix = "input[" + std::to_string(index) + "]";
+        if (type == "tool_search_call") {
+            const std::string call = optional_string_field(item, "call_id");
+            if (call.empty()) {
+                throw invalid_request_field(prefix + ".call_id", "missing_required_parameter",
+                                            "Tool search call requires a non-empty call_id.");
+            }
+            if (!item.contains("execution")) {
+                throw invalid_request_field(prefix + ".execution", "missing_required_parameter",
+                                            "Tool search call requires execution 'client'.");
+            }
+            if (!item.at("execution").is_string()) {
+                throw invalid_request_field(prefix + ".execution", "invalid_type",
+                                            "Tool search call execution must be a string.");
+            }
+            if (item.at("execution") != "client") {
+                throw unsupported_request_field(prefix + ".execution", "Hosted tool search lineage is not available");
+            }
+            if (!item.contains("arguments") || !item.at("arguments").is_object()) {
+                throw invalid_request_field(prefix + ".arguments", "invalid_type",
+                                            "Tool search call arguments must be an object.");
+            }
+            if (!calls.insert(call).second) {
+                throw invalid_request_field(prefix + ".call_id", "invalid_value",
+                                            "Tool search call_id values must be unique.");
+            }
+        } else if (type == "tool_search_output") {
+            const std::string call = optional_string_field(item, "call_id");
+            if (call.empty()) {
+                throw invalid_request_field(prefix + ".call_id", "missing_required_parameter",
+                                            "Tool search output requires a non-empty call_id.");
+            }
+            if (!item.contains("execution")) {
+                throw invalid_request_field(prefix + ".execution", "missing_required_parameter",
+                                            "Tool search output requires execution 'client'.");
+            }
+            if (!item.at("execution").is_string()) {
+                throw invalid_request_field(prefix + ".execution", "invalid_type",
+                                            "Tool search output execution must be a string.");
+            }
+            if (item.at("execution") != "client") {
+                throw unsupported_request_field(prefix + ".execution", "Hosted tool search lineage is not available");
+            }
+            if (item.contains("status") && !item.at("status").is_null()) {
+                if (!item.at("status").is_string()) {
+                    throw invalid_request_field(prefix + ".status", "invalid_type",
+                                                "Tool search output status must be a string.");
+                }
+                const std::string status = item.at("status").get<std::string>();
+                if (status != "in_progress" && status != "completed" && status != "incomplete") {
+                    throw invalid_request_field(prefix + ".status", "invalid_value",
+                                                "Invalid tool search output status.");
+                }
+            }
+            if (!item.contains("tools")) {
+                throw invalid_request_field(prefix + ".tools", "missing_required_parameter",
+                                            "Tool search output requires a tools array.");
+            }
+            if (!item.at("tools").is_array()) {
+                throw invalid_request_field(prefix + ".tools", "invalid_type",
+                                            "Tool search output tools must be an array.");
+            }
+            if (calls.find(call) == calls.end()) {
+                throw invalid_request_field("input", "invalid_value",
+                                            "No preceding tool search call found for call_id " + call + ".");
+            }
+            if (!outputs.insert(call).second) {
+                throw invalid_request_field(prefix + ".call_id", "invalid_value",
+                                            "Only one output may answer a tool search call.");
+            }
+            std::size_t tool_index = 0;
+            for (const common_json & tool : item.at("tools")) {
+                validate_selected_tool(tool, prefix + ".tools[" + std::to_string(tool_index) + "]", selected);
+                ++tool_index;
+            }
+        }
+        ++index;
+    }
+
+    for (const std::string & call : calls) {
+        if (outputs.find(call) == outputs.end()) {
+            throw invalid_request_field("input", "invalid_value",
+                                        "No tool output found for tool search call " + call + ".");
         }
     }
 }
@@ -1442,8 +1870,13 @@ class responses_routes_impl final {
 
     static item_id make_input_id(std::size_t /*index*/, const common_json & item) {
         std::string prefix = "item_";
-        if (item.is_object() && item.value("type", std::string()) == "message") {
-            prefix = "msg_";
+        if (item.is_object()) {
+            const std::string type = item.value("type", std::string());
+            if (type == "message") {
+                prefix = "msg_";
+            } else if (type == "additional_tools") {
+                prefix = "at_";
+            }
         }
         return item_id(prefix + random_id_suffix());
     }
@@ -1547,9 +1980,22 @@ class responses_routes_impl final {
             expanded.push_back(item);
         }
         validate_unique_input_item_ids(expanded);
+        validate_tool_search_lineage(expanded);
+
+        common_json effective_tools_request = {
+            { "tools", collect_effective_tools(original, expanded) },
+        };
+        const declared_tools effective_tools = validate_tools(effective_tools_request);
+        validate_tool_choice(original, effective_tools);
+        // `additional_tools` is an ordered input representation, but the
+        // response envelope still reports the active declaration set in its
+        // ordinary `tools` field. Persist that projection with the response so
+        // retrieval matches the create result without reparsing lineage.
+        original["tools"] = effective_tools_request.at("tools");
 
         common_json generation_request = original;
         generation_request["input"]    = expanded;
+        generation_request["tools"]    = std::move(effective_tools_request["tools"]);
         if (generation_request.contains("max_output_tokens") &&
             generation_request.at("max_output_tokens").is_number_integer() &&
             !json_integer_is_negative(generation_request.at("max_output_tokens")) &&

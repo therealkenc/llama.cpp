@@ -98,9 +98,9 @@ void test_qwen_projection_accepts_version_bags() {
         return make_response(legacy);
     });
 
-    for (const std::string & version : { std::string("0.148.0"), std::string("0.149.0-alpha.4.3"),
-                                         std::string("1.148.0"), std::string("99.0.0"),
-                                         std::string("opaque-preview") }) {
+    for (const std::string & version :
+         { std::string("0.148.0"), std::string("0.149.0-alpha.4.3"), std::string("1.148.0"), std::string("99.0.0"),
+           std::string("opaque-preview") }) {
         auto response = handler(make_request({
             { "client_version", version },
             { "reload",         "1"     }
@@ -131,6 +131,8 @@ void test_qwen_projection_accepts_version_bags() {
         CODEX_MODELS_CHECK(model.at("truncation_policy").at("mode") == "tokens");
         CODEX_MODELS_CHECK(model.at("truncation_policy").at("limit") == 10000);
         CODEX_MODELS_CHECK(model.at("experimental_supported_tools").empty());
+        CODEX_MODELS_CHECK(model.at("supports_search_tool") == true);
+        CODEX_MODELS_CHECK(model.at("use_responses_lite") == true);
         CODEX_MODELS_CHECK(model.at("context_window") == 32768);
         CODEX_MODELS_CHECK(model.at("max_context_window") == 32768);
         CODEX_MODELS_CHECK(model.at("input_modalities") == common_json::array({ "text", "image" }));
@@ -171,6 +173,8 @@ void test_router_projection() {
     CODEX_MODELS_CHECK(body.at("models").at(0).at("context_window") == 65536);
     CODEX_MODELS_CHECK(body.at("models").at(1).at("priority") == 2);
     CODEX_MODELS_CHECK(body.at("models").at(1).at("supported_reasoning_levels").empty());
+    CODEX_MODELS_CHECK(body.at("models").at(1).at("supports_search_tool") == false);
+    CODEX_MODELS_CHECK(body.at("models").at(1).at("use_responses_lite") == false);
     CODEX_MODELS_CHECK(!body.at("models").at(1).contains("default_reasoning_level"));
     CODEX_MODELS_CHECK(!body.at("models").at(1).contains("context_window"));
     CODEX_MODELS_CHECK(body.at("models").at(1).at("input_modalities") == common_json::array({ "text" }));

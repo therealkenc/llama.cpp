@@ -1,7 +1,6 @@
 #include "codex-models.h"
 
 #include "codex-models-prompt.h"
-
 #include "json.h"
 #include "log.h"
 #include "server-http.h"
@@ -176,8 +175,8 @@ common_json project_model(const common_json & legacy_catalog,
         { "effective_context_window_percent", 95 },
         { "experimental_supported_tools", common_json::array() },
         { "input_modalities", input_modalities(legacy_catalog, legacy_model, index) },
-        { "supports_search_tool", false },
-        { "use_responses_lite", false },
+        { "supports_search_tool", is_qwen },
+        { "use_responses_lite", is_qwen },
     };
 
     if (is_qwen) {

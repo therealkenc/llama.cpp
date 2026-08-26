@@ -12,6 +12,7 @@
 #include <exception>
 #include <initializer_list>
 #include <iterator>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -35,9 +36,36 @@ struct lowered_message {
 };
 
 struct lowering_context {
-    server_generation_input result;
-    std::size_t             inline_media_bytes = 0;
+    server_generation_input            result;
+    std::size_t                        inline_media_bytes = 0;
+    // Public namespace/name identity is the durable contract. The generated
+    // model name is only an adapter detail and may include a collision-safe
+    // namespace suffix.
+    std::map<std::string, common_json> callable_tool_definitions;
 };
+
+common_json canonical_json_value(const common_json & value) {
+    if (value.is_array()) {
+        common_json result = common_json::array();
+        for (const common_json & element : value) {
+            result.push_back(canonical_json_value(element));
+        }
+        return result;
+    }
+    if (!value.is_object()) {
+        return value;
+    }
+
+    std::map<std::string, common_json> sorted;
+    for (const auto & entry : value.items()) {
+        sorted.emplace(entry.key(), canonical_json_value(entry.value()));
+    }
+    common_json result = common_json::object();
+    for (auto & [key, element] : sorted) {
+        result[key] = std::move(element);
+    }
+    return result;
+}
 
 std::string string_field(const common_json & object, const char * key, const std::string & fallback = {}) {
     return object.is_object() && object.contains(key) && object.at(key).is_string() ?
@@ -498,6 +526,10 @@ void lower_tool_call(lowering_context & context, const common_json & item, const
     } else if (type == "local_shell_call") {
         name      = "local_shell";
         arguments = item.contains("action") ? item.at("action") : common_json::object();
+    } else if (type == "tool_search_call") {
+        name      = "tool_search";
+        arguments = item.contains("arguments") && item.at("arguments").is_object() ? item.at("arguments") :
+                                                                                     common_json::object();
     } else {
         name = name.empty() ? "function" : name;
         if (item.contains("namespace") && item.at("namespace").is_string()) {
@@ -507,6 +539,58 @@ void lower_tool_call(lowering_context & context, const common_json & item, const
     }
     const std::string call_id = string_field(item, "call_id", string_field(item, "id"));
     append_assistant_tool_call(context, make_tool_call(name, call_id, arguments));
+}
+
+std::string selected_tool_summary(const common_json & tool) {
+    const std::string type = string_field(tool, "type");
+    const std::string name = string_field(tool, "name");
+    if (type != "namespace") {
+        return name.empty() ? type : name;
+    }
+    std::string result = name;
+    if (!tool.contains("tools") || !tool.at("tools").is_array()) {
+        return result;
+    }
+    result += " [";
+    bool first = true;
+    for (const common_json & nested : tool.at("tools")) {
+        const std::string nested_name = string_field(nested, "name");
+        if (nested_name.empty()) {
+            continue;
+        }
+        if (!first) {
+            result += ", ";
+        }
+        result += nested_name;
+        first = false;
+    }
+    result += ']';
+    return result;
+}
+
+void lower_tool_search_output(lowering_context & context, const common_json & item) {
+    const std::string call_id = string_field(item, "call_id");
+    if (call_id.empty()) {
+        throw std::invalid_argument("tool_search_output input item is missing call_id");
+    }
+    if (!item.contains("tools") || !item.at("tools").is_array()) {
+        throw std::invalid_argument("tool_search_output input item is missing tools");
+    }
+
+    common_json names = common_json::array();
+    for (const common_json & tool : item.at("tools")) {
+        names.push_back(selected_tool_summary(tool));
+    }
+    lowered_message message;
+    message.message.role         = "tool";
+    message.message.tool_call_id = call_id;
+    message.message.tool_name    = "tool_search";
+    append_text(message.message,
+                common_json{
+                    { "loaded_tools", std::move(names) }
+    }
+                    .dump());
+    append_lowered_message(context, std::move(message));
 }
 
 void lower_tool_output(lowering_context & context, const common_json & item) {
@@ -554,12 +638,14 @@ void lower_item(lowering_context & context, const common_json & item) {
     const std::string type = string_field(item, "type");
     if (type == "message" || (type.empty() && item.contains("role"))) {
         lower_message_item(context, item);
-    } else if (type == "function_call" || type == "custom_tool_call" || type == "local_shell_call") {
+    } else if (type == "function_call" || type == "custom_tool_call" || type == "local_shell_call" ||
+               type == "tool_search_call") {
         lower_tool_call(context, item, type);
     } else if (type == "function_call_output" || type == "custom_tool_call_output" || type == "mcp_tool_call_output" ||
-               type == "web_search_output" || type == "file_search_output" || type == "tool_search_output" ||
-               type == "computer_call_output") {
+               type == "web_search_output" || type == "file_search_output" || type == "computer_call_output") {
         lower_tool_output(context, item);
+    } else if (type == "tool_search_output") {
+        lower_tool_search_output(context, item);
     } else if (type == "reasoning") {
         lower_reasoning(context, item);
     } else if (type == "compaction" || type == "compaction_summary") {
@@ -570,8 +656,10 @@ void lower_item(lowering_context & context, const common_json & item) {
             append_text(message.message, "Previous conversation summary:\n\n" + summary);
             append_lowered_message(context, std::move(message));
         }
-    } else if (type == "ghost_snapshot") {
-        // IDE-local bookkeeping does not belong in the model prompt.
+    } else if (type == "additional_tools" || type == "ghost_snapshot") {
+        // Responses Lite declarations are projected through the shared tool
+        // seam, while ghost snapshots are IDE bookkeeping. Neither item is a
+        // model message.
     } else if (type == "item_reference") {
         throw std::invalid_argument("item_reference reached generation before resolution");
     } else {
@@ -653,7 +741,115 @@ void remember_tool(server_generation_input & result,
     if (!namespace_name.empty()) {
         metadata["namespace"] = namespace_name;
     }
+    const auto existing = result.tool_metadata.find(model_name);
+    if (existing != result.tool_metadata.end() && existing->second != metadata) {
+        throw std::invalid_argument("model-visible tool name collision for '" + model_name + "'");
+    }
     result.tool_metadata[model_name] = std::move(metadata);
+}
+
+bool deferred_tool(const common_json & tool) {
+    return tool.contains("defer_loading") && tool.at("defer_loading").is_boolean() &&
+           tool.at("defer_loading").get<bool>();
+}
+
+std::string tool_identity(const std::string & namespace_name, const std::string & name) {
+    return namespace_name + '\n' + name;
+}
+
+common_json comparable_tool_definition(common_json         tool,
+                                       const std::string & namespace_name,
+                                       const std::string & namespace_description = {}) {
+    tool.erase("defer_loading");
+    if (!namespace_name.empty()) {
+        tool["namespace"] = namespace_name;
+    }
+    if (!namespace_description.empty()) {
+        tool["_llama_namespace_description"] = namespace_description;
+    }
+    return canonical_json_value(tool);
+}
+
+void append_callable_tool(lowering_context &  context,
+                          const common_json & public_tool,
+                          const std::string & namespace_name        = {},
+                          const std::string & namespace_description = {}) {
+    const std::string type       = string_field(public_tool, "type");
+    const std::string name       = string_field(public_tool, "name");
+    const std::string key        = tool_identity(namespace_name, name);
+    common_json       definition = comparable_tool_definition(public_tool, namespace_name, namespace_description);
+    const auto        existing   = context.callable_tool_definitions.find(key);
+    if (existing != context.callable_tool_definitions.end()) {
+        if (existing->second != definition) {
+            throw std::invalid_argument("conflicting selected tool identity '" +
+                                        (namespace_name.empty() ? name : namespace_name + "." + name) + "'");
+        }
+        return;
+    }
+
+    const std::string model_name = namespace_name.empty() ? name : namespace_tool_name(namespace_name, name);
+    common_chat_tool  lowered =
+        type == "custom" ? lower_custom_tool(public_tool, model_name) : lower_function_tool(public_tool, model_name);
+    if (!namespace_description.empty()) {
+        lowered.description =
+            namespace_description + (lowered.description.empty() ? std::string() : "\n\n" + lowered.description);
+    }
+    context.callable_tool_definitions.emplace(key, std::move(definition));
+    context.result.chat.tools.push_back(std::move(lowered));
+    remember_tool(context.result, model_name, public_tool, type, name, namespace_name);
+}
+
+void append_selected_tool(lowering_context & context, const common_json & tool) {
+    const std::string type = string_field(tool, "type");
+    if (type == "function" || type == "custom") {
+        append_callable_tool(context, tool, string_field(tool, "namespace"));
+        return;
+    }
+    if (type != "namespace") {
+        throw std::invalid_argument("unsupported selected tool type '" + type + "'");
+    }
+    const std::string namespace_name        = string_field(tool, "name");
+    const std::string namespace_description = string_field(tool, "description");
+    for (const common_json & nested : tool.at("tools")) {
+        append_callable_tool(context, nested, namespace_name, namespace_description);
+    }
+}
+
+void lower_selected_tools(lowering_context & context, const common_json & input) {
+    const auto visit = [&context](const common_json & item) {
+        if (!item.is_object() || string_field(item, "type") != "tool_search_output" || !item.contains("tools") ||
+            !item.at("tools").is_array()) {
+            return;
+        }
+        for (const common_json & tool : item.at("tools")) {
+            append_selected_tool(context, tool);
+        }
+    };
+    if (input.is_array()) {
+        for (const common_json & item : input) {
+            visit(item);
+        }
+    } else {
+        visit(input);
+    }
+}
+
+bool request_has_client_tool_search(const common_json & tools) {
+    return tools.is_array() && std::any_of(tools.begin(), tools.end(), [](const common_json & tool) {
+               return tool.is_object() && string_field(tool, "type") == "tool_search" &&
+                      string_field(tool, "execution") == "client";
+           });
+}
+
+void append_searchable_source(std::vector<std::string> & sources,
+                              const std::string &        kind,
+                              const std::string &        name,
+                              const std::string &        description) {
+    std::string source = kind + " '" + name + "'";
+    if (!description.empty()) {
+        source += ": " + description;
+    }
+    sources.push_back(std::move(source));
 }
 
 void lower_tools(lowering_context & context, const common_json & request) {
@@ -664,16 +860,25 @@ void lower_tools(lowering_context & context, const common_json & request) {
     if (!tools.is_array()) {
         throw std::invalid_argument("tools must be an array");
     }
+    const bool               client_search = request_has_client_tool_search(tools);
+    std::vector<std::string> searchable_sources;
+    std::size_t              search_tool_index = static_cast<std::size_t>(-1);
     for (const common_json & tool : tools) {
         const std::string type = string_field(tool, "type");
         if (type == "function") {
             const std::string name = string_field(tool, "name");
-            context.result.chat.tools.push_back(lower_function_tool(tool, name));
-            remember_tool(context.result, name, tool, type, name);
+            if (client_search && deferred_tool(tool)) {
+                append_searchable_source(searchable_sources, "Function", name, string_field(tool, "description"));
+            } else {
+                append_callable_tool(context, tool);
+            }
         } else if (type == "custom") {
             const std::string name = string_field(tool, "name");
-            context.result.chat.tools.push_back(lower_custom_tool(tool, name));
-            remember_tool(context.result, name, tool, type, name);
+            if (client_search && deferred_tool(tool)) {
+                append_searchable_source(searchable_sources, "Custom tool", name, string_field(tool, "description"));
+            } else {
+                append_callable_tool(context, tool);
+            }
         } else if (type == "local_shell") {
             common_chat_tool lowered;
             lowered.name        = "local_shell";
@@ -687,25 +892,43 @@ void lower_tools(lowering_context & context, const common_json & request) {
             })
                     .dump();
             context.result.chat.tools.push_back(std::move(lowered));
+            context.callable_tool_definitions.emplace(tool_identity({}, "local_shell"),
+                                                      comparable_tool_definition(tool, {}));
             remember_tool(context.result, "local_shell", tool, type, "local_shell");
         } else if (type == "namespace") {
             const std::string namespace_name        = string_field(tool, "name");
             const std::string namespace_description = string_field(tool, "description");
+            bool              has_deferred_members  = false;
             for (const common_json & nested : tool.at("tools")) {
-                const std::string nested_type = string_field(nested, "type");
-                const std::string nested_name = string_field(nested, "name");
-                const std::string model_name  = namespace_tool_name(namespace_name, nested_name);
-                common_chat_tool  lowered     = nested_type == "custom" ? lower_custom_tool(nested, model_name) :
-                                                                          lower_function_tool(nested, model_name);
-                if (!namespace_description.empty()) {
-                    lowered.description = namespace_description +
-                                          (lowered.description.empty() ? std::string() : "\n\n" + lowered.description);
+                if (client_search && deferred_tool(nested)) {
+                    has_deferred_members = true;
+                    continue;
                 }
-                context.result.chat.tools.push_back(std::move(lowered));
-                remember_tool(context.result, model_name, nested, nested_type, nested_name, namespace_name);
+                append_callable_tool(context, nested, namespace_name, namespace_description);
             }
+            if (has_deferred_members) {
+                append_searchable_source(searchable_sources, "Namespace", namespace_name, namespace_description);
+            }
+        } else if (type == "tool_search") {
+            common_chat_tool lowered = lower_function_tool(tool, "tool_search");
+            if (lowered.description.empty()) {
+                lowered.description = "Search for tools needed to continue the task.";
+            }
+            search_tool_index = context.result.chat.tools.size();
+            context.result.chat.tools.push_back(std::move(lowered));
+            context.callable_tool_definitions.emplace(tool_identity({}, "tool_search"),
+                                                      comparable_tool_definition(tool, {}));
+            remember_tool(context.result, "tool_search", tool, type, "tool_search");
         } else {
             throw std::invalid_argument("unsupported tool reached generation lowering: " + type);
+        }
+    }
+
+    if (search_tool_index != static_cast<std::size_t>(-1) && !searchable_sources.empty()) {
+        std::string & description = context.result.chat.tools.at(search_tool_index).description;
+        description += "\n\nSearchable tool sources:\n";
+        for (const std::string & source : searchable_sources) {
+            description += "- " + source + '\n';
         }
     }
 }
@@ -726,7 +949,8 @@ void lower_tool_choice(server_generation_input & result, const common_json & req
         }
         return;
     }
-    const std::string selected = string_field(choice, "name");
+    const std::string selected =
+        string_field(choice, "type") == "tool_search" ? "tool_search" : string_field(choice, "name");
     if (selected.empty()) {
         throw std::invalid_argument("named tool_choice is missing name");
     }
@@ -818,6 +1042,7 @@ server_generation_input lower_responses_generation_input(const common_json & req
     }
     lower_item_sequence(context, request.at("input"));
     lower_tools(context, request);
+    lower_selected_tools(context, request.at("input"));
     lower_tool_choice(context.result, request);
     lower_structured_output(context.result, request);
     lower_inference_parameters(context.result, request);

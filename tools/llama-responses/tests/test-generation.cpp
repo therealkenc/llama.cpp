@@ -209,6 +209,77 @@ void test_scripted_interleaving() {
     GENERATION_CHECK(events.back().at("response") == snapshot);
 }
 
+void test_client_tool_search_uses_typed_item_and_generic_lifecycle() {
+    const response_usage     usage = fixture_usage();
+    scripted_generation_port port({
+        generation_started{},
+        generation_tool_call_started{
+                           0, generation_tool_kind::client_tool_search,
+                           "tool_search", "call_search_fixture",
+                           "", },
+        generation_tool_call_delta{ 0, R"({"query":"calendar)" },
+        generation_tool_call_delta{ 0, R"( create","limit":1})" },
+        generation_completed{ usage, 101 },
+    });
+
+    counter_generation_id_source   ids("tool_search");
+    native_response_state_machine  machine(fixture_context("tool_search"), ids);
+    const std::vector<common_json> events   = drain(port, machine);
+    const common_json              snapshot = machine.snapshot();
+
+    GENERATION_CHECK(snapshot.at("output").size() == 1);
+    if (snapshot.at("output").size() != 1) {
+        return;
+    }
+    const common_json & item = snapshot.at("output").at(0);
+    GENERATION_CHECK(item.at("type") == "tool_search_call");
+    GENERATION_CHECK(item.at("id").get<std::string>().rfind("tsc_", 0) == 0);
+    GENERATION_CHECK(item.at("call_id") == "call_search_fixture");
+    GENERATION_CHECK(item.at("status") == "completed");
+    GENERATION_CHECK(item.at("execution") == "client");
+    GENERATION_CHECK(item.at("arguments") == common_json({
+                                                 { "query", "calendar create" },
+                                                 { "limit", 1                 }
+    }));
+    GENERATION_CHECK(!item.contains("name"));
+
+    const auto added = events_named(events, "response.output_item.added");
+    const auto done  = events_named(events, "response.output_item.done");
+    GENERATION_CHECK(added.size() == 1);
+    GENERATION_CHECK(done.size() == 1);
+    if (added.size() == 1) {
+        GENERATION_CHECK(added.at(0).at("item").at("status") == "in_progress");
+        GENERATION_CHECK(added.at(0).at("item").at("arguments") == common_json::object());
+    }
+    if (done.size() == 1) {
+        GENERATION_CHECK(done.at(0).at("item") == item);
+    }
+    GENERATION_CHECK(events_named(events, "response.function_call_arguments.delta").empty());
+    GENERATION_CHECK(events_named(events, "response.function_call_arguments.done").empty());
+    GENERATION_CHECK(events_named(events, "response.custom_tool_call_input.delta").empty());
+    GENERATION_CHECK(events_named(events, "response.custom_tool_call_input.done").empty());
+}
+
+void test_partial_client_tool_search_snapshot_remains_well_formed() {
+    counter_generation_id_source  ids("partial_tool_search");
+    native_response_state_machine machine(fixture_context("partial_tool_search"), ids);
+    machine.apply(generation_tool_call_started{
+        0,
+        generation_tool_kind::client_tool_search,
+        "tool_search",
+        "call_partial_search",
+        "",
+    });
+    machine.apply(generation_tool_call_delta{ 0, R"({"query":)" });
+
+    const common_json snapshot = machine.snapshot();
+    GENERATION_CHECK(snapshot.at("output").at(0).at("arguments") == common_json::object());
+    GENERATION_CHECK(snapshot.at("output").at(0).at("status") == "in_progress");
+
+    machine.apply(generation_tool_call_delta{ 0, R"("calendar"})" });
+    GENERATION_CHECK(machine.snapshot().at("output").at(0).at("arguments") == common_json::object());
+}
+
 common_json run_terminal(const generation_update & terminal_update, const std::string & suffix) {
     scripted_generation_port       port({ terminal_update });
     counter_generation_id_source   ids(suffix);
@@ -357,6 +428,8 @@ void test_scripted_cancellation() {
 // NOLINTNEXTLINE(misc-use-internal-linkage)
 int test_generation() {
     test_scripted_interleaving();
+    test_client_tool_search_uses_typed_item_and_generic_lifecycle();
+    test_partial_client_tool_search_snapshot_remains_well_formed();
     test_terminal_states();
     test_active_output_is_materialized_only_at_read_boundaries();
     test_partial_failure_events_remain_drainable();

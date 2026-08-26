@@ -8,6 +8,7 @@
 #include <sqlite3.h>
 #include <stdlib.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -291,6 +292,105 @@ server_generation_service fake_generation_service(route_counters & counters) {
     return service;
 }
 
+server_generation_service tool_search_generation_service(route_counters & counters) {
+    server_generation_service service;
+    service.generate = [&counters](const server_http_req & request, const server_generation_input & input,
+                                   const server_generation_sink_ptr & sink) {
+        ++counters.generate;
+        counters.last_input       = input;
+        std::string stream_output = sink->accept(server_generation_started{});
+
+        common_chat_msg final_message;
+        const auto      selected =
+            std::find_if(input.tool_metadata.begin(), input.tool_metadata.end(), [](const auto & entry) {
+                return entry.second.value("namespace", std::string()) == "chrome" &&
+                       entry.second.value("name", std::string()) == "read_tab";
+            });
+        if (selected != input.tool_metadata.end()) {
+            final_message.tool_calls = {
+                { selected->first, R"({"detail":"title"})", "call_chrome_route" }
+            };
+        } else if (input.tool_metadata.find("tool_search") != input.tool_metadata.end()) {
+            final_message.tool_calls = {
+                { "tool_search", R"({"query":"read the selected browser tab","limit":1})", "call_search_route" }
+            };
+        } else {
+            throw std::runtime_error("neither client search nor its selected Chrome tool reached generation");
+        }
+        stream_output += sink->accept(server_generation_message_snapshot{ final_message });
+        stream_output += sink->accept(server_generation_completed{
+            { 11, 3, 5 },
+            101,
+        });
+
+        auto response  = std::make_unique<server_http_res>();
+        response->data = sink->snapshot().dump();
+        if (common_json::parse(request.body).value("stream", false)) {
+            response->content_type = "text/event-stream";
+            response->next         = [output = std::move(stream_output), emitted = false](std::string & chunk) mutable {
+                if (emitted) {
+                    chunk.clear();
+                    return false;
+                }
+                emitted = true;
+                chunk   = std::move(output);
+                return false;
+            };
+        }
+        return response;
+    };
+    service.count_input_tokens = [](const server_generation_input &) {
+        return std::uint64_t{ 1 };
+    };
+    return service;
+}
+
+common_json fixture_search_function(const std::string & name, const std::string & description) {
+    return {
+        { "type",          "function"  },
+        { "name",          name        },
+        { "description",   description },
+        { "defer_loading", true        },
+        { "parameters",
+         {
+              { "type", "object" },
+              { "properties", { { "detail", { { "type", "string" } } } } },
+          }                            },
+    };
+}
+
+common_json fixture_client_search_tool() {
+    return {
+        { "type",        "tool_search"                        },
+        { "execution",   "client"                             },
+        { "description", "Find an installed tool by purpose." },
+        { "parameters",
+         {
+              { "type", "object" },
+              { "properties",
+                {
+                    { "query", { { "type", "string" } } },
+                    { "limit", { { "type", "integer" } } },
+                } },
+              { "required", common_json::array({ "query" }) },
+          }                                                   },
+    };
+}
+
+common_json fixture_responses_lite_tools() {
+    common_json direct = fixture_search_function("wait", "Wait for a task to finish.");
+    direct.erase("defer_loading");
+    return common_json::array({
+        fixture_client_search_tool(),
+        {
+            { "type", "namespace" },
+            { "name", "functions" },
+            { "description", "" },
+            { "tools", common_json::array({ direct }) },
+            },
+    });
+}
+
 server_http_req make_request(const std::function<bool()> & should_stop, const common_json & body) {
     return {
         {}, {}, "/v1/responses", "", body.dump(), {}, should_stop,
@@ -479,6 +579,533 @@ void test_nullable_parallel_tool_calls_is_sdk_decodable() {
     response                = routes.create(invalid);
     CHECK(response && response->status == 400);
     CHECK(response_body(response).at("error").at("param") == "parallel_tool_calls");
+}
+
+void test_client_tool_search_round_trip_and_continuation() {
+    route_counters counters;
+    auto           routes = make_server_responses_routes_factory()(tool_search_generation_service(counters));
+    const std::function<bool()> should_stop = [] {
+        return false;
+    };
+
+    server_http_req first =
+        make_request(should_stop, {
+                                      { "model",             "fixture-model"                                      },
+                                      { "input",             "Read the current browser tab."                      },
+                                      { "tools",             common_json::array({ fixture_client_search_tool() }) },
+                                      { "max_output_tokens", 16                                                   },
+                                      { "store",             true                                                 },
+    });
+    server_http_res_ptr response = routes.create(first);
+    CHECK(response && response->status == 200);
+    CHECK(counters.generate == 1);
+    CHECK(counters.last_input.chat.tools.size() == 1U);
+    CHECK(counters.last_input.chat.tools.at(0).name == "tool_search");
+    if (!response || response->status != 200) {
+        return;
+    }
+    const common_json first_body = response_body(response);
+    CHECK(first_body.at("output").size() == 1U);
+    CHECK(first_body.at("output").at(0).at("type") == "tool_search_call");
+    CHECK(first_body.at("output").at(0).at("execution") == "client");
+    CHECK(first_body.at("output").at(0).at("arguments").is_object());
+    const std::string response_id = first_body.at("id").get<std::string>();
+    const std::string call_id     = first_body.at("output").at(0).at("call_id").get<std::string>();
+
+    const common_json selected_namespace = {
+        { "type",        "namespace"                                                                           },
+        { "name",        "chrome"                                                                              },
+        { "description", "Control the selected browser tab."                                                   },
+        { "tools",       common_json::array({ fixture_search_function("read_tab", "Read the selected tab.") }) },
+    };
+    server_http_req continuation =
+        make_request(should_stop, {
+                                      { "model",                "fixture-model"                       },
+                                      { "previous_response_id", response_id                           },
+                                      { "input",                common_json::array({ {
+                                                     { "type", "tool_search_output" },
+                                                     { "call_id", call_id },
+                                                     { "execution", "client" },
+                                                     { "status", "completed" },
+                                                     { "tools", common_json::array({ selected_namespace }) },
+                                                 } }) },
+                                      { "max_output_tokens",    16                                    },
+                                      { "store",                true                                  },
+    });
+    response = routes.create(continuation);
+    CHECK(response && response->status == 200);
+    CHECK(counters.generate == 2);
+    CHECK(counters.last_input.chat.tools.size() == 1U);
+    CHECK(counters.last_input.chat.messages.size() == 3U);
+    CHECK(counters.last_input.chat.messages.at(1).tool_calls.at(0).name == "tool_search");
+    CHECK(counters.last_input.chat.messages.at(2).tool_name == "tool_search");
+    if (!response || response->status != 200) {
+        return;
+    }
+    const common_json second_body = response_body(response);
+    CHECK(second_body.at("output").at(0).at("type") == "function_call");
+    CHECK(second_body.at("output").at(0).at("name") == "read_tab");
+    CHECK(second_body.at("output").at(0).at("namespace") == "chrome");
+
+    server_http_req input_items       = make_request(should_stop, common_json::object());
+    input_items.path                  = "/v1/responses/{response_id}/input_items";
+    input_items.params["response_id"] = second_body.at("id").get<std::string>();
+    const server_http_res_ptr listed  = routes.input_items(input_items);
+    CHECK(listed && listed->status == 200);
+    if (listed && listed->status == 200) {
+        const common_json data = response_body(listed).at("data");
+        CHECK(std::any_of(data.begin(), data.end(), [](const common_json & item) {
+            return item.value("type", std::string()) == "tool_search_call";
+        }));
+        CHECK(std::any_of(data.begin(), data.end(), [](const common_json & item) {
+            return item.value("type", std::string()) == "tool_search_output";
+        }));
+    }
+}
+
+void test_responses_lite_tools_instructions_and_continuation() {
+    route_counters counters;
+    auto           routes = make_server_responses_routes_factory()(tool_search_generation_service(counters));
+    const std::function<bool()> should_stop = [] {
+        return false;
+    };
+
+    const common_json additional_tools = {
+        { "type",  "additional_tools"             },
+        { "role",  "developer"                    },
+        { "tools", fixture_responses_lite_tools() },
+    };
+    const common_json developer_message = {
+        { "type",    "message"                },
+        { "role",    "developer"              },
+        { "content", common_json::array({ {
+                         { "type", "input_text" },
+                         { "text", "Use the available tools carefully." },
+                     } }) },
+    };
+    const common_json user_message = {
+        { "type",    "message"                },
+        { "role",    "user"                   },
+        { "content", common_json::array({ {
+                         { "type", "input_text" },
+                         { "text", "Read the current browser tab." },
+                     } }) },
+    };
+    server_http_req first = make_request(
+        should_stop, {
+                         { "model",               "fixture-model"                                                           },
+                         { "input",               common_json::array({ additional_tools, developer_message, user_message }) },
+                         { "parallel_tool_calls", false                                                                     },
+                         { "reasoning",
+                          {
+                               { "effort", "low" },
+                               { "context", "all_turns" },
+                           }                                                                                                },
+                         { "max_output_tokens",   16                                                                        },
+                         { "store",               true                                                                      },
+    });
+    server_http_res_ptr response = routes.create(first);
+    CHECK(response && response->status == 200);
+    CHECK(counters.generate == 1);
+    CHECK(counters.last_input.parallel_tool_calls == std::optional<bool>(false));
+    CHECK(counters.last_input.chat.messages.size() == 2U);
+    CHECK(counters.last_input.chat.messages.at(0).role == "system");
+    CHECK(counters.last_input.chat.tools.size() == 2U);
+    CHECK(counters.last_input.tool_metadata.find("tool_search") != counters.last_input.tool_metadata.end());
+    if (!response || response->status != 200) {
+        return;
+    }
+
+    const common_json first_body = response_body(response);
+    CHECK(first_body.at("instructions").is_null());
+    CHECK(first_body.at("tools").size() == 2U);
+    const std::string response_id = first_body.at("id").get<std::string>();
+    const std::string call_id     = first_body.at("output").at(0).at("call_id").get<std::string>();
+
+    server_http_req input_items       = make_request(should_stop, common_json::object());
+    input_items.path                  = "/v1/responses/{response_id}/input_items";
+    input_items.params["response_id"] = response_id;
+    const server_http_res_ptr listed  = routes.input_items(input_items);
+    CHECK(listed && listed->status == 200);
+    if (listed && listed->status == 200) {
+        const common_json data      = response_body(listed).at("data");
+        const auto        lite_item = std::find_if(data.begin(), data.end(), [](const common_json & item) {
+            return item.value("type", std::string()) == "additional_tools";
+        });
+        CHECK(lite_item != data.end());
+        CHECK(lite_item != data.end() && (*lite_item).at("id").get<std::string>().rfind("at_", 0) == 0);
+        CHECK(lite_item != data.end() && (*lite_item).at("role") == "developer");
+    }
+
+    const common_json selected_namespace = {
+        { "type",        "namespace"                                                                           },
+        { "name",        "chrome"                                                                              },
+        { "description", "Control the selected browser tab."                                                   },
+        { "tools",       common_json::array({ fixture_search_function("read_tab", "Read the selected tab.") }) },
+    };
+    server_http_req continuation =
+        make_request(should_stop, {
+                                      { "model",                "fixture-model"                       },
+                                      { "previous_response_id", response_id                           },
+                                      { "input",                common_json::array({ {
+                                                     { "type", "tool_search_output" },
+                                                     { "call_id", call_id },
+                                                     { "execution", "client" },
+                                                     { "tools", common_json::array({ selected_namespace }) },
+                                                 } }) },
+                                      { "parallel_tool_calls",  false                                 },
+                                      { "reasoning",            { { "context", "all_turns" } }        },
+                                      { "max_output_tokens",    16                                    },
+                                      { "store",                true                                  },
+    });
+    response = routes.create(continuation);
+    CHECK(response && response->status == 200);
+    CHECK(counters.generate == 2);
+    CHECK(counters.last_input.chat.tools.size() == 3U);
+    if (response && response->status == 200) {
+        const common_json body = response_body(response);
+        CHECK(body.at("tools").size() == 3U);
+        CHECK(body.at("output").at(0).at("type") == "function_call");
+        CHECK(body.at("output").at(0).at("namespace") == "chrome");
+        CHECK(body.at("output").at(0).at("name") == "read_tab");
+    }
+}
+
+void test_responses_lite_search_lineage_survives_sqlite_reopen() {
+    temporary_directory         directory;
+    scoped_environment_override database("LLAMA_RESPONSES_DB", directory.database_path().string());
+    route_counters              counters;
+    const std::function<bool()> should_stop = [] {
+        return false;
+    };
+    std::string first_response_id;
+    std::string search_call_id;
+
+    {
+        auto            routes = make_server_responses_routes_factory()(tool_search_generation_service(counters));
+        server_http_req first =
+            make_request(should_stop, {
+                                          { "model",               "fixture-model"                          },
+                                          { "input",               common_json::array({
+                                                         {
+                                                             { "type", "additional_tools" },
+                                                             { "role", "developer" },
+                                                             { "tools", fixture_responses_lite_tools() },
+                                                         },
+                                                         {
+                                                             { "role", "user" },
+                                                             { "content", "Find Chrome." },
+                                                         },
+                                                     }) },
+                                          { "reasoning",           { { "context", "all_turns" } }           },
+                                          { "parallel_tool_calls", false                                    },
+                                          { "max_output_tokens",   16                                       },
+                                          { "store",               true                                     },
+        });
+        const server_http_res_ptr response = routes.create(first);
+        CHECK(response && response->status == 200);
+        if (!response || response->status != 200) {
+            return;
+        }
+        const common_json body = response_body(response);
+        first_response_id      = body.at("id").get<std::string>();
+        search_call_id         = body.at("output").at(0).at("call_id").get<std::string>();
+    }
+
+    {
+        auto              routes = make_server_responses_routes_factory()(tool_search_generation_service(counters));
+        const common_json selected_namespace = {
+            { "type",        "namespace"                                                                           },
+            { "name",        "chrome"                                                                              },
+            { "description", "Control the selected browser tab."                                                   },
+            { "tools",       common_json::array({ fixture_search_function("read_tab", "Read the selected tab.") }) },
+        };
+        server_http_req continuation =
+            make_request(should_stop, {
+                                          { "model",                "fixture-model"                           },
+                                          { "previous_response_id", first_response_id                         },
+                                          { "input",                common_json::array({ {
+                                                         { "type", "tool_search_output" },
+                                                         { "call_id", search_call_id },
+                                                         { "execution", "client" },
+                                                         { "tools", common_json::array({ selected_namespace }) },
+                                                     } }) },
+                                          { "reasoning",            { { "context", "all_turns" } }            },
+                                          { "parallel_tool_calls",  false                                     },
+                                          { "max_output_tokens",    16                                        },
+                                          { "store",                true                                      },
+        });
+        const server_http_res_ptr response = routes.create(continuation);
+        CHECK(response && response->status == 200);
+        CHECK(counters.generate == 2);
+        if (response && response->status == 200) {
+            const common_json body = response_body(response);
+            CHECK(body.at("output").at(0).at("type") == "function_call");
+            CHECK(body.at("output").at(0).at("namespace") == "chrome");
+        }
+    }
+}
+
+void test_responses_lite_store_false_full_replay_streams_selected_call() {
+    route_counters counters;
+    auto           routes = make_server_responses_routes_factory()(tool_search_generation_service(counters));
+    const std::function<bool()> should_stop = [] {
+        return false;
+    };
+
+    const common_json additional_tools = {
+        { "type",  "additional_tools"             },
+        { "role",  "developer"                    },
+        { "tools", fixture_responses_lite_tools() },
+    };
+    const common_json developer_message = {
+        { "type",    "message"                },
+        { "role",    "developer"              },
+        { "content", common_json::array({ {
+                         { "type", "input_text" },
+                         { "text", "Use the available tools carefully." },
+                     } }) },
+    };
+    const common_json user_message = {
+        { "type",    "message"                },
+        { "id",      "msg_codex_replay_user"  },
+        { "role",    "user"                   },
+        { "content", common_json::array({ {
+                         { "type", "input_text" },
+                         { "text", "Read the current browser tab." },
+                     } }) },
+    };
+    const common_json search_call = {
+        { "type",      "tool_search_call"                               },
+        { "id",        "tsc_codex_replay"                               },
+        { "call_id",   "call_codex_replay"                              },
+        { "execution", "client"                                         },
+        { "status",    "completed"                                      },
+        { "arguments", { { "query", "read the selected browser tab" } } },
+    };
+    const common_json selected_namespace = {
+        { "type",        "namespace"                                                                           },
+        { "name",        "chrome"                                                                              },
+        { "description", "Control the selected browser tab."                                                   },
+        { "tools",       common_json::array({ fixture_search_function("read_tab", "Read the selected tab.") }) },
+    };
+    const common_json search_output = {
+        { "type",      "tool_search_output"                       },
+        { "call_id",   "call_codex_replay"                        },
+        { "execution", "client"                                   },
+        { "status",    "completed"                                },
+        { "tools",     common_json::array({ selected_namespace }) },
+    };
+    server_http_req replay =
+        make_request(should_stop, {
+                                      { "model",               "fixture-model"                                                                      },
+                                      { "input",               common_json::array({ additional_tools, developer_message, user_message,
+                                                                      search_call, search_output }) },
+                                      { "include",             common_json::array({ "reasoning.encrypted_content" })                                },
+                                      { "parallel_tool_calls", false                                                                                },
+                                      { "reasoning",
+                                       {
+                                            { "context", "all_turns" },
+                                            { "effort", "low" },
+                                        }                                                                                                           },
+                                      { "store",               false                                                                                },
+                                      { "stream",              true                                                                                 },
+                                      { "tool_choice",         "auto"                                                                               },
+    });
+
+    server_http_res_ptr response = routes.create(replay);
+    CHECK(response && response->status == 200);
+    CHECK(response && response->is_stream());
+    CHECK(counters.generate == 1);
+    CHECK(counters.last_input.parallel_tool_calls == std::optional<bool>(false));
+    CHECK(counters.last_input.chat.messages.size() == 4U);
+    CHECK(counters.last_input.chat.messages.at(0).role == "system");
+    CHECK(counters.last_input.chat.messages.at(2).tool_calls.at(0).name == "tool_search");
+    CHECK(counters.last_input.chat.messages.at(3).tool_name == "tool_search");
+    CHECK(counters.last_input.chat.tools.size() == 3U);
+    const auto selected = std::find_if(counters.last_input.tool_metadata.begin(),
+                                       counters.last_input.tool_metadata.end(), [](const auto & entry) {
+                                           return entry.second.value("namespace", std::string()) == "chrome" &&
+                                                  entry.second.value("name", std::string()) == "read_tab";
+                                       });
+    CHECK(selected != counters.last_input.tool_metadata.end());
+    if (!response || !response->is_stream()) {
+        return;
+    }
+
+    const std::vector<common_json> events = drain_sse(*response);
+    CHECK(!events.empty());
+    const auto done = std::find_if(events.begin(), events.end(), [](const common_json & event) {
+        return event.value("type", std::string()) == "response.output_item.done" && event.contains("item") &&
+               event.at("item").value("type", std::string()) == "function_call";
+    });
+    CHECK(done != events.end());
+    if (done != events.end()) {
+        CHECK(done->at("item").at("namespace") == "chrome");
+        CHECK(done->at("item").at("name") == "read_tab");
+        CHECK(done->at("item").at("call_id") == "call_chrome_route");
+        CHECK(done->at("item").at("status") == "completed");
+    }
+    CHECK(events.back().at("type") == "response.completed");
+    if (events.back().at("type") == "response.completed") {
+        const common_json & completed = events.back().at("response");
+        CHECK(completed.at("instructions").is_null());
+        CHECK(completed.at("store") == false);
+        CHECK(completed.at("tools").size() == 3U);
+        CHECK(completed.at("output").at(0).at("type") == "function_call");
+        CHECK(completed.at("output").at(0).at("namespace") == "chrome");
+        CHECK(completed.at("output").at(0).at("name") == "read_tab");
+    }
+}
+
+void test_tool_search_validation_and_store_false_replay() {
+    route_counters counters;
+    auto           routes = make_server_responses_routes_factory()(tool_search_generation_service(counters));
+    const std::function<bool()> should_stop = [] {
+        return false;
+    };
+    const common_json search_call = {
+        { "type",      "tool_search_call"        },
+        { "id",        "tsc_manual"              },
+        { "call_id",   "call_manual"             },
+        { "execution", "client"                  },
+        { "status",    "completed"               },
+        { "arguments", { { "query", "chrome" } } },
+    };
+    const common_json selected_namespace = {
+        { "type",        "namespace"                                                                           },
+        { "name",        "chrome"                                                                              },
+        { "description", "Control Chrome."                                                                     },
+        { "tools",       common_json::array({ fixture_search_function("read_tab", "Read the selected tab.") }) },
+    };
+    const common_json search_output = {
+        { "type",      "tool_search_output"                       },
+        { "id",        "tso_manual"                               },
+        { "call_id",   "call_manual"                              },
+        { "execution", "client"                                   },
+        { "tools",     common_json::array({ selected_namespace }) },
+    };
+    server_http_req replay =
+        make_request(should_stop, {
+                                      { "model",             "fixture-model"                                    },
+                                      { "input",             common_json::array({ search_call, search_output }) },
+                                      { "max_output_tokens", 16                                                 },
+                                      { "store",             false                                              },
+    });
+    server_http_res_ptr response = routes.create(replay);
+    CHECK(response && response->status == 200);
+    CHECK(counters.generate == 1);
+    CHECK(counters.last_input.chat.tools.size() == 1U);
+
+    const common_json & original_function  = selected_namespace.at("tools").at(0);
+    common_json         reordered_function = common_json::object();
+    reordered_function["parameters"]       = original_function.at("parameters");
+    reordered_function["defer_loading"]    = original_function.at("defer_loading");
+    reordered_function["description"]      = original_function.at("description");
+    reordered_function["name"]             = original_function.at("name");
+    reordered_function["type"]             = original_function.at("type");
+    common_json reordered_namespace        = common_json::object();
+    reordered_namespace["tools"]           = common_json::array({ reordered_function });
+    reordered_namespace["description"]     = selected_namespace.at("description");
+    reordered_namespace["name"]            = selected_namespace.at("name");
+    reordered_namespace["type"]            = selected_namespace.at("type");
+    common_json reordered_output           = search_output;
+    reordered_output["tools"]              = common_json::array({ selected_namespace, reordered_namespace });
+    server_http_req reordered =
+        make_request(should_stop, {
+                                      { "model",             "fixture-model"                                       },
+                                      { "input",             common_json::array({ search_call, reordered_output }) },
+                                      { "max_output_tokens", 16                                                    },
+                                      { "store",             false                                                 },
+    });
+    response = routes.create(reordered);
+    CHECK(response && response->status == 200);
+    CHECK(counters.generate == 2);
+
+    common_json namespace_description_conflict    = selected_namespace;
+    namespace_description_conflict["description"] = "A different model-visible namespace description.";
+    common_json description_conflicting_output    = search_output;
+    description_conflicting_output["tools"] =
+        common_json::array({ selected_namespace, namespace_description_conflict });
+    server_http_req description_conflict =
+        make_request(should_stop, {
+                                      { "model",             "fixture-model"                                                     },
+                                      { "input",             common_json::array({ search_call, description_conflicting_output }) },
+                                      { "max_output_tokens", 16                                                                  },
+                                      { "store",             false                                                               },
+    });
+    response = routes.create(description_conflict);
+    CHECK(response && response->status == 400);
+    CHECK(response_body(response).at("error").at("code") == "invalid_value");
+
+    common_json mismatched_output = search_output;
+    mismatched_output["call_id"]  = "call_wrong";
+    server_http_req mismatch =
+        make_request(should_stop, {
+                                      { "model",             "fixture-model"                                        },
+                                      { "input",             common_json::array({ search_call, mismatched_output }) },
+                                      { "max_output_tokens", 16                                                     },
+                                      { "store",             false                                                  },
+    });
+    response = routes.create(mismatch);
+    CHECK(response && response->status == 400);
+    CHECK(response_body(response).at("error").at("param") == "input");
+    CHECK(counters.generate == 2);
+
+    server_http_req reversed =
+        make_request(should_stop, {
+                                      { "model",             "fixture-model"                                    },
+                                      { "input",             common_json::array({ search_output, search_call }) },
+                                      { "max_output_tokens", 16                                                 },
+                                      { "store",             false                                              },
+    });
+    response = routes.create(reversed);
+    CHECK(response && response->status == 400);
+    CHECK(response_body(response).at("error").at("param") == "input");
+    CHECK(counters.generate == 2);
+
+    common_json malformed_output = search_output;
+    malformed_output["tools"]    = common_json::object();
+    server_http_req malformed =
+        make_request(should_stop, {
+                                      { "model",             "fixture-model"                                       },
+                                      { "input",             common_json::array({ search_call, malformed_output }) },
+                                      { "max_output_tokens", 16                                                    },
+                                      { "store",             false                                                 },
+    });
+    response = routes.create(malformed);
+    CHECK(response && response->status == 400);
+    CHECK(response_body(response).at("error").at("param") == "input[1].tools");
+
+    common_json conflicting_output = search_output;
+    common_json conflicting_tool   = fixture_search_function("read_tab", "Conflicting selected definition.");
+    conflicting_output["tools"].push_back({
+        { "type",  "namespace"                              },
+        { "name",  "chrome"                                 },
+        { "tools", common_json::array({ conflicting_tool }) },
+    });
+    server_http_req conflict =
+        make_request(should_stop, {
+                                      { "model",             "fixture-model"                                         },
+                                      { "input",             common_json::array({ search_call, conflicting_output }) },
+                                      { "max_output_tokens", 16                                                      },
+                                      { "store",             false                                                   },
+    });
+    response = routes.create(conflict);
+    CHECK(response && response->status == 400);
+    CHECK(response_body(response).at("error").at("code") == "invalid_value");
+
+    common_json hosted_search  = fixture_client_search_tool();
+    hosted_search["execution"] = "server";
+    server_http_req hosted     = make_request(should_stop, {
+                                                               { "model",             "fixture-model"                       },
+                                                               { "input",             "hello"                               },
+                                                               { "tools",             common_json::array({ hosted_search }) },
+                                                               { "max_output_tokens", 16                                    },
+    });
+    response                   = routes.create(hosted);
+    CHECK(response && response->status == 400);
+    CHECK(response_body(response).at("error").at("param") == "tools[0].execution");
 }
 
 void test_foreground_cancellation_and_terminal_outcomes() {
@@ -1171,6 +1798,11 @@ int main() try {
     test_native_route_selection_and_typed_persistence();
     test_unsupported_telemetry_never_reaches_generation();
     test_nullable_parallel_tool_calls_is_sdk_decodable();
+    test_client_tool_search_round_trip_and_continuation();
+    test_responses_lite_tools_instructions_and_continuation();
+    test_responses_lite_search_lineage_survives_sqlite_reopen();
+    test_responses_lite_store_false_full_replay_streams_selected_call();
+    test_tool_search_validation_and_store_false_replay();
     test_foreground_cancellation_and_terminal_outcomes();
     test_completion_can_win_foreground_cancellation_race();
     test_background_resource_lifecycle();

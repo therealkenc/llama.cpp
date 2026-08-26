@@ -149,6 +149,14 @@ generation_tool_kind tool_kind(const common_json & metadata) {
     if (type == "local_shell") {
         return generation_tool_kind::local_shell;
     }
+    if (type == "tool_search") {
+        const std::string execution = metadata.value("execution", std::string());
+        if (!execution.empty() && execution != "client") {
+            throw std::invalid_argument(
+                "native Responses projection supports only client-executed generated tool search");
+        }
+        return generation_tool_kind::client_tool_search;
+    }
     throw std::invalid_argument("native Responses projection does not support generated tool type '" + type + "'");
 }
 

@@ -217,6 +217,113 @@ void test_interleaved_namespace_custom_and_local_shell_tools() {
     CHECK(events.back().at("response") == snapshot);
 }
 
+void test_client_tool_search_projection() {
+    const std::unordered_map<std::string, common_json> metadata = {
+        {
+         "tool_search", {
+                { "type", "tool_search" },
+                { "name", "tool_search" },
+                { "execution", "client" },
+            }, },
+    };
+    native_server_generation_sink sink(fixture_context("tool_search"), "adapter_tool_search", true, nullptr, metadata);
+
+    std::string stream = sink.accept(server_generation_started{});
+    stream += sink.accept(server_generation_message_deltas{
+        { tool_diff(0, "tool_search", "call_search_adapter", R"({"query":"chrome)") } });
+    stream += sink.accept(server_generation_message_deltas{ { tool_diff(0, "", "", R"( selected tab","limit":1})") } });
+
+    common_chat_msg final_message;
+    final_message.tool_calls = {
+        { "tool_search", R"({"query":"chrome selected tab","limit":1})", "call_search_adapter" }
+    };
+    stream += sink.accept(server_generation_message_snapshot{ final_message });
+    stream += sink.accept(server_generation_completed{ fixture_usage(), 101 });
+
+    const common_json snapshot = sink.snapshot();
+    CHECK(snapshot.at("output").size() == 1);
+    if (snapshot.at("output").size() != 1) {
+        return;
+    }
+    const common_json & item = snapshot.at("output").at(0);
+    CHECK(item.at("type") == "tool_search_call");
+    CHECK(item.at("id").get<std::string>().rfind("tsc_", 0) == 0);
+    CHECK(item.at("call_id") == "call_search_adapter");
+    CHECK(item.at("status") == "completed");
+    CHECK(item.at("execution") == "client");
+    CHECK(item.at("arguments") == common_json({
+                                      { "query", "chrome selected tab" },
+                                      { "limit", 1                     }
+    }));
+
+    const std::vector<common_json> events = parse_sse(stream);
+    const auto                     added  = events_named(events, "response.output_item.added");
+    const auto                     done   = events_named(events, "response.output_item.done");
+    CHECK(added.size() == 1);
+    CHECK(done.size() == 1);
+    if (added.size() == 1) {
+        CHECK(added.at(0).at("item").at("arguments") == common_json::object());
+        CHECK(added.at(0).at("item").at("status") == "in_progress");
+    }
+    if (done.size() == 1) {
+        CHECK(done.at(0).at("item") == item);
+    }
+    CHECK(events_named(events, "response.function_call_arguments.delta").empty());
+    CHECK(events_named(events, "response.function_call_arguments.done").empty());
+    CHECK(events.back().at("type") == "response.completed");
+}
+
+void test_server_tool_search_projection_is_rejected() {
+    const std::unordered_map<std::string, common_json> metadata = {
+        {
+         "tool_search", {
+                { "type", "tool_search" },
+                { "name", "tool_search" },
+                { "execution", "server" },
+            }, },
+    };
+    native_server_generation_sink sink(fixture_context("hosted_tool_search"), "adapter_hosted_tool_search", true,
+                                       nullptr, metadata);
+    sink.accept(server_generation_started{});
+
+    bool threw = false;
+    try {
+        sink.accept(server_generation_message_deltas{
+            { tool_diff(0, "tool_search", "call_hosted_search", R"({"query":"unsupported"})") } });
+    } catch (const std::invalid_argument &) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+void test_tool_search_metadata_defaults_to_client_execution() {
+    const std::unordered_map<std::string, common_json> metadata = {
+        {
+         "tool_search", {
+                { "type", "tool_search" },
+                { "name", "tool_search" },
+            }, },
+    };
+    native_server_generation_sink sink(fixture_context("implicit_client_search"), "adapter_implicit_client_search",
+                                       false, nullptr, metadata);
+    sink.accept(server_generation_started{});
+
+    common_chat_msg final_message;
+    final_message.tool_calls = {
+        { "tool_search", R"({"query":"chrome"})", "call_implicit_search" }
+    };
+    sink.accept(server_generation_message_snapshot{ final_message });
+    sink.accept(server_generation_completed{ fixture_usage(), 101 });
+
+    const common_json   snapshot = sink.snapshot();
+    const common_json & item     = snapshot.at("output").at(0);
+    CHECK(item.at("type") == "tool_search_call");
+    CHECK(item.at("execution") == "client");
+    CHECK(item.at("arguments") == common_json({
+                                      { "query", "chrome" }
+    }));
+}
+
 void test_partial_tool_name_is_buffered_until_arguments() {
     const std::unordered_map<std::string, common_json> metadata = {
         {
@@ -535,6 +642,9 @@ void test_translation_failure_poisoning_terminalizes_from_the_last_checkpoint() 
 int main() try {
     test_text_reasoning_reconciliation_and_persistence();
     test_interleaved_namespace_custom_and_local_shell_tools();
+    test_client_tool_search_projection();
+    test_server_tool_search_projection_is_rejected();
+    test_tool_search_metadata_defaults_to_client_execution();
     test_partial_tool_name_is_buffered_until_arguments();
     test_custom_argument_boundary_ignores_nested_string_syntax();
     test_checkpoint_failure_and_cancellation_contract();

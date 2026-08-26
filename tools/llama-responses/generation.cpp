@@ -89,6 +89,26 @@ common_json parse_tool_arguments(const std::string & arguments) {
     }
 }
 
+common_json parse_tool_search_arguments(const std::string & arguments, bool require_complete) {
+    // Client tool-search has no public argument-delta event. Keep the
+    // in-progress snapshot aligned with output_item.added and reveal the
+    // buffered object only when the item closes.
+    if (!require_complete || arguments.empty()) {
+        return common_json::object();
+    }
+    try {
+        common_json parsed = common_json::parse(arguments);
+        if (!parsed.is_object()) {
+            throw std::invalid_argument("generated client tool-search arguments must be a JSON object");
+        }
+        return parsed;
+    } catch (const std::invalid_argument &) {
+        throw;
+    } catch (const std::exception &) {
+        throw std::invalid_argument("generated client tool-search arguments must be a valid JSON object");
+    }
+}
+
 // Keep this projection aligned with
 // tools/server/server-task.cpp::build_local_shell_action while the
 // transitional Chat-shaped input/output parser remains in use.
@@ -185,6 +205,8 @@ item_id counter_generation_id_source::next_item_id(generation_item_kind kind) {
             return item_id(next_value("ctc_", custom_counter));
         case generation_item_kind::local_shell_call:
             return item_id(next_value("lsc_", local_shell_counter));
+        case generation_item_kind::tool_search_call:
+            return item_id(next_value("tsc_", tool_search_counter));
     }
     throw std::invalid_argument("unknown generation item kind");
 }
@@ -269,7 +291,9 @@ class native_response_state_machine::impl {
         }
         for (const auto & entry : tools) {
             const tool_state & tool = entry.second;
-            materialize_tool_item(tool, result.output.at(tool.response_item_index));
+            if (!tool.done) {
+                materialize_tool_item(tool, result.output.at(tool.response_item_index), false);
+            }
         }
         return result;
     }
@@ -608,6 +632,9 @@ class native_response_state_machine::impl {
             case generation_tool_kind::local_shell:
                 item_kind = generation_item_kind::local_shell_call;
                 break;
+            case generation_tool_kind::client_tool_search:
+                item_kind = generation_item_kind::tool_search_call;
+                break;
         }
         tool.item = ids.next_item_id(item_kind);
         tool.call = ids.next_call_id(update.upstream_call_id);
@@ -633,6 +660,9 @@ class native_response_state_machine::impl {
             case generation_tool_kind::local_shell:
                 item.type = "local_shell_call";
                 break;
+            case generation_tool_kind::client_tool_search:
+                item.type = "tool_search_call";
+                break;
         }
         item.value = {
             { "id",      item.id.str()   },
@@ -642,6 +672,9 @@ class native_response_state_machine::impl {
         };
         if (update.kind == generation_tool_kind::local_shell) {
             item.value["action"] = local_shell_action("");
+        } else if (update.kind == generation_tool_kind::client_tool_search) {
+            item.value["execution"] = "client";
+            item.value["arguments"] = common_json::object();
         } else {
             item.value["name"]                                                                = update.name;
             item.value[update.kind == generation_tool_kind::function ? "arguments" : "input"] = "";
@@ -686,6 +719,12 @@ class native_response_state_machine::impl {
             return;
         }
         if (tool.kind == generation_tool_kind::local_shell) {
+            return;
+        }
+        if (tool.kind == generation_tool_kind::client_tool_search) {
+            // OpenAI exposes client tool-search arguments as one JSON value
+            // on the generic output-item lifecycle. There is no corresponding
+            // public tool-search argument-delta event to manufacture here.
             return;
         }
         emit(response_event_type::custom_tool_call_input_delta,
@@ -740,7 +779,7 @@ class native_response_state_machine::impl {
         return ordered;
     }
 
-    static void materialize_tool_item(const tool_state & tool, response_output_item & item) {
+    static void materialize_tool_item(const tool_state & tool, response_output_item & item, bool require_complete) {
         switch (tool.kind) {
             case generation_tool_kind::function:
                 item.value["arguments"] = tool.value;
@@ -751,6 +790,9 @@ class native_response_state_machine::impl {
             case generation_tool_kind::local_shell:
                 item.value["action"] = local_shell_action(tool.value);
                 break;
+            case generation_tool_kind::client_tool_search:
+                item.value["arguments"] = parse_tool_search_arguments(tool.value, require_complete);
+                break;
         }
     }
 
@@ -760,7 +802,7 @@ class native_response_state_machine::impl {
         }
         response_output_item & item = output_item(tool.response_item_index);
         item.value["status"]        = status;
-        materialize_tool_item(tool, item);
+        materialize_tool_item(tool, item, std::string(status) == "completed");
         if (tool.kind == generation_tool_kind::function) {
             emit(response_event_type::function_call_arguments_done,
                  {

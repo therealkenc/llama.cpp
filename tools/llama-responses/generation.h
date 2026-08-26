@@ -41,6 +41,7 @@ enum class generation_tool_kind {
     function,
     custom,
     local_shell,
+    client_tool_search,
 };
 
 struct generation_tool_call_started {
@@ -151,6 +152,7 @@ enum class generation_item_kind {
     function_call,
     custom_tool_call,
     local_shell_call,
+    tool_search_call,
 };
 
 // Identity creation is injected so production can use its preferred random
@@ -186,6 +188,7 @@ class counter_generation_id_source final : public generation_id_source {
     std::uint64_t function_counter    = 0;
     std::uint64_t custom_counter      = 0;
     std::uint64_t local_shell_counter = 0;
+    std::uint64_t tool_search_counter = 0;
     std::uint64_t call_counter        = 0;
 };
 

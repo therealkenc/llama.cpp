@@ -83,7 +83,6 @@ def test_installed_codex_create_request_fixture_is_current_and_replayable():
         "client_metadata",
         "include",
         "input",
-        "instructions",
         "model",
         "parallel_tool_calls",
         "prompt_cache_key",
@@ -91,15 +90,33 @@ def test_installed_codex_create_request_fixture_is_current_and_replayable():
         "store",
         "stream",
         "tool_choice",
-        "tools",
     }
     assert request["include"] == ["reasoning.encrypted_content"]
+    assert request["parallel_tool_calls"] is False
+    assert request["reasoning"] == {"context": "all_turns", "effort": "low"}
+    assert request["store"] is False
+    assert request["stream"] is True
+    assert request["tool_choice"] == "auto"
+    assert [item["type"] for item in request["input"]] == [
+        "additional_tools",
+        "message",
+        "message",
+        "message",
+        "message",
+    ]
     assert [item["role"] for item in request["input"]] == [
+        "developer",
+        "developer",
         "developer",
         "user",
         "user",
     ]
-    assert [tool["type"] for tool in request["tools"]] == [
+    additional_tools = request["input"][0]
+    assert set(additional_tools) == {"role", "tools", "type"}
+    assert [tool["type"] for tool in additional_tools["tools"]] == ["namespace"]
+    function_namespace = additional_tools["tools"][0]
+    assert function_namespace["name"] == "functions"
+    assert [tool["type"] for tool in function_namespace["tools"]] == [
         "function",
         "function",
         "function",
@@ -107,8 +124,17 @@ def test_installed_codex_create_request_fixture_is_current_and_replayable():
         "custom",
         "function",
     ]
+    base_instructions = request["input"][1]
+    assert "id" not in base_instructions
+    assert base_instructions["content"] == [
+        {"type": "input_text", "text": "$CODEX_BASE_INSTRUCTIONS"}
+    ]
+    assert fixture["capture"]["transport"]["stable_header_values"][
+        "x-openai-internal-codex-responses-lite"
+    ] == "true"
 
     prompt_metadata = fixture["normalization"]["instructions"]
+    assert prompt_metadata["pointer"] == "/request/input/1/content/0/text"
     prompt_path = (fixture_path.parent / prompt_metadata["source"]).resolve()
     prompt_bytes = prompt_path.read_bytes()
     assert hashlib.sha256(prompt_bytes).hexdigest() == prompt_metadata["sha256"]
@@ -155,6 +181,8 @@ def test_codex_model_catalog_route_chain():
         assert model["apply_patch_tool_type"] == "freeform"
         assert model["supported_reasoning_levels"] == []
         assert "default_reasoning_level" not in model
+        assert model["supports_search_tool"] is False
+        assert model["use_responses_lite"] is False
         assert model["context_window"] == server.n_ctx // server.n_slots
         assert model["max_context_window"] == model["context_window"]
         assert model["input_modalities"] == ["text"]
@@ -327,6 +355,47 @@ def test_function_call_golden_stream_has_independent_stable_ids():
 
     assert_sdk_valid_events(events)
     assert_call_identity_contract(events)
+
+
+def test_client_tool_search_golden_stream_matches_sdk_item_lifecycle():
+    response_id = "resp_tool_search_fixture"
+    in_progress = {
+        "id": "tsc_tool_search_fixture",
+        "type": "tool_search_call",
+        "status": "in_progress",
+        "execution": "client",
+        "call_id": "call_tool_search_fixture",
+        "arguments": {},
+    }
+    completed = {
+        **in_progress,
+        "status": "completed",
+        "arguments": {"query": "read selected browser tab", "limit": 1},
+    }
+    events = [
+        event(
+            0,
+            "response.created",
+            response=response_snapshot(response_id, [], status="in_progress"),
+        ),
+        event(
+            1,
+            "response.in_progress",
+            response=response_snapshot(response_id, [], status="in_progress"),
+        ),
+        event(2, "response.output_item.added", output_index=0, item=in_progress),
+        event(3, "response.output_item.done", output_index=0, item=completed),
+        event(
+            4,
+            "response.completed",
+            response=response_snapshot(response_id, [completed]),
+        ),
+    ]
+
+    assert_sdk_valid_events(events)
+    assert events[2]["item"]["arguments"] == {}
+    assert events[3]["item"]["arguments"] == completed["arguments"]
+    assert not any("arguments.delta" in item["type"] for item in events)
 
 
 def test_parallel_function_call_golden_stream_tracks_interleaved_calls():
@@ -522,6 +591,261 @@ def test_codex_replayed_function_and_custom_tool_outputs_round_trip_through_sdk(
     assert response.output_text
 
 
+def test_client_tool_search_output_replay_round_trips_through_sdk_and_storage():
+    global server
+    server.jinja = True
+    client = openai_client()
+    call_id = "call_replayed_search"
+    search_call = {
+        "type": "tool_search_call",
+        "id": "tsc_replayed_search",
+        "status": "completed",
+        "execution": "client",
+        "call_id": call_id,
+        "arguments": {"query": "read the selected browser tab", "limit": 1},
+    }
+    search_output = {
+        "type": "tool_search_output",
+        "id": "tso_replayed_search",
+        "execution": "client",
+        "call_id": call_id,
+        "status": "completed",
+        "tools": [
+            {
+                "type": "namespace",
+                "name": "chrome",
+                "description": "Control the selected browser tab.",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "read_tab",
+                        "description": "Read the selected tab.",
+                        "defer_loading": True,
+                        "parameters": {
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": False,
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+    response = client.responses.create(
+        model="tinyllama-2",
+        input=[search_call, search_output],
+        max_output_tokens=16,
+        temperature=0.0,
+        tool_choice="none",
+        store=True,
+    )
+
+    assert_foreground_terminal(response)
+    assert response.id.startswith("resp_")
+    listed = authenticated_request(
+        "GET", f"/v1/responses/{response.id}/input_items?order=asc"
+    )
+    assert listed.status_code == 200
+    assert [item["type"] for item in listed.body["data"]] == [
+        "tool_search_call",
+        "tool_search_output",
+    ]
+    assert listed.body["data"][1]["tools"] == search_output["tools"]
+
+
+def codex_responses_lite_tools() -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "namespace",
+            "name": "functions",
+            "description": "",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "wait",
+                    "description": "Wait for a fixture task.",
+                    "strict": False,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"task_id": {"type": "string"}},
+                        "required": ["task_id"],
+                        "additionalProperties": False,
+                    },
+                }
+            ],
+        },
+        {
+            "type": "tool_search",
+            "execution": "client",
+            "description": "Find an installed tool by purpose.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+    ]
+
+
+def codex_responses_lite_prefix() -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": codex_responses_lite_tools(),
+        },
+        {
+            "type": "message",
+            "role": "developer",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": "Use the available tools carefully.",
+                }
+            ],
+        },
+    ]
+
+
+def test_codex_responses_lite_raw_shape_streams_without_top_level_tools():
+    global server
+    server.jinja = True
+    server.start()
+    request = {
+        "model": "tinyllama-2",
+        "input": [
+            *codex_responses_lite_prefix(),
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Reply briefly."}],
+            },
+        ],
+        "include": ["reasoning.encrypted_content"],
+        "parallel_tool_calls": False,
+        "prompt_cache_key": "responses-lite-fixture",
+        "reasoning": {"context": "all_turns", "effort": "low"},
+        "store": False,
+        "stream": True,
+        "tool_choice": "auto",
+        "max_output_tokens": 16,
+        "temperature": 0.0,
+    }
+
+    assert "instructions" not in request
+    assert "tools" not in request
+    assert request["input"][0]["type"] == "additional_tools"
+    assert request["input"][0]["role"] == "developer"
+    assert request["input"][1]["role"] == "developer"
+    events = list(
+        server.make_stream_request(
+            "POST",
+            "/v1/responses",
+            data=request,
+            headers={
+                "Authorization": f"Bearer {TEST_API_KEY}",
+                "x-openai-internal-codex-responses-lite": "true",
+            },
+        )
+    )
+
+    assert events[0]["type"] == "response.created"
+    assert events[-1]["type"] in {"response.completed", "response.incomplete"}
+    assert events[-1]["response"]["parallel_tool_calls"] is False
+    assert events[-1]["response"]["store"] is False
+
+
+def test_codex_responses_lite_client_search_replay_persists_typed_inputs():
+    global server
+    server.jinja = True
+    server.start()
+    call_id = "call_responses_lite_search"
+    selected_tools = [
+        {
+            "type": "namespace",
+            "name": "chrome",
+            "description": "Control the selected browser tab.",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "read_tab",
+                    "description": "Read the selected tab.",
+                    "defer_loading": True,
+                    "strict": False,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                }
+            ],
+        }
+    ]
+    input_items = [
+        *codex_responses_lite_prefix(),
+        {
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "Read the current browser tab."}
+            ],
+        },
+        {
+            "type": "tool_search_call",
+            "id": "tsc_responses_lite_search",
+            "status": "completed",
+            "execution": "client",
+            "call_id": call_id,
+            "arguments": {"query": "read selected browser tab", "limit": 1},
+        },
+        {
+            "type": "tool_search_output",
+            "id": "tso_responses_lite_search",
+            "status": "completed",
+            "execution": "client",
+            "call_id": call_id,
+            "tools": selected_tools,
+        },
+    ]
+    response = authenticated_request(
+        "POST",
+        "/v1/responses",
+        headers={"x-openai-internal-codex-responses-lite": "true"},
+        data={
+            "model": "tinyllama-2",
+            "input": input_items,
+            "parallel_tool_calls": False,
+            "reasoning": {"context": "all_turns"},
+            "store": True,
+            "stream": False,
+            "tool_choice": "auto",
+            "max_output_tokens": 16,
+            "temperature": 0.0,
+        },
+    )
+
+    assert response.status_code == 200
+    listed = authenticated_request(
+        "GET", f"/v1/responses/{response.body['id']}/input_items?order=asc&limit=100"
+    )
+    assert listed.status_code == 200
+    assert [item["type"] for item in listed.body["data"]] == [
+        "additional_tools",
+        "message",
+        "message",
+        "tool_search_call",
+        "tool_search_output",
+    ]
+    assert listed.body["data"][0]["id"].startswith("at_")
+    assert listed.body["data"][0]["tools"] == codex_responses_lite_tools()
+    assert listed.body["data"][-1]["tools"] == selected_tools
+
+
 @pytest.mark.parametrize(
     "body, message_fragment, code, param",
     [
@@ -677,14 +1001,13 @@ def test_top_logprobs_zero_is_a_responses_default_not_chat_logprobs():
             {
                 "tools": [
                     {
-                        "type": "function",
-                        "name": "fixture",
-                        "defer_loading": True,
+                        "type": "tool_search",
+                        "execution": 1,
                     }
                 ]
             },
-            "unsupported_parameter",
-            "tools[0].defer_loading",
+            "invalid_type",
+            "tools[0].execution",
         ),
         (
             {
@@ -1015,6 +1338,7 @@ def test_codex_client_metadata_and_client_executed_tools_are_accepted_and_echoed
                     "type": "function",
                     "name": "read_remote_fixture",
                     "description": "Read a remote fixture.",
+                    "defer_loading": True,
                     "strict": False,
                     "parameters": {
                         "type": "object",
@@ -1023,6 +1347,16 @@ def test_codex_client_metadata_and_client_executed_tools_are_accepted_and_echoed
                     },
                 }
             ],
+        },
+        {
+            "type": "tool_search",
+            "execution": "client",
+            "description": "Find a fixture tool by purpose.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
         },
     ]
     response = authenticated_request(
@@ -1171,7 +1505,6 @@ def test_create_string_limits_reject_one_character_over_the_boundary(
         ("text", {"format": {"type": "text"}, "verbosity": "low"}),
         ("reasoning", {"summary": "auto"}),
         ("reasoning", {"generate_summary": "auto"}),
-        ("reasoning", {"context": "all_turns"}),
         ("reasoning", {"mode": "standard"}),
         ("personality", "pragmatic"),
     ],
@@ -1199,8 +1532,6 @@ def test_recognized_unavailable_create_fields_fail_explicitly(field, value):
         expected_param = "reasoning.summary"
     elif field == "reasoning" and "generate_summary" in value:
         expected_param = "reasoning.generate_summary"
-    elif field == "reasoning" and "context" in value:
-        expected_param = "reasoning.context"
     elif field == "reasoning":
         expected_param = "reasoning.mode"
     assert response.body["error"]["param"] == expected_param

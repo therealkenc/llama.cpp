@@ -6,6 +6,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 using namespace llama_responses;
 
@@ -268,6 +269,152 @@ void test_string_instructions_merge_with_developer_items_as_typed_content() {
     CHECK(lowered.chat.messages.at(1).content_parts.at(0).text == "Do the work.");
 }
 
+common_json fixture_function(const std::string & name, bool deferred = false) {
+    common_json result = {
+        { "type",        "function"        },
+        { "name",        name              },
+        { "description", "Fixture " + name },
+        { "parameters",
+         {
+              { "type", "object" },
+              { "properties", { { "value", { { "type", "string" } } } } },
+          }                                },
+    };
+    if (deferred) {
+        result["defer_loading"] = true;
+    }
+    return result;
+}
+
+common_json fixture_client_search() {
+    return {
+        { "type",        "tool_search"                     },
+        { "execution",   "client"                          },
+        { "description", "Find the fixture tools to load." },
+        { "parameters",
+         {
+              { "type", "object" },
+              { "properties", { { "query", { { "type", "string" } } } } },
+              { "required", common_json::array({ "query" }) },
+          }                                                },
+    };
+}
+
+void test_client_search_withholds_deferred_namespace_members() {
+    const common_json request = {
+        { "input", "Use a fixture tool." },
+        { "tools",
+         common_json::array({
+              {
+                  { "type", "namespace" },
+                  { "name", "fixtures" },
+                  { "description", "Fixture operations." },
+                  { "tools", common_json::array({ fixture_function("direct"), fixture_function("hidden", true) }) },
+              },
+              fixture_client_search(),
+          })                             },
+    };
+
+    const server_generation_input lowered = lower_responses_generation_input(request);
+    CHECK(lowered.chat.tools.size() == 2U);
+    CHECK(lowered.tool_metadata.size() == 2U);
+    CHECK(lowered.tool_metadata.at("tool_search").at("type") == "tool_search");
+    CHECK(lowered.tool_metadata.at("tool_search").at("execution") == "client");
+    CHECK(lowered.chat.tools.at(1).name == "tool_search");
+    CHECK(lowered.chat.tools.at(1).description.find("Namespace 'fixtures': Fixture operations.") != std::string::npos);
+    CHECK(lowered.chat.tools.at(1).description.find("hidden") == std::string::npos);
+    CHECK(lowered.chat.tools.at(0).name != "direct");
+    CHECK(lowered.tool_metadata.at(lowered.chat.tools.at(0).name).at("name") == "direct");
+    CHECK(lowered.tool_metadata.at(lowered.chat.tools.at(0).name).at("namespace") == "fixtures");
+}
+
+void test_search_output_loads_selected_tools_and_preserves_call_pair() {
+    const common_json selected_namespace = {
+        { "type",        "namespace"                                                },
+        { "name",        "chrome"                                                   },
+        { "description", "Control the selected browser tab."                        },
+        { "tools",       common_json::array({ fixture_function("read_tab", true) }) },
+    };
+    const common_json request = {
+        { "input", common_json::array({
+                       {
+                           { "type", "tool_search_call" },
+                           { "id", "tsc_fixture" },
+                           { "call_id", "call_search" },
+                           { "execution", "client" },
+                           { "status", "completed" },
+                           { "arguments", { { "query", "read the selected browser tab" } } },
+                       },
+                       {
+                           { "type", "tool_search_output" },
+                           { "id", "tso_fixture" },
+                           { "call_id", "call_search" },
+                           { "execution", "client" },
+                           { "status", "completed" },
+                           { "tools", common_json::array({ selected_namespace }) },
+                       },
+                   }) },
+    };
+
+    const server_generation_input lowered = lower_responses_generation_input(request);
+    CHECK(lowered.chat.messages.size() == 2U);
+    CHECK(lowered.chat.messages.at(0).role == "assistant");
+    CHECK(lowered.chat.messages.at(0).tool_calls.at(0).name == "tool_search");
+    CHECK(lowered.chat.messages.at(0).tool_calls.at(0).id == "call_search");
+    CHECK(lowered.chat.messages.at(1).role == "tool");
+    CHECK(lowered.chat.messages.at(1).tool_name == "tool_search");
+    CHECK(lowered.chat.messages.at(1).tool_call_id == "call_search");
+    CHECK(lowered.chat.messages.at(1).content_parts.at(0).text.find("chrome [read_tab]") != std::string::npos);
+    CHECK(lowered.chat.tools.size() == 1U);
+    const std::string model_name = lowered.chat.tools.at(0).name;
+    CHECK(model_name != "read_tab");
+    CHECK(lowered.tool_metadata.at(model_name).at("name") == "read_tab");
+    CHECK(lowered.tool_metadata.at(model_name).at("namespace") == "chrome");
+}
+
+void test_search_selection_deduplicates_equal_tools_and_rejects_conflicts() {
+    common_json       selected         = fixture_function("selected", true);
+    const common_json repeated_request = {
+        { "input", common_json::array({
+                       {
+                           { "type", "tool_search_output" },
+                           { "call_id", "call_one" },
+                           { "tools", common_json::array({ selected, selected }) },
+                       },
+                   }) },
+    };
+    CHECK(lower_responses_generation_input(repeated_request).chat.tools.size() == 1U);
+
+    common_json conflicting      = selected;
+    conflicting["description"]   = "A different schema contract.";
+    common_json conflict_request = repeated_request;
+    conflict_request["input"][0]["tools"].push_back(std::move(conflicting));
+    bool threw = false;
+    try {
+        const server_generation_input unused = lower_responses_generation_input(conflict_request);
+        static_cast<void>(unused);
+    } catch (const std::invalid_argument &) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+void test_defer_loading_without_search_keeps_eager_compatibility() {
+    const common_json request = {
+        { "input", "Use the fixture."   },
+        { "tools", common_json::array({
+                       {
+                           { "type", "namespace" },
+                           { "name", "fixtures" },
+                           { "tools", common_json::array({ fixture_function("still_eager", true) }) },
+                       },
+                   }) },
+    };
+    const server_generation_input lowered = lower_responses_generation_input(request);
+    CHECK(lowered.chat.tools.size() == 1U);
+    CHECK(lowered.tool_metadata.at(lowered.chat.tools.at(0).name).at("name") == "still_eager");
+}
+
 }  // namespace
 
 int main() try {
@@ -277,6 +424,10 @@ int main() try {
     test_unresolved_reference_and_file_provider_are_explicit_errors();
     test_malformed_content_recovers_without_discarding_valid_media();
     test_string_instructions_merge_with_developer_items_as_typed_content();
+    test_client_search_withholds_deferred_namespace_members();
+    test_search_output_loads_selected_tools_and_preserves_call_pair();
+    test_search_selection_deduplicates_equal_tools_and_rejects_conflicts();
+    test_defer_loading_without_search_keeps_eager_compatibility();
     if (failures != 0) {
         std::cerr << failures << " input lowering checks failed\n";
         return 1;

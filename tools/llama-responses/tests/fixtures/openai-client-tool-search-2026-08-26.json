@@ -1,0 +1,170 @@
+{
+  "fixture_schema": "llama.responses.openai-client-tool-search-structural.v1",
+  "provenance": {
+    "observed_at": "2026-08-26",
+    "endpoint": "https://api.openai.com/v1/responses",
+    "model": "gpt-5.6-sol",
+    "source": "Direct minimal Responses probes; raw payloads were discarded after structural projection.",
+    "content_retained": false,
+    "credentials_retained": false,
+    "request_ids_retained": false
+  },
+  "non_stream": {
+    "request": {
+      "stream": false,
+      "store": false,
+      "parallel_tool_calls": false,
+      "tool_choice": "auto",
+      "tool_types": [
+        "tool_search"
+      ],
+      "tool_search_execution": "client"
+    },
+    "http_status": 200,
+    "response": {
+      "object": "response",
+      "status": "completed",
+      "instructions_kind": "null",
+      "store": false,
+      "parallel_tool_calls": false,
+      "tool_choice": "auto",
+      "response_tool_types": [
+        "tool_search"
+      ],
+      "output": [
+        {
+          "type": "tool_search_call",
+          "status": "completed",
+          "execution": "client",
+          "id_prefix": "tsc",
+          "call_id_kind": "string",
+          "arguments_kind": "object",
+          "name_present": false
+        }
+      ],
+      "usage_present": true
+    }
+  },
+  "stream": {
+    "request": {
+      "stream": true,
+      "store": false,
+      "parallel_tool_calls": false,
+      "tool_choice": "auto",
+      "tool_types": [
+        "tool_search"
+      ],
+      "tool_search_execution": "client"
+    },
+    "http_status": 200,
+    "events": [
+      {
+        "type": "response.created",
+        "sequence_number": 0,
+        "response_status": "in_progress",
+        "response_output_types": [],
+        "response_tool_types": [
+          "tool_search"
+        ]
+      },
+      {
+        "type": "response.in_progress",
+        "sequence_number": 1,
+        "response_status": "in_progress",
+        "response_output_types": [],
+        "response_tool_types": [
+          "tool_search"
+        ]
+      },
+      {
+        "type": "response.output_item.added",
+        "sequence_number": 2,
+        "output_index": 0,
+        "item": {
+          "type": "tool_search_call",
+          "status": "in_progress",
+          "execution": "client",
+          "id_prefix": "tsc",
+          "call_id_kind": "string",
+          "arguments_kind": "object",
+          "name_present": false
+        }
+      },
+      {
+        "type": "response.output_item.done",
+        "sequence_number": 3,
+        "output_index": 0,
+        "item": {
+          "type": "tool_search_call",
+          "status": "completed",
+          "execution": "client",
+          "id_prefix": "tsc",
+          "call_id_kind": "string",
+          "arguments_kind": "object",
+          "name_present": false
+        }
+      },
+      {
+        "type": "response.completed",
+        "sequence_number": 4,
+        "response_status": "completed",
+        "response_output_types": [
+          "tool_search_call"
+        ],
+        "response_tool_types": [
+          "tool_search"
+        ]
+      }
+    ]
+  },
+  "client_output_continuation": {
+    "request": {
+      "store": false,
+      "input_item_types": [
+        "tool_search_call",
+        "tool_search_output"
+      ],
+      "tool_search_output": {
+        "field_names": [
+          "call_id",
+          "execution",
+          "status",
+          "tools",
+          "type"
+        ],
+        "id_present": false,
+        "call_id_kind": "string",
+        "call_id_matches_tool_search_call": true,
+        "execution": "client",
+        "status": "completed",
+        "tools_kind": "array",
+        "selected_tool_count": 1
+      }
+    },
+    "http_status": 200,
+    "response": {
+      "object": "response",
+      "status": "completed",
+      "active_tool_count_before": 1,
+      "active_tool_count_after": 2,
+      "selected_definition_present_in_response_tools": true
+    },
+    "accepted_variant": {
+      "omitted_field": "status",
+      "http_status": 200
+    }
+  },
+  "tool_choice_observations": {
+    "search_only_required": {
+      "http_status": 400,
+      "error_type": "invalid_request_error",
+      "error_param": "tool_choice"
+    },
+    "search_plus_direct_required": {
+      "http_status": 200,
+      "output_type": "tool_search_call",
+      "execution": "client",
+      "interpretation": "A direct callable makes required valid, after which client tool search remains eligible to satisfy it."
+    }
+  }
+}
