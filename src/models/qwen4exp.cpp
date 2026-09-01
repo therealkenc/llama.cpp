@@ -296,6 +296,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 
     ggml_tensor * inpL = build_inp_embd(model.tok_embd);
     cb(inpL, "model.input_embed", -1);
+    ggml_build_forward_expand(gf, inpL);
 
     auto * inp = build_inp_mem_hybrid();
 
@@ -312,6 +313,13 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    ggml_tensor * ple_emb = nullptr;
+    if (hparams.ple_n_heads > 0) {
+        ple_emb = build_inp_ple(mctx_hyb);
+        // make sure ple_emb and build_inp_embd are in the same graph split
+        ggml_build_forward_expand(gf, ple_emb);
+    }
+
     // the wide residual starts as hc identical copies of the embedding
     ggml_tensor * res_hc = ggml_repeat_4d(ctx0,
             ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens),
@@ -322,7 +330,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         res->t_layer_inp[il] = res_hc;
 
         if (hparams.is_ple(il)) {
-            res_hc = build_ple(inp->get_recr(), mctx_hyb, res_hc, il);
+            res_hc = build_ple(inp->get_recr(), ple_emb, res_hc, il);
         }
 
         ggml_tensor * inject = nullptr;
@@ -568,12 +576,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
     // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
     ggml_tensor * score = ggml_mul_mat(ctx0, pooled,
-            ggml_reshape_3d(ctx0, ggml_cont(ctx0, q), idx_dim, n_idx_h*n_tps, n_stream));
+            ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream));
     score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
     score = ggml_relu(ctx0, score);
-    score = ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3));
-    score = ggml_sum_rows(ctx0, score);
-    score = ggml_reshape_3d(ctx0, score, n_blocks, n_tps, n_stream);
+
+    // the heads sit side by side on ne[1] and there are only a few of them
+    ggml_tensor * summed = nullptr;
+    for (int64_t h = 0; h < n_idx_h; ++h) {
+        ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks, n_tps, n_stream,
+                score->nb[2], score->nb[3], h*score->nb[1]);
+        summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
+    }
+
+    score = summed;
     cb(score, "indexer_score", il);
 
     // one value per block, so it is cheaper to bias here than after the cells are expanded
@@ -1072,31 +1087,34 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
 
     ggml_tensor * conv_input = ggml_concat(ctx0, state, ggml_transpose(ctx0, x), 0);
 
-    // keep the last state_cols columns for the next ubatch
+    // [TAG_RECURRENT_ROLLBACK_SPLITS] keep the last state_cols columns once per rollback slot,
+    // slot s ending s tokens earlier so a rollback of s tokens reads a history that never saw them
     const size_t row_size = ggml_row_size(conv_states_all->type, row_total);
+    const uint32_t mem_size = mctx_cur->get_size();
 
-    ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
-            state_cols, channels, n_seqs,
-            conv_input->nb[1], conv_input->nb[2],
-            ggml_row_size(conv_input->type, conv_input->ne[0] - state_cols));
+    const int64_t n_slots = (int64_t) cparams.n_rs_seq + 1;
 
-    ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
-            state_cols * channels, n_seqs,
-            conv_states_all->nb[1],
-            kv_head * row_size);
+    for (int64_t slot = 0; slot < n_slots; ++slot) {
+        const int64_t s_idx = std::max<int64_t>(0, conv_input->ne[0] - state_cols - slot);
 
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
+                state_cols, channels, n_seqs,
+                conv_input->nb[1], conv_input->nb[2],
+                ggml_row_size(conv_input->type, s_idx));
+
+        ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
+                state_cols * channels, n_seqs,
+                conv_states_all->nb[1],
+                (slot * mem_size + kv_head) * row_size);
+
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+    }
 
     return conv_input;
 }
 
-ggml_tensor * llama_model_qwen4exp::graph::build_ple(
-        llm_graph_input_rs * inp,
-        const llama_memory_hybrid_idx_context * mctx_hyb,
-        ggml_tensor *        hidden,
-        int                  il) {
-    const int64_t hc      = hparams.dsv4_hc_mult;
-    const int64_t hc_dim  = hc * n_embd;
+ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
+        const llama_memory_hybrid_idx_context * mctx_hyb) {
     const int64_t n_heads = hparams.ple_n_heads;
 
     // the attention cells see every ubatch regardless of the layer types
@@ -1111,7 +1129,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
     ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
-    cb(emb, "ple_embd", il);
+    cb(emb, "ple_embd", -1);
+
+    return emb;
+}
+
+ggml_tensor * llama_model_qwen4exp::graph::build_ple(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        emb,
+        ggml_tensor *        hidden,
+        int                  il) {
+    const int64_t hc      = hparams.dsv4_hc_mult;
+    const int64_t hc_dim  = hc * n_embd;
 
     ggml_tensor * key   = build_lora_mm(model.layers[il].ple_key,   emb);
     ggml_tensor * value = build_lora_mm(model.layers[il].ple_value, emb);
