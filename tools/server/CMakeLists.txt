@@ -1,13 +1,5 @@
 include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
 
-# MSVC emits a PCH bookkeeping symbol that WINDOWS_EXPORT_ALL_SYMBOLS exports as an ambiguous "__"
-
-set(LLAMA_SERVER_PCH ON)
-
-if (BUILD_SHARED_LIBS AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
-    set(LLAMA_SERVER_PCH OFF)
-endif()
-
 # server-context containing the core server logic, used by llama-server and CLI
 
 set(TARGET server-context)
@@ -42,12 +34,8 @@ if (BUILD_SHARED_LIBS)
 endif()
 
 target_include_directories(${TARGET} PRIVATE ../mtmd)
-target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
+target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
-
-if (LLAMA_SERVER_PCH)
-    target_precompile_headers(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/common/common.h)
-endif()
 
 if (LLAMA_BUILD_TESTS)
     add_executable(test-llama-responses-server-chat
@@ -81,12 +69,8 @@ add_library(${TARGET}
 set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
 target_include_directories(${TARGET} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_include_directories(${TARGET} PRIVATE ../mtmd ${CMAKE_SOURCE_DIR})
+target_include_directories(${TARGET} PRIVATE ../mtmd ${PROJECT_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC server-context llama-ui cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
-
-if (LLAMA_SERVER_PCH)
-    target_precompile_headers(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/common/common.h)
-endif()
 
 add_dependencies(${TARGET} llama-ui-assets)
 
