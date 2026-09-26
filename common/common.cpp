@@ -943,7 +943,12 @@ std::string fs_path_to_utf8(const std::filesystem::path & path) {
 // returns true if successful, false otherwise
 bool fs_create_directory_with_parents(const std::string & path) {
     std::error_code ec;
-    std::filesystem::create_directories(std::filesystem::u8path(path), ec);
+#ifdef __cpp_lib_char8_t
+    const auto utf8_path = std::filesystem::path(std::u8string(path.begin(), path.end()));
+#else
+    const auto utf8_path = std::filesystem::u8path(path);
+#endif
+    std::filesystem::create_directories(utf8_path, ec);
     return !ec;
 }
 
