@@ -13,6 +13,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <string>
 #include <system_error>
 #include <vector>
 
@@ -39,6 +40,14 @@ namespace fs = std::filesystem;
 // ----------------------------------------------------------------------------
 
 namespace {
+
+fs::path path_from_utf8(const std::string & path) {
+#ifdef __cpp_lib_char8_t
+    return fs::path(std::u8string(path.begin(), path.end()));
+#else
+    return fs::u8path(path);
+#endif
+}
 
 struct sha256_ctx {
     uint32_t state[8];
@@ -174,7 +183,7 @@ bool make_dir_recursive(const std::string & path) {
     if (path.empty()) { return false; }
     // create_directories() already creates missing parents. It returns false
     // (with ec clear) when the directory is already there, so re-check.
-    const fs::path p = fs::u8path(path);
+    const fs::path p = path_from_utf8(path);
     std::error_code ec;
     if (fs::create_directories(p, ec)) { return true; }
     std::error_code ec_stat;
@@ -239,7 +248,7 @@ std::string compute_key_suffix(cl_device_id device) {
 const uint8_t MAGIC[8] = { 'G','G','M','L','C','L','B','C' };
 
 bool read_all(const std::string & path, std::vector<uint8_t> & out) {
-    std::ifstream f(fs::u8path(path), std::ios::binary);
+    std::ifstream f(path_from_utf8(path), std::ios::binary);
     if (!f) { return false; }
     f.seekg(0, std::ios::end);
     std::streamsize sz = f.tellg();
@@ -251,8 +260,8 @@ bool read_all(const std::string & path, std::vector<uint8_t> & out) {
 }
 
 bool write_atomic(const std::string & path, const uint8_t * data, size_t len) {
-    const fs::path dst = fs::u8path(path);
-    const fs::path tmp = fs::u8path(path + ".tmp." + std::to_string(ggml_getpid()));
+    const fs::path dst = path_from_utf8(path);
+    const fs::path tmp = path_from_utf8(path + ".tmp." + std::to_string(ggml_getpid()));
     {
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
         if (!f) { return false; }

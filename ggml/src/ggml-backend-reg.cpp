@@ -92,6 +92,14 @@
 
 namespace fs = std::filesystem;
 
+static fs::path path_from_utf8(const std::string & path) {
+#ifdef __cpp_lib_char8_t
+    return fs::path(std::u8string(path.begin(), path.end()));
+#else
+    return fs::u8path(path);
+#endif
+}
+
 static std::string path_str(const fs::path & path) {
     try {
 #if defined(__cpp_lib_char8_t)
@@ -463,30 +471,30 @@ static fs::path get_executable_path() {
 
 static fs::path backend_filename_prefix() {
 #ifdef _WIN32
-    return fs::u8path("ggml-");
+    return fs::path("ggml-");
 #else
-    return fs::u8path("libggml-");
+    return fs::path("libggml-");
 #endif
 }
 
 static fs::path backend_filename_extension() {
 #ifdef _WIN32
-    return fs::u8path(".dll");
+    return fs::path(".dll");
 #else
-    return fs::u8path(".so");
+    return fs::path(".so");
 #endif
 }
 
 static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent, const char * user_search_path) {
     // enumerate all the files that match [lib]ggml-name-*.[so|dll] in the search paths
-    const fs::path name_path = fs::u8path(name);
-    const fs::path file_prefix = backend_filename_prefix().native() + name_path.native() + fs::u8path("-").native();
+    const fs::path name_path = path_from_utf8(name);
+    const fs::path file_prefix = backend_filename_prefix().native() + name_path.native() + fs::path("-").native();
     const fs::path file_extension = backend_filename_extension();
 
     std::vector<fs::path> search_paths;
     if (user_search_path == nullptr) {
 #ifdef GGML_BACKEND_DIR
-        search_paths.push_back(fs::u8path(GGML_BACKEND_DIR));
+        search_paths.push_back(path_from_utf8(GGML_BACKEND_DIR));
 #endif
         // default search paths: executable directory, current directory
         search_paths.push_back(get_executable_path());
@@ -498,7 +506,7 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
             search_paths.push_back(cwd);
         }
     } else {
-        search_paths.push_back(fs::u8path(user_search_path));
+        search_paths.push_back(path_from_utf8(user_search_path));
     }
 
     int best_score = 0;
