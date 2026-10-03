@@ -446,7 +446,9 @@ int llama_server(common_params & params, int argc, char ** argv, const server_ro
         SRV_WRN("%s", "the following feature(s) are enabled:\n");
         std::string features;
         for (const auto & name : warn_names) {
-            if (!features.empty()) features += ", ";
+            if (!features.empty()) {
+                features += ", ";
+            }
             features += name;
         }
         SRV_WRN("security: %s enabled - do not expose to untrusted environments\n", features.c_str());
