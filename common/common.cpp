@@ -1041,47 +1041,6 @@ std::filesystem::path fs_get_cache_file(const std::string & filename) {
     return cache_directory / fs_path_from_utf8(filename);
 }
 
-std::vector<common_file_info> fs_list(const std::string & path, bool include_directories) {
-    std::vector<common_file_info> files;
-    if (path.empty()) return files;
-
-    std::filesystem::path dir(path);
-    if (!std::filesystem::exists(dir) || !std::filesystem::is_directory(dir)) {
-        return files;
-    }
-
-    for (const auto & entry : std::filesystem::directory_iterator(dir)) {
-        try {
-            // Only include regular files (skip directories)
-            const auto & p = entry.path();
-            if (std::filesystem::is_regular_file(p)) {
-                common_file_info info;
-                info.path   = p.string();
-                info.name   = p.filename().string();
-                info.is_dir = false;
-                try {
-                    info.size = static_cast<size_t>(std::filesystem::file_size(p));
-                } catch (const std::filesystem::filesystem_error &) {
-                    info.size = 0;
-                }
-                files.push_back(std::move(info));
-            } else if (include_directories && std::filesystem::is_directory(p)) {
-                common_file_info info;
-                info.path   = p.string();
-                info.name   = p.filename().string();
-                info.size   = 0; // Directories have no size
-                info.is_dir = true;
-                files.push_back(std::move(info));
-            }
-        } catch (const std::filesystem::filesystem_error &) {
-            // skip entries we cannot inspect
-            continue;
-        }
-    }
-
-    return files;
-}
-
 //
 // TTY utils
 //
@@ -1112,6 +1071,20 @@ bool tty_can_use_colors() {
     // Check if stdout and stderr are connected to a terminal
     // We check both because log messages can go to either
     return common_is_tty(stdout) || common_is_tty(stderr);
+}
+
+bool tty_enable_ansi() {
+#if defined(_WIN32)
+    // a Windows console renders ANSI sequences only in virtual terminal mode, pipes and files take them as is
+    for (DWORD id : { STD_OUTPUT_HANDLE, STD_ERROR_HANDLE }) {
+        HANDLE h    = GetStdHandle(id);
+        DWORD  mode = 0;
+        if (GetConsoleMode(h, &mode) && !SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) {
+            return false;
+        }
+    }
+#endif
+    return true;
 }
 
 //
@@ -1679,7 +1652,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
-    mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    mparams.load_mtp                    = params.load_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
     return mparams;
 }
