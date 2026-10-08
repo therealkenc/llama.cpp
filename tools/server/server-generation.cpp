@@ -94,7 +94,7 @@ std::vector<server_generation_update> server_generation_updates_from_result(cons
             // parser which cannot recognize the model output must not erase
             // the raw generated text from the native Responses projection.
             snapshot.role    = "assistant";
-            snapshot.content = final->content;
+            snapshot.content = final->content.text;
         }
         updates.emplace_back(server_generation_message_snapshot{ std::move(snapshot) });
         const server_generation_usage usage = generation_usage(*final);

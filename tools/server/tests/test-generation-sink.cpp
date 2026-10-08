@@ -92,7 +92,7 @@ void test_final_mapping() {
     CHECK(completed.usage.output_tokens == 7);
 
     server_task_result_cmpl_final unparsed;
-    unparsed.content = "raw parser fallback";
+    unparsed.content = common_chat_input("raw parser fallback");
     updates          = server_generation_updates_from_result(unparsed, false);
     CHECK(updates.size() == 2);
     const auto & fallback = std::get<server_generation_message_snapshot>(updates.at(0));
