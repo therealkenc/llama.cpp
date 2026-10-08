@@ -1087,6 +1087,7 @@ struct peg_test_case {
     common_chat_msg              expect;
     bool                         is_partial            = false;
     bool                         expect_reconstruction = false;
+    std::vector<std::string>     expect_rules;
 };
 
 struct make_peg_parser {
@@ -1105,7 +1106,7 @@ struct make_peg_parser {
     common_chat_msg parse(const std::string & msg, bool is_partial) const {
         common_chat_parser_params parser_params(params_);
         parser_params.debug = detailed_debug_;
-        return common_chat_peg_parse(arena_, msg, is_partial, parser_params);
+        return common_chat_peg_parse(arena_, common_chat_input(msg), is_partial, parser_params);
     }
 };
 
@@ -1164,6 +1165,14 @@ static void test_peg_parser(common_chat_templates *                      tmpls,
     if (detailed_debug) {
         LOG_DBG("Using parser: \n%s\n", parser.arena_.dump(parser.arena_.root()).c_str());
         LOG_DBG("Generation prompt: '%s'\n", parser.params_.generation_prompt.c_str());
+    }
+
+    for (const auto & rule : tc.expect_rules) {
+        if (!parser.arena_.has_rule(rule)) {
+            LOG_ERR("Missing rule: %s\n", rule.c_str());
+            common_log_flush(common_log_main());
+            throw std::runtime_error("Test failed");
+        }
     }
 
     common_chat_msg msg_accum;
@@ -1570,6 +1579,11 @@ class peg_test_builder {
 
     peg_test_builder & expect_tool_calls(std::vector<common_chat_tool_call> calls) {
         tc_.expect.tool_calls = std::move(calls);
+        return *this;
+    }
+
+    peg_test_builder & expect_rules(std::vector<std::string> rules) {
+        tc_.expect_rules = std::move(rules);
         return *this;
     }
 
@@ -2245,6 +2259,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
             .tools({ special_function_tool })
             .expect(message_assist_call)
+            .expect_rules({ "tool-0", "tool-0-arg-0" })
             .run();
 
         tst.test(
@@ -2696,6 +2711,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .enable_thinking(true)
             .tools({ special_function_tool })
             .expect(message_assist_call)
+            .expect_rules({ "tool-0" })
             .run();
 
         tst.test(
@@ -3095,6 +3111,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
                 "<|tool_call>call:get_time{city:<|\"|>London<|\"|>}<tool_call|>")
             .tools({ get_time_tool })
             .expect(message_with_tool_calls("get_time", R"({"city": "London"})"))
+            .expect_rules({ "tool-0" })
             .run();
 
         // Tool call with string argument containing special chars
@@ -3411,6 +3428,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
                "</tool_call>")
             .tools({ special_function_tool })
             .expect(message_assist_call)
+            .expect_rules({ "tool-0" })
             .run();
 
         tst.test(
@@ -3695,6 +3713,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
                 { "special_function", R"({"arg1": 1})", {} },
                 { "special_function_with_opt", R"({"arg1": 1, "arg2": 2})", {} },
             })
+            .expect_rules({ "tool-0", "tool-0-arg-0", "tool-1", "tool-1-arg-0", "tool-1-arg-1" })
             .run();
 
         tst.test(
@@ -4106,6 +4125,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
             .tools({ get_time_tool })
             .expect(message_with_tool_calls_and_reasoning("get_time", R"({"city": "Tokyo"})", "Let me check the time"))
+            .expect_rules({ "tool-0", "tool-0-arg-0" })
             .run();
 
         // Tool call without reasoning (non-thinking mode), integer param (string="false")
@@ -4714,7 +4734,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             bool got_out_of_range = false;
             std::string error_msg;
             try {
-                common_chat_peg_parse(arena, bad_input, /*is_partial=*/false, pp);
+                common_chat_peg_parse(arena, common_chat_input(bad_input), /*is_partial=*/false, pp);
             } catch (const std::out_of_range & e) {
                 got_out_of_range = true;
                 error_msg = e.what();
@@ -4744,6 +4764,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .tools({ get_time_tool })
             .expect_reasoning("I need to check the time first.\n")
             .expect_tool_calls({ { "get_time", R"({"city": "Paris"})", "" } })
+            .expect_rules({ "ling3-tool-0", "ling3-arg-0-0" })
             .run();
 
         // Closed think block, prose, then a tool call.
@@ -4982,6 +5003,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .tools({ special_function_tool })
             .expect(message_assist_call_thoughts)
             .expect_reconstruction()
+            .expect_rules({ "tool-0", "tool-0-arg-0" })
             .run();
 
         tst.test(
@@ -5194,6 +5216,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect_tool_calls({
                 { "special_function", R"({"arg1":1})", "" },
             })
+            .expect_rules({ "kimi-k3-tool-0", "kimi-k3-arg-0-0" })
             .run();
 
         // Tool call preceded by reasoning (no opening think tag) and content.
@@ -5482,6 +5505,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .tools({ special_function_tool })
             .expect(kimi_id_special_func_tool_call)
             .expect_reconstruction()
+            .expect_rules({ "tool-0" })
             .run();
 
         // Kimi-K2-Instruct
@@ -5536,6 +5560,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
             .tools({ special_function_tool })
             .expect(message_assist_call_thoughts)
+            .expect_rules({ "tool-0" })
             .run();
 
         // Tool call with reasoning and content
@@ -5813,6 +5838,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .tools({ get_time_tool })
             .expect(message_with_tool_calls_and_reasoning("get_time", R"({"city": "Tokyo"})", "Let me check the time"))
             .expect_reconstruction()
+            .expect_rules({ "tool-0", "tool-0-arg-0" })
             .run();
 
         // Tool call without reasoning, integer param
@@ -6211,6 +6237,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .tools({ special_function_tool })
             .expect(message_assist_call_id)
             .expect_reconstruction()
+            .expect_rules({ "tool-0" })
             .run();
 
         // Continuation tests
@@ -6246,6 +6273,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .tools({ special_function_tool })
             .expect(message_assist_call)
             .expect_reconstruction()
+            .expect_rules({ "tool-0" })
             .run();
 
         // Continuation tests
@@ -6618,7 +6646,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
     {
         // Llama 3.2
         auto tst = peg_tester("models/templates/meta-llama-Llama-3.2-3B-Instruct.jinja", detailed_debug);
-        tst.test("Hello, world!\nWhat's up?").tools({ special_function_tool }).expect(message_assist).expect_reconstruction().run();
+        tst.test("Hello, world!\nWhat's up?").tools({ special_function_tool }).expect(message_assist).expect_reconstruction().expect_rules({ "tool-0" }).run();
 
         // Continuation tests
         tst.test("world!\nWhat's up?")
@@ -6666,6 +6694,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .tools({ special_function_tool })
             .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
             .expect(message_assist_call)
+            .expect_rules({ "tool-0" })
             .run();
 
         // "Inform then act": the model answers the user and calls a tool in ONE generation,
@@ -6751,6 +6780,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
             .tools({ special_function_tool })
             .expect(message_assist_call)
+            .expect_rules({ "tool-0" })
             .run();
 
         // Tool call with recipient in channel header: "<|channel|>analysis to=functions.NAME<|message|>JSON"
@@ -6926,6 +6956,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
             .tools({ special_function_tool })
             .expect(message_assist_call_thoughts)
+            .expect_rules({ "tool-0" })
             .run();
 
         // Tool call, recipient in channel header
@@ -7182,6 +7213,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .tools({ special_function_tool })
             .expect(message_assist_call)
             .expect_reconstruction()
+            .expect_rules({ "tool-0" })
             .run();
 
         tst.test(
@@ -7210,6 +7242,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .tools({ special_function_tool })
             .expect(message_assist_call)
             .expect_reconstruction()
+            .expect_rules({ "tool-0" })
             .run();
 
         tst.test(
@@ -7230,6 +7263,13 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .run();
     }
 
+    // TranslateGemma
+    {
+        // no reconstruction check, the template adds whitespace around assistant content
+        auto tst = peg_tester("models/templates/google-translategemma-4b-it.jinja", detailed_debug);
+        tst.test("Hello, world!\nWhat's up?").expect(message_assist).run();
+    }
+
     // MiniCPM5 - XML tool calls with <function name="..."><param name="...">...</param></function>
     {
         auto tst = peg_tester("models/templates/openbmb-MiniCPM5-1B.jinja", detailed_debug);
@@ -7245,6 +7285,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
             .tools({ python_tool })
             .expect_tool_calls({ { "python", R"#({"code": "print('Hello, World!')"})#", {} } })
+            .expect_rules({ "tool-0" })
             .run();
 
         tst.test(R"(<function name="empty_args"></function>)")
@@ -7646,6 +7687,43 @@ static void test_developer_role_to_system_workaround() {
     }
 }
 
+// TranslateGemma raises on plain string user content, the specialized handler must rewrite it
+static void test_translate_gemma() {
+    LOG_DBG("%s\n", __func__);
+
+    auto tmpls = read_templates("models/templates/google-translategemma-4b-it.jinja");
+
+    // server startup renders this example, it must not throw
+    auto example = common_chat_format_example(tmpls.get(), /* use_jinja= */ true, {});
+    assert_contains(example, "English (en-GB) to English (en-GB) translator");
+    assert_contains(example, "How are you?");
+
+    common_chat_templates_inputs inputs;
+    inputs.messages                                 = { message_user };
+    inputs.add_generation_prompt                    = true;
+    inputs.chat_template_kwargs["source_lang_code"] = R"("en")";
+    inputs.chat_template_kwargs["target_lang_code"] = R"("fr")";
+
+    auto params = common_chat_templates_apply(tmpls.get(), inputs);
+    assert_contains(params.prompt, "English (en) to French (fr) translator");
+    assert_contains(params.prompt, "into French:\n\n\nHey there!<end_of_turn>\n");
+    assert_equals(std::string("<start_of_turn>model\n"), params.generation_prompt);
+    assert_ends_with(params.prompt, params.generation_prompt);
+
+    // typed text parts are joined into one item
+    inputs.messages = { message_user_parts };
+    params = common_chat_templates_apply(tmpls.get(), inputs);
+    assert_contains(params.prompt, "into French:\n\n\nHey\nthere<end_of_turn>\n");
+
+    // assistant prefill is appended after the generation prompt
+    inputs.messages               = { message_user, message_assist_prefill_content };
+    inputs.add_generation_prompt  = false;
+    inputs.continue_final_message = COMMON_CHAT_CONTINUATION_CONTENT;
+    params = common_chat_templates_apply(tmpls.get(), inputs);
+    assert_equals(std::string("<start_of_turn>model\nHello, "), params.generation_prompt);
+    assert_ends_with(params.prompt, "Hey there!<end_of_turn>\n<start_of_turn>model\nHello, ");
+}
+
 // Verify reasoning-trace retention rules in the DeepSeek-V4 template:
 // all traces are retained unless drop_thinking is true AND the conversation
 // has no tool calls, in which case only the last (after-final-user) trace is
@@ -8026,6 +8104,7 @@ int main(int argc, char ** argv) {
         test_convert_responses_non_video_input_file();
         test_convert_responses_to_chatcmpl();
         test_developer_role_to_system_workaround();
+        test_translate_gemma();
         test_deepseek_v4_thinking_retention();
         test_deepseek_v4_tool_result_ordering();
         test_template_generation_prompt();
