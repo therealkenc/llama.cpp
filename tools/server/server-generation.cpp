@@ -126,9 +126,11 @@ std::vector<server_generation_update> server_generation_updates_from_result(cons
     throw std::invalid_argument("server generation sink received an unsupported task result");
 }
 
-json server_generation_params_parse(const server_generation_input & input,
+json server_generation_params_parse(const llama_vocab *             vocab,
+                                    const server_generation_input & input,
                                     const server_chat_params &      options,
                                     std::vector<raw_buffer> &       files,
+                                    common_chat_session &           session,
                                     bool                            load_media) {
     if (!input.inference_parameters.is_object()) {
         throw std::invalid_argument("generation inference_parameters must be an object");
@@ -294,7 +296,7 @@ json server_generation_params_parse(const server_generation_input & input,
     try {
         // Reuse llama-server's prompt/sampling parser in-process. No HTTP
         // request or Chat Completions response shape crosses this boundary.
-        return oaicompat_chat_params_parse(body, options, files);
+        return oaicompat_chat_params_parse(vocab, body, options, files, session);
     } catch (const std::invalid_argument &) {
         throw;
     } catch (const std::exception & error) {

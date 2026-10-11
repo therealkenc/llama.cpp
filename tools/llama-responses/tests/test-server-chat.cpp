@@ -7,7 +7,11 @@
 #include "server-generation.h"
 
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
+#include <memory>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -188,14 +192,78 @@ void test_typed_server_adapter_rejects_unsupported_media() {
     options.allow_audio       = false;
     options.allow_video       = false;
     std::vector<raw_buffer> files;
+    common_chat_session    session;
     bool                    rejected = false;
     try {
-        static_cast<void>(server_generation_params_parse(typed, options, files));
+        static_cast<void>(server_generation_params_parse(nullptr, typed, options, files, session));
     } catch (const std::invalid_argument & error) {
         rejected = std::string(error.what()).find("image input is not supported") != std::string::npos;
     }
     CHECK(rejected);
     CHECK(files.empty());
+}
+
+void test_typed_server_adapter_preserves_chat_session() {
+    const auto source_dir = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path().parent_path();
+    const auto vocab_path = source_dir / "models/ggml-vocab-qwen35.gguf";
+    std::ifstream template_file(source_dir / "models/templates/Qwen3.5-4B.jinja", std::ios::binary);
+    if (!template_file) {
+        throw std::runtime_error("failed to open Qwen3.5 chat template fixture");
+    }
+    const std::string template_text{ std::istreambuf_iterator<char>(template_file), std::istreambuf_iterator<char>() };
+
+    auto model_params = llama_model_default_params();
+    model_params.vocab_only = true;
+    const std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
+        llama_model_load_from_file(vocab_path.string().c_str(), model_params), llama_model_free);
+    if (!model) {
+        throw std::runtime_error("failed to load Qwen3.5 vocabulary fixture");
+    }
+    const auto * vocab = llama_model_get_vocab(model.get());
+
+    server_chat_params options{};
+    options.use_jinja        = true;
+    options.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+    options.tmpls = common_chat_templates_ptr(common_chat_templates_init(nullptr, template_text));
+    const server_generation_input typed = lower_responses_generation_input(common_json::parse(R"({
+        "input": "Look up the weather.",
+        "tools": [{
+            "type": "function",
+            "name": "get_weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]
+            }
+        }]
+    })"));
+    std::vector<raw_buffer> files;
+    common_chat_session session;
+    const json data = server_generation_params_parse(vocab, typed, options, files, session);
+    CHECK(session.has_template());
+    CHECK(data.at("prompt") == session.prompt());
+    CHECK(!session.grammar().empty());
+    CHECK(!data.contains("grammar"));
+    CHECK(files.empty());
+    CHECK(!session.message_delimiters().delimiters.empty());
+    for (const auto & delimiter : session.message_delimiters().delimiters) {
+        CHECK(!delimiter.tokens.empty());
+    }
+
+    common_params_sampling sampling;
+    session.apply_sampling(sampling);
+    CHECK(sampling.grammar.grammar == session.grammar());
+    CHECK(sampling.generation_prompt == session.generation_prompt());
+
+    const auto & message = session.finish(common_chat_input_tokenize(vocab,
+        "Checking.</think>\n\n<tool_call>\n<function=get_weather>\n"
+        "<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>"));
+    CHECK(message.reasoning_content == "Checking.");
+    CHECK(message.tool_calls.size() == 1U);
+    if (!message.tool_calls.empty()) {
+        CHECK(message.tool_calls.front().name == "get_weather");
+        CHECK(json::parse(message.tool_calls.front().arguments) == json({{ "city", "Tokyo" }}));
+    }
 }
 
 }  // namespace
@@ -207,6 +275,7 @@ int main() try {
     test_local_shell_protocol_identity_cannot_be_renamed();
     test_namespace_tools_lower_to_unique_functions_and_replay();
     test_typed_server_adapter_rejects_unsupported_media();
+    test_typed_server_adapter_preserves_chat_session();
     if (failures != 0) {
         std::cerr << failures << " server-chat Responses checks failed\n";
         return 1;

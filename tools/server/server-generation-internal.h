@@ -11,9 +11,11 @@
 // Internal adapter into llama-server's shared prompt parser. This is not an
 // HTTP Chat Completions seam: the caller supplies typed model input, and this
 // function produces the completion engine's established prompt parameters.
-json server_generation_params_parse(const server_generation_input & input,
+json server_generation_params_parse(const llama_vocab *             vocab,
+                                    const server_generation_input & input,
                                     const server_chat_params &      options,
                                     std::vector<raw_buffer> &       files,
+                                    common_chat_session &           session,
                                     bool                            load_media = true);
 
 class server_generation_projection {

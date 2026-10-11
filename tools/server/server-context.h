@@ -175,6 +175,7 @@ private:
             const json & data,
             const std::vector<raw_buffer> & files,
             task_response_type res_type,
+            const common_chat_session & chat_session = {},
             std::shared_ptr<server_generation_sink> generation_sink = nullptr);
     std::unique_ptr<server_res_generator> handle_generation_input_impl(
             const server_http_req & req,
