@@ -241,7 +241,7 @@ void test_typed_server_adapter_preserves_chat_session() {
     common_chat_session session;
     const json data = server_generation_params_parse(vocab, typed, options, files, session);
     CHECK(session.has_template());
-    CHECK(data.at("prompt") == session.prompt());
+    CHECK(data.at("prompt") == session.prompt().str());
     CHECK(!session.grammar().empty());
     CHECK(!data.contains("grammar"));
     CHECK(files.empty());
