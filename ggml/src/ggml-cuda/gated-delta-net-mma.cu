@@ -4,7 +4,16 @@
 #include <climits>
 #include <mutex>
 
+#if defined(__NVCC__) && defined(__GNUC__) && !defined(__clang__)
+// nvcc emits an extra semicolon for the anonymous namespace declaration.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wextra-semi"
+#endif
 namespace {
+#if defined(__NVCC__) && defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+
 constexpr int D = 128;
 using bf16      = nv_bfloat16;
 
