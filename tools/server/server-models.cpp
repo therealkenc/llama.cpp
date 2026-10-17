@@ -801,7 +801,7 @@ void server_unfinished_downloads::save() {
         data["downloads"].push_back({ {"model", d.model}, {"sidecars", d.sidecars}, {"partials", partials} });
     }
     try {
-        fs_write_atomic(std::filesystem::u8path(unfinished_downloads_path()), data.dump());
+        fs_write_atomic(fs_path_from_utf8(unfinished_downloads_path()), data.dump());
     } catch (const std::exception & e) {
         LOG_WRN("failed to record unfinished downloads: %s\n", e.what());
     }
@@ -818,7 +818,7 @@ void server_unfinished_downloads::delete_partials(const std::vector<common_downl
             continue;
         }
         std::error_code ec;
-        std::filesystem::remove(std::filesystem::u8path(p.path), ec);
+        std::filesystem::remove(fs_path_from_utf8(p.path), ec);
     }
 }
 

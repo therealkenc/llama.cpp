@@ -1162,7 +1162,7 @@ bool common_download_remove_sidecars(const std::string & hf_repo_with_tag, const
     for (const auto & s : sidecars) {
         const auto & f = plan.*s.file;
         if (!f.local_path.empty()) {
-            to_remove.emplace_back(std::filesystem::u8path(f.local_path));
+            to_remove.emplace_back(fs_path_from_utf8(f.local_path));
         }
     }
     if (to_remove.empty()) {
