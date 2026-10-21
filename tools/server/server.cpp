@@ -1,4 +1,5 @@
 #include "server.h"
+#include "server-connect.h"
 
 #include "arg.h"
 #include "common.h"
@@ -218,6 +219,20 @@ static int llama_server(common_params & params,
         params.model_alias.insert(model_name);
     }
 
+    // check early, so a missing llama-connect fails-fast
+    if (params.server_connect) {
+        const std::string reason = server_connect::unavailable_reason(params);
+        if (!reason.empty()) {
+            SRV_ERR("--connect is not available: %s\n", reason.c_str());
+            return 1;
+        }
+        params.server_connect_code = server_connect::resolve_code(params.server_connect_code);
+    } else if (!params.server_connect_code.empty()) {
+        // the code is only meaningful while the tunnel runs, and /props keys off it being set
+        SRV_WRN("%s", "--connect-code is ignored without --connect\n");
+        params.server_connect_code.clear();
+    }
+
     // note: this is guaranteed to out-live ctx_http and tools
     server_mcp mcp_mgr;
 
@@ -259,6 +274,8 @@ static int llama_server(common_params & params,
         routes.post_control                = models_routes->proxy_post;
         routes.post_responses_oai          = models_routes->proxy_post;
         routes.post_transcriptions_oai     = models_routes->proxy_post;
+        routes.post_tts                    = models_routes->proxy_post;
+        routes.ws_realtime                 = models_routes->proxy_ws;
         routes.post_anthropic_messages     = models_routes->proxy_post;
         routes.post_anthropic_count_tokens = models_routes->proxy_post;
         routes.post_infill                 = models_routes->proxy_post;
@@ -347,6 +364,8 @@ static int llama_server(common_params & params,
     }
     ctx_http.post("/v1/audio/transcriptions", ex_wrapper(routes.post_transcriptions_oai));
     ctx_http.post("/audio/transcriptions", ex_wrapper(routes.post_transcriptions_oai));
+    ctx_http.post("/tts", ex_wrapper(routes.post_tts));
+    ctx_http.ws("/v1/realtime", routes.ws_realtime);
     ctx_http.post("/v1/messages", ex_wrapper(routes.post_anthropic_messages));  // anthropic messages API
     ctx_http.post("/infill", ex_wrapper(routes.post_infill));
     ctx_http.post("/embedding", ex_wrapper(routes.post_embeddings));            // legacy
@@ -417,6 +436,10 @@ static int llama_server(common_params & params,
     std::vector<std::string> warn_names;
     if (is_router_server) {
         warn_names.push_back("router mode");
+    }
+
+    if (params.server_connect) {
+        warn_names.push_back("peer-to-peer tunnel (llama-connect, experimental)");
     }
 
     if (params.ui_mcp_proxy) {
@@ -606,6 +629,16 @@ static int llama_server(common_params & params,
 
     for (const auto & address : ctx_http.listening_addresses) {
         SRV_INF("listening on %s\n", address.c_str());
+    }
+
+    // spawn only once listening, so the port is bound and the child startup health check reaches us. the destructor stops it
+    server_connect connect_proc;
+    if (params.server_connect && !connect_proc.start(params, ctx_http.port)) {
+        SRV_ERR("%s", "exiting due to llama-connect error\n");
+        ctx_http.stop();
+        ctx_http.join();
+        clean_up();
+        return 1;
     }
 
     if (is_router_server) {
