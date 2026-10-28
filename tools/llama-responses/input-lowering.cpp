@@ -122,7 +122,7 @@ std::string namespace_tool_name(const std::string & namespace_name, const std::s
 }
 
 void append_text(common_chat_msg & message, std::string text) {
-    message.content_parts.push_back({ "text", std::move(text) });
+    message.content_parts.push_back({ "text", std::move(text), {} });
 }
 
 void append_recovery(common_chat_msg & message, const std::string & detail) {
@@ -131,7 +131,7 @@ void append_recovery(common_chat_msg & message, const std::string & detail) {
 
 void append_media(lowered_message & message, server_generation_media_kind kind, std::string source) {
     const std::size_t part_index = message.message.content_parts.size();
-    message.message.content_parts.push_back({ "media_marker", {} });
+    message.message.content_parts.push_back({ "media_marker", {}, {} });
     message.media.push_back({ part_index, kind, std::move(source) });
 }
 
