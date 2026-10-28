@@ -21,6 +21,8 @@ add_library(${TARGET} STATIC
     server-generation.h
     server-generation-internal.h
     server-responses.h
+    server-realtime.cpp
+    server-realtime.h
     server-stream.cpp
     server-stream.h
     server-tools.cpp
@@ -69,6 +71,8 @@ add_library(${TARGET}
     server-models.cpp
     server-models.h
     server-route-extensions.h
+    server-models-sched.cpp
+    server-models-sched.h
 )
 set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
