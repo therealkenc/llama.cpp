@@ -910,9 +910,6 @@ std::wstring utf8_to_wstring(const std::string & str);
 std::string  wstring_to_utf8(const std::wstring & str);
 #endif
 
-// returns the path as a UTF-8 string, preserving its separators
-std::string fs_path_to_utf8(const std::filesystem::path & path);
-
 // converts a UTF-8 string to a path
 std::filesystem::path fs_path_from_utf8(const std::string & path);
 
