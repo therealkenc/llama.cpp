@@ -45,7 +45,7 @@ static fs::path get_cache_directory() {
             {HOME_DIR,                fs::path(".cache") / "huggingface" / "hub"}
         };
         for (const auto & entry : entries) {
-            if (fs::path base = common_get_path_from_env(entry.var); !base.empty()) {
+            if (fs::path base = fs_path_from_utf8(common_get_env(entry.var)); !base.empty()) {
                 return entry.path.empty() ? base : base / entry.path;
             }
         }
@@ -434,8 +434,7 @@ hf_files get_cached_files(const std::string & repo_id) {
             if (!path.empty()) {
                 hf_file file;
                 file.repo_id = _repo_id;
-                const auto generic_path = path.generic_u8string();
-                file.path = std::string(generic_path.begin(), generic_path.end());
+                file.path = path.generic_string();
                 file.local_path = entry.path().string();
                 file.final_path = file.local_path;
                 files.push_back(std::move(file));
