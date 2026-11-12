@@ -228,6 +228,7 @@ void test_queue_shutdown_releases_sleep_waiters() {
     // A response worker may reach this gate while the main loop is unwinding.
     // It must return rather than waiting forever on a state no thread owns.
     queue.wait_until_no_sleep();
+    queue.release_inflight();
 }
 
 }  // namespace

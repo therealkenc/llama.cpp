@@ -125,18 +125,24 @@ void server_queue::pop_deferred_task(int id_slot) {
 
 void server_queue::wait_until_no_sleep() {
     std::unique_lock<std::mutex> lock(mutex_tasks);
-    if (!sleeping) {
-        return;
+    if (sleeping) {
+        if (!req_stop_sleeping) {
+            QUE_DBG("%s", "requesting to stop sleeping\n");
+            req_stop_sleeping = true;
+            condition_tasks.notify_one(); // only main thread is waiting on this
+        }
+        QUE_DBG("%s", "waiting until no sleep\n");
+        condition_tasks.wait(lock, [&]{
+            return !sleeping;
+        });
     }
-    if (!req_stop_sleeping) {
-        QUE_DBG("%s", "requesting to stop sleeping\n");
-        req_stop_sleeping = true;
-        condition_tasks.notify_one(); // only main thread is waiting on this
-    }
-    QUE_DBG("%s", "waiting until no sleep\n");
-    condition_tasks.wait(lock, [&]{
-        return !sleeping;
-    });
+    n_inflight++;
+}
+
+void server_queue::release_inflight() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    GGML_ASSERT(n_inflight > 0);
+    n_inflight--;
 }
 
 void server_queue::terminate() {
@@ -302,7 +308,7 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
     constexpr auto max_wait_time = std::chrono::seconds(1);
     auto should_sleep = [&]() -> bool {
         // caller must hold mutex_tasks
-        if (idle_sleep_ms < 0) {
+        if (idle_sleep_ms < 0 || n_inflight > 0) {
             return false;
         }
         int64_t now = ggml_time_ms();
