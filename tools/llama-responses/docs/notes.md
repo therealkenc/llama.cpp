@@ -814,20 +814,14 @@ byte-for-byte; the six exceptions contain the narrow declared seams and the
 separately documented PR #27196 MTP logprobs fix. This is the merge-cost metric
 to preserve; raw additive line count is not the concern.
 
-### Touched-file clang-tidy policy
+### Linting policy
 
-Responses-owned code and any upstream server source or header intentionally
-modified by this fork must be clean under the repository's `.clang-tidy`
-configuration. Run clang-tidy against `build/compile_commands.json`, restricting
-the header filter to headers this fork actually touched. Diagnostics in
-untouched transitive upstream headers do not expand the cleanup boundary.
-
-Prefer fixing a diagnostic. A `NOLINT`, `NOLINTNEXTLINE`, or scoped suppression
-is acceptable only when the warning is inapplicable because of a concrete
-invariant. Put a comment immediately above the suppression explaining that
-invariant and why the obvious refactor would be worse or cannot provide useful
-recovery. Bare suppressions are not allowed.
+Follow [`linter.md`](linter.md): keep touched upstream files free of VS Code
+Problems while minimizing the upstream diff; use the repository's
+`.clang-tidy` standard for code we own. These are different validation targets.
+The policy records the clangd/clang-tidy distinction and supersedes the former
+requirement that every touched upstream file be standalone-tidy clean.
 
 Responses-specific server conversion tests belong in
 `test-llama-responses-server-chat`, not the large upstream `test-chat` target.
-This keeps the fork's test ownership and tidy boundary explicit.
+This keeps the fork's test ownership and linting boundary explicit.
