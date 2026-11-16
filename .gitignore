@@ -156,3 +156,7 @@ AGENTS.local.md
 .pi/SYSTEM.md
 
 scripts-ken/
+
+/tools/ui/.svelte-kit/
+/tools/ui/node_modules/
+/tools/ui/static/
