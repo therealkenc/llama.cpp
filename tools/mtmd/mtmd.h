@@ -218,6 +218,8 @@ MTMD_API void         mtmd_bitmap_set_mergeable(mtmd_bitmap * bitmap, bool merge
 // on a lazy bitmap: the expanded chunks are one video, wrapped by the model's video begin/end tokens
 //                   with MTMD_VIDEO_TEMPLATE_LFM3_OMNI, its audio bitmaps are the pieces of one soundtrack, in order
 MTMD_API void         mtmd_bitmap_set_is_video(mtmd_bitmap * bitmap, bool is_video);
+// transcript of an audio bitmap is optional, some TTS models use it to clone the speaker voice more closely (--tts-speaker-text)
+MTMD_API void         mtmd_bitmap_set_transcript(mtmd_bitmap * bitmap, const char * transcript);
 
 // mtmd_bitmap lazy
 //
@@ -474,7 +476,9 @@ enum mtmd_gen_audio_type {
     MTMD_GEN_AUDIO_TYPE_DRAMA3,
     MTMD_GEN_AUDIO_TYPE_ZONOS3,
     MTMD_GEN_AUDIO_TYPE_YUE2,
+    MTMD_GEN_AUDIO_TYPE_MINIMAX_MUSIC3,
     MTMD_GEN_AUDIO_TYPE_FISH_S2,
+    MTMD_GEN_AUDIO_TYPE_KOKORO,
 };
 
 struct mtmd_gen_audio_info {
@@ -504,6 +508,7 @@ enum mtmd_gen_process_type {
                                     // for pocket-tts, this is mimi decoder
                                     // for lfm3a, this is the codec decoder + ISTFT, n_codes == 0 flushes the tail
                                     // for yue2, this is one VAE pass, the caller splits a long song into tiles
+                                    // for minimax_music3, this is one window: flow matching + vocoder
 };
 
 struct mtmd_gen_inp {
@@ -522,10 +527,12 @@ struct mtmd_gen_inp {
     // pass either codes (discrete) or feats (continuous), depending on the pipeline
     // lfm3a GEN_CODE also takes codes: the codes revealed so far, -1 for a masked codebook
     // zonos3 GEN_WAV: -1 for a residual code not known yet, the frame is decoded without it
+    // kokoro GEN_WAV takes both: codes are the phoneme tokens, feats is the voice row (256 values) then the backbone state of each token
     int32_t * codes;
     size_t    n_codes;
     const float * feats;
     size_t        n_feats;
+    float speed; // kokoro: speaking speed, > 0 (default: 1.0)
 
     // yue2 GEN_CODE: n_codes is the frame count, codes is not read (the backbone state holds them)
     // backbone_state: llama_state_seq_get_data() of the backbone_n_past positions (prompt, codes, end token)
@@ -533,8 +540,12 @@ struct mtmd_gen_inp {
     size_t          backbone_state_size;
     int32_t         backbone_n_past;
 
-    // flow-matching GEN_CODE: steps of the ODE solver, <= 0 = model default (yue2: 32)
+    // flow matching: steps of the ODE solver, <= 0 = model default (yue2 GEN_CODE: 32, minimax_music3 GEN_WAV: 30)
     int32_t n_steps;
+
+    // minimax_music3 GEN_CODE: feats holds the backbone hidden rows, cond then uncond with guidance
+    // classifier-free guidance scale of the residual codes, <= 0 = model default (1.5)
+    float cfg_scale;
 };
 
 struct mtmd_gen_out {
