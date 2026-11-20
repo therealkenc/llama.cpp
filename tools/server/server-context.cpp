@@ -358,6 +358,8 @@ struct server_slot {
             return false;
         }
 
+        const int64_t t_start = ggml_time_us();
+
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
@@ -378,6 +380,8 @@ struct server_slot {
             prompt_cache.states.pop_back();
             return false;
         }
+
+        SLT_TRC(*this, "prompt cache save took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
 
         return true;
     }
@@ -6346,6 +6350,9 @@ void server_routes::init_routes() {
     // audio is PCM16 mono at the model sample rate, sent as base64 in input_audio_buffer.append events
     // input_audio_buffer.commit with "final": true ends the input, closing the socket also ends it
     this->ws_realtime = [this](const server_http_req & req, server_http_context::ws_conn & conn) {
+        // make sure sleep state is handled by create_response()
+        auto res = create_response();
+
         auto send_event = [&conn](json ev) {
             ev["event_id"] = "event_" + random_string();
             conn.send(safe_json_to_str(ev));
@@ -6390,7 +6397,6 @@ void server_routes::init_routes() {
             }}}},
         };
 
-        auto res = create_response();
         auto & rd = res->rd;
         {
             server_task task(SERVER_TASK_TYPE_TRANSCRIBE_RT);
