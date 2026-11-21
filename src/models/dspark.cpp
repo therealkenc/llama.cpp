@@ -974,6 +974,35 @@ static ggml_tensor * build_inkling2_head(llm_graph_context & g, const llama_mode
     return ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, logits, 1.0f/cap)), cap);
 }
 
+// A common output prefix lets the recurrent head stop early. Other output masks use the full chain.
+struct llm_graph_input_inkling2_draft : llm_graph_input_embd_h {
+    llm_graph_input_inkling2_draft(int64_t n_embd, const llm_graph_params & params)
+        : llm_graph_input_embd_h(n_embd, n_embd), n_head_rows(head_rows(params)) {}
+
+    const int64_t n_head_rows;
+
+    bool can_reuse(const llm_graph_params & params) override {
+        return llm_graph_input_embd_h::can_reuse(params) && n_head_rows == head_rows(params);
+    }
+
+    static int64_t head_rows(const llm_graph_params & params) {
+        const auto & ubatch = params.ubatch;
+        const uint32_t nb = ubatch.n_seqs_unq;
+        const uint32_t block = ubatch.n_tokens / nb;
+        const uint32_t rows = params.n_outputs / nb;
+        // Keep the full graph for reservation and for masks that need a gather.
+        if (!ubatch.embd_state || !ubatch.output || rows < 2 || rows >= block || params.n_outputs % nb != 0) {
+            return block;
+        }
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            if ((ubatch.output[i] != 0) != (i % block < rows)) {
+                return block;
+            }
+        }
+        return rows;
+    }
+};
+
 // dspark_fuse has one row of target-layer mixing weights per draft layer and a final row for the recurrent head.
 llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & params) : llm_graph_context(params) {
     auto * positions = build_inp_pos();
@@ -1024,7 +1053,8 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     GGML_ASSERT(cparams.ctx_other);
     const auto * target = llama_get_model(cparams.ctx_other);
     GGML_ASSERT(target->tok_embd && target->tok_norm && target->output);
-    auto inp = std::make_unique<llm_graph_input_embd_h>(n_embd, n_embd);
+    auto inp = std::make_unique<llm_graph_input_inkling2_draft>(n_embd, params);
+    const int64_t n_head_rows = inp->n_head_rows;
     auto * tokens = inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp->tokens);
     auto * f_rnn = inp->h = build_inp_embd_state(inp.get(), n_embd);
@@ -1064,8 +1094,14 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     res->t_embd = cur;
     auto * base = build_lora_mm(target->output, cur, target->output_s);
     ggml_prec_set_acc(base, GGML_PREC_F32);
+    const auto set_logits = [&](ggml_tensor * logits) {
+        if (logits->ne[1] != n_outputs) {
+            logits = ggml_get_rows(ctx0, logits, build_inp_out_ids());
+        }
+        res->t_logits = ggml_cont(ctx0, ggml_view_2d(ctx0, logits, hparams.n_vocab_unpadded, n_outputs, logits->nb[1], 0));
+    };
     if (block > hparams.dflash_block_size) {
-        res->t_logits = ggml_cont(ctx0, ggml_view_2d(ctx0, base, hparams.n_vocab_unpadded, n_tokens, base->nb[1], 0));
+        set_logits(base);
         return;
     }
     auto * state = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, rank, nb), 0.0f);
@@ -1077,7 +1113,7 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     auto * tie_rank = ggml_arange(ctx0, 0, hparams.n_vocab_unpadded, 1);
     tie_rank = ggml_scale_bias(ctx0, tie_rank, -1.0f, hparams.n_vocab_unpadded);
     auto * prev = ids;
-    for (int64_t i = 1; i < block; ++i) {
+    for (int64_t i = 1; i < n_head_rows; ++i) {
         auto * col = build_inkling2_head(*this, model, *target, prev, state, column(cur, i), column(base, i), context);
         logits = ggml_concat(ctx0, logits, col, 1);
         // Select the first maximum, independent of backend argmax tie order.
@@ -1086,7 +1122,7 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
         auto * is_max = ggml_scale_bias(ctx0, ggml_step(ctx0, ggml_sub(ctx0, ggml_repeat(ctx0, maximum, valid), valid)), -1.0f, 1.0f);
         prev = ggml_argmax(ctx0, ggml_mul(ctx0, is_max, tie_rank));
     }
-    logits = ggml_reshape_3d(ctx0, logits, logits->ne[0], nb, block);
-    logits = ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, logits, 0, 2, 1, 3)), logits->ne[0], n_tokens);
-    res->t_logits = ggml_cont(ctx0, ggml_view_2d(ctx0, logits, hparams.n_vocab_unpadded, n_tokens, logits->nb[1], 0));
+    logits = ggml_reshape_3d(ctx0, logits, logits->ne[0], nb, n_head_rows);
+    logits = ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, logits, 0, 2, 1, 3)), logits->ne[0], nb*n_head_rows);
+    set_logits(logits);
 }

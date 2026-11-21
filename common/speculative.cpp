@@ -1499,7 +1499,9 @@ public:
             }
             i_block_beg[seq_id] = batch.size();
             for (int32_t i = 0; i < n_block_tokens; ++i) {
-                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, true);
+                // Keep all Inkling attention inputs, but request logits only for the anchor and the first n_max masks.
+                const bool output = !has_rnn_context || i <= params.n_max;
+                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, output);
                 if (context) {
                     batch.set_embd_state(idx, { context, 1, (size_t) n_embd_dec });
                 }
