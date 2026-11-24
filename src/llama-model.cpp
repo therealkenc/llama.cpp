@@ -2097,12 +2097,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 layer.nextn.shared_head_head_in_s = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
         }
-        // inkling2_loop: the cache slots copied the physical layers before the scale pass, re-share them
-        if (auto * lm = dynamic_cast<llama_model_inkling2_loop *>(this)) {
-            for (int il = lm->n_phys; il < n_layer_all; ++il) {
-                layers[il] = layers[lm->layer_phys(il)];
-            }
-        }
         // output scales
         if (output) {
             // weight scale
@@ -3806,7 +3800,19 @@ int32_t llama_model_n_layer_nextn(const llama_model * model) {
 }
 
 llama_dflash_variant llama_model_dflash_variant(const llama_model * model) {
-    return model ? model->hparams.dflash_variant : LLAMA_DFLASH_VARIANT_NONE;
+    const auto * dflash = dynamic_cast<const llama_model_dflash *>(model);
+    if (dflash == nullptr) {
+        return LLAMA_DFLASH_VARIANT_NONE;
+    }
+
+    switch (dflash->variant) {
+        case llama_model_dflash::VARIANT_DFLASH:   return LLAMA_DFLASH_VARIANT_DFLASH;
+        case llama_model_dflash::VARIANT_DFLASH2:  return LLAMA_DFLASH_VARIANT_DFLASH2;
+        case llama_model_dflash::VARIANT_DSPARK:   return LLAMA_DFLASH_VARIANT_DSPARK;
+        case llama_model_dflash::VARIANT_LILICORR: return LLAMA_DFLASH_VARIANT_LILICORR;
+    }
+
+    return LLAMA_DFLASH_VARIANT_NONE;
 }
 
 int32_t llama_model_dflash_selector_top_k(const llama_model * model) {

@@ -1614,12 +1614,17 @@ struct llama_model_eagle3 : public llama_model_base {
 };
 
 struct llama_model_dflash : public llama_model_base {
-    llama_model_dflash(const struct llama_model_params & params) : llama_model_base(params) {
-        hparams.dflash_variant = LLAMA_DFLASH_VARIANT_DFLASH;
-    }
+    llama_model_dflash(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
     uint32_t graph_nodes_per_tensor() const override;
+
+    enum variant_type {
+        VARIANT_DFLASH,
+        VARIANT_DFLASH2,
+        VARIANT_DSPARK,
+        VARIANT_LILICORR,
+    };
 
     enum backbone_type {
         BACKBONE_BASE,
@@ -1628,12 +1633,12 @@ struct llama_model_dflash : public llama_model_base {
         BACKBONE_MISTRAL_LARGE4,
     };
 
+    variant_type  variant  = VARIANT_DFLASH;
     backbone_type backbone = BACKBONE_BASE;
 
     void load_hparams_lilicorr(llama_model_loader & ml);
     void load_hparams_dsv4(llama_model_loader & ml);
     void load_hparams_mistral_large4(llama_model_loader & ml);
-    void load_hparams_inkling2(llama_model_loader & ml);
     void load_tensors_dflash2();
     void load_tensors_dflash2_conv();
     void load_tensors_dspark(int64_t n_vocab_draft);
@@ -1641,7 +1646,6 @@ struct llama_model_dflash : public llama_model_base {
     void load_tensors_layers_base();
     void load_tensors_layers_dsv4();
     void load_tensors_layers_mistral_large4();
-    void load_tensors_inkling2();
 
     template <bool is_enc>
     struct graph : public llm_graph_context {
@@ -1664,6 +1668,8 @@ struct llama_model_dflash : public llama_model_base {
         graph_base(const llm_graph_params & params);
 
         ggml_tensor * build_inject();
+        void          build_inject_ctx_mix();
+        void          store_inject_kv(ggml_tensor * Kcur, ggml_tensor * Vcur, int il);
         ggml_tensor * build_inp_tokens();
         ggml_tensor * build_layers(ggml_tensor * inp_tokens);
         ggml_tensor * build_logits(ggml_tensor * cur);
@@ -1700,19 +1706,16 @@ struct llama_model_dflash : public llama_model_base {
         graph_mistral_large4(const llm_graph_params & params);
     };
 
-    // Inkling2 DSpark: decode the block, then run the recurrent head for each draft token
-    struct graph_inkling2 : public llm_graph_context {
-        graph_inkling2(const llm_graph_params & params);
-    };
-
     // graph helpers shared by the backbones
-    static ggml_tensor * build_inp_target_features(llm_graph_context & g, llm_graph_input_embd & inp, int64_t n_embd_inp);
     static ggml_tensor * build_inject_inp(llm_graph_context & g, const llama_model & model);
     static ggml_tensor * get_tok_embd(const llm_graph_context & g, const llama_model & model);
     static std::pair<ggml_tensor *, ggml_tensor *> get_lm_head(const llm_graph_context & g, const llama_model & model);
 
     // DFlash2 local conv, run by the base layers of DFlash2 and LiliCorr drafts
     static ggml_tensor * build_dflash2_conv(llm_graph_context & g, ggml_tensor * hidden, ggml_tensor * dynamic, ggml_tensor * base, int side);
+
+    // DSpark block input from mask_embd, run by the base layers and the Mistral Large 4 graph
+    static ggml_tensor * build_dspark_inp_block(const llm_graph_context & g, const llama_model & model, ggml_tensor * inp_tokens);
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };

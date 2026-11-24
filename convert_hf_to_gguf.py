@@ -289,7 +289,7 @@ def main() -> None:
                     sys.exit(1)
                 from conversion.mistral4 import MistralLarge4DSparkModel
                 model_class = MistralLarge4DSparkModel
-            elif model_architecture in ("Inkling2ForCausalLM", "Inkling2ForConditionalGeneration"):
+            elif model_architecture in ("Inkling2ForConditionalGeneration", "Inkling2ForCausalLM", "Inkling2LoopForConditionalGeneration", "Inkling2LoopForCausalLM"):
                 from conversion.inkling2 import Inkling2DSparkModel
                 model_class = Inkling2DSparkModel
             elif model_architecture not in ("DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM"):
