@@ -33,6 +33,18 @@ server_generation_usage generation_usage(const server_task_result_cmpl_final & r
     };
 }
 
+const char * tool_choice_mode_name(common_chat_tool_choice_mode mode) {
+    switch (mode) {
+        case COMMON_CHAT_TOOL_CHOICE_AUTO:
+            return "auto";
+        case COMMON_CHAT_TOOL_CHOICE_REQUIRED:
+            return "required";
+        case COMMON_CHAT_TOOL_CHOICE_NONE:
+            return "none";
+    }
+    throw std::invalid_argument("invalid tool choice mode");
+}
+
 std::string generation_error_code(error_type type) {
     switch (type) {
         case ERROR_TYPE_INVALID_REQUEST:
@@ -252,16 +264,22 @@ json server_generation_params_parse(const llama_vocab *             vocab,
     if (!input.chat.tools.empty()) {
         body["tools"] = common_chat_tools_to_json_oaicompat(input.chat.tools);
     }
-    switch (input.chat.tool_choice) {
-        case COMMON_CHAT_TOOL_CHOICE_AUTO:
-            body["tool_choice"] = "auto";
-            break;
-        case COMMON_CHAT_TOOL_CHOICE_REQUIRED:
-            body["tool_choice"] = "required";
-            break;
-        case COMMON_CHAT_TOOL_CHOICE_NONE:
-            body["tool_choice"] = "none";
-            break;
+    const auto & choice = input.chat.tool_choice;
+    const char * mode   = tool_choice_mode_name(choice.mode);
+    if (choice.allowed.empty() || choice.is_none()) {
+        body["tool_choice"] = mode;
+    } else {
+        json tools = json::array();
+        for (const std::string & name : choice.allowed) {
+            tools.push_back({
+                { "type",     "function"           },
+                { "function", { { "name", name } } }
+            });
+        }
+        body["tool_choice"] = {
+            { "type",          "allowed_tools"                                     },
+            { "allowed_tools", { { "mode", mode }, { "tools", std::move(tools) } } },
+        };
     }
     if (input.parallel_tool_calls) {
         body["parallel_tool_calls"] = *input.parallel_tool_calls;

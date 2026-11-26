@@ -264,6 +264,22 @@ void test_typed_server_adapter_preserves_chat_session() {
         CHECK(message.tool_calls.front().name == "get_weather");
         CHECK(json::parse(message.tool_calls.front().arguments) == json({{ "city", "Tokyo" }}));
     }
+
+    server_generation_input restricted = typed;
+    restricted.chat.tools.push_back({ "get_time", "", R"({"type":"object"})" });
+    restricted.chat.tools.push_back({ "get_forecast", "", R"({"type":"object"})" });
+    restricted.chat.tool_choice.allowed = { "get_forecast", "get_weather" };
+    for (const auto mode : { COMMON_CHAT_TOOL_CHOICE_AUTO, COMMON_CHAT_TOOL_CHOICE_REQUIRED }) {
+        restricted.chat.tool_choice.mode = mode;
+        common_chat_session restricted_session;
+        const json params = server_generation_params_parse(vocab, restricted, options, files, restricted_session);
+        const auto tools  = common_chat_tools_parse_oaicompat(params.at("tools"));
+        const auto choice = common_chat_tool_choice_parse_oaicompat(params.at("tool_choice"), tools);
+        CHECK(tools.size() == restricted.chat.tools.size());
+        CHECK(choice.mode == mode);
+        CHECK(choice.allowed == restricted.chat.tool_choice.allowed);
+        CHECK(!choice.allows("get_time"));
+    }
 }
 
 }  // namespace
